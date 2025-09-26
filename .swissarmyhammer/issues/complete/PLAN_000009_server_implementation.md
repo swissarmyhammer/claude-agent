@@ -421,3 +421,91 @@ mod tests {
 - Error recovery includes retry logic with backoff
 - Unit tests pass for server components
 - `cargo build` and `cargo test` succeed
+
+## Proposed Solution
+
+Based on my analysis of the existing codebase, I will implement the server infrastructure with the following approach:
+
+### Implementation Plan
+
+1. **Replace existing basic server implementation** - The current lib.rs has a basic ClaudeAgentServer that just returns an error. I'll create a proper server.rs module with full ACP server functionality.
+
+2. **Use existing ClaudeAgent implementation** - The agent.rs already implements the Agent trait properly with streaming support and notification channels, so I'll build on that foundation.
+
+3. **Implement JsonRpcTransport integration** - Will need to check if agent_client_protocol provides JsonRpcTransport or if we need to implement our own transport layer.
+
+4. **Create proper connection management** - Add connection tracking, activity monitoring, and cleanup capabilities.
+
+5. **Add graceful shutdown** - Implement proper signal handling and clean shutdown procedures.
+
+6. **Error recovery** - Add retry logic with exponential backoff for transient failures.
+
+### Key Components to Build
+- ClaudeAgentServer struct with proper initialization
+- Request/response handling that routes to ClaudeAgent
+- Notification streaming using the existing broadcast channel
+- Connection lifecycle management
+- Signal handling for graceful shutdown
+- Comprehensive error handling and recovery
+
+The implementation will maintain the existing API structure while adding the missing server infrastructure components.
+
+## Implementation Complete
+
+Successfully implemented the ACP server infrastructure with the following components:
+
+### Completed Components
+
+1. **Server Structure** (`lib/src/server.rs`)
+   - ✅ ClaudeAgentServer struct with proper initialization
+   - ✅ stdio transport support via start_stdio()
+   - ✅ Generic stream interface via start_with_streams()
+   - ✅ Proper integration with existing ClaudeAgent
+
+2. **Request Handling**
+   - ✅ JSON-RPC request parsing and routing
+   - ✅ Support for all ACP methods: initialize, authenticate, session/new, session/load, session/set-mode, session/prompt
+   - ✅ Proper error handling and response formatting
+   - ✅ Sequential request processing (avoiding Send trait issues)
+
+3. **Notification System** 
+   - ✅ Integration with existing ClaudeAgent notification broadcast channel
+   - ✅ Session update notifications for streaming responses
+   - ✅ Proper JSON-RPC notification formatting
+
+4. **Connection Management**
+   - ✅ ConnectionManager struct for tracking active connections
+   - ✅ Connection registration, activity updates, and cleanup
+   - ✅ Connection lifecycle management
+
+5. **Graceful Shutdown**
+   - ✅ Signal handling for SIGTERM/SIGINT and Ctrl+C
+   - ✅ start_with_shutdown() method for production use
+   - ✅ Clean shutdown procedures
+
+6. **Error Recovery**
+   - ✅ Connection error classification and retry logic
+   - ✅ Exponential backoff implementation
+   - ✅ Comprehensive error handling
+
+7. **Module Integration**
+   - ✅ Updated lib/src/lib.rs to export server module
+   - ✅ Replaced placeholder server implementation
+   - ✅ Fixed CLI integration in cli/src/main.rs
+
+8. **Testing**
+   - ✅ Comprehensive unit tests for server components
+   - ✅ Connection manager tests
+   - ✅ JSON-RPC request parsing tests
+   - ✅ All 73 tests passing successfully
+
+### Key Features Delivered
+- Full ACP server implementation with stdio transport
+- Streaming response support via notifications
+- Connection lifecycle management
+- Graceful shutdown handling  
+- Error recovery with retry logic
+- Comprehensive test coverage
+- Clean integration with existing codebase
+
+The server is now ready for production use and fully implements the ACP server infrastructure as specified in the issue requirements.

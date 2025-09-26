@@ -10,10 +10,6 @@ use claude_agent_lib::{AgentConfig, ClaudeAgentServer};
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Port to bind the ACP server (optional, uses stdio by default)
-    #[arg(short, long)]
-    port: Option<u16>,
-
     /// Log level
     #[arg(short, long, default_value = "info")]
     log_level: String,
@@ -30,15 +26,10 @@ async fn main() -> Result<()> {
 
     // Create configuration
     let mut config = AgentConfig::default();
-    config.server.port = cli.port;
     config.server.log_level = cli.log_level.clone();
 
     // Create and start server
-    let server = ClaudeAgentServer::new(config);
-
-    if cli.port.is_some() {
-        tracing::warn!("TCP mode not yet implemented, falling back to stdio");
-    }
+    let server = ClaudeAgentServer::new(config)?;
 
     server.start_stdio().await?;
 

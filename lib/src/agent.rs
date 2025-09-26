@@ -22,7 +22,7 @@ pub struct SessionUpdateNotification {
 }
 
 /// Message chunk for streaming responses
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct MessageChunk {
     pub content: Vec<ContentBlock>,
 }
