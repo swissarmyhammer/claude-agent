@@ -41,7 +41,8 @@ impl ClaudeAgentServer {
         // For now, return an error indicating this needs implementation
         tracing::error!("ACP server implementation not yet complete");
         Err(AgentError::ServerError(
-            "ACP server implementation requires integration with agent_client_protocol crate".to_string()
+            "ACP server implementation requires integration with agent_client_protocol crate"
+                .to_string(),
         ))
     }
 }

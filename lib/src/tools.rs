@@ -275,7 +275,13 @@ mod tests {
         let permissions = ToolPermissions {
             require_permission_for: vec!["fs_write".to_string()],
             auto_approved: vec![],
-            forbidden_paths: vec!["/etc".to_string(), "/usr".to_string(), "/bin".to_string(), "/sys".to_string(), "/proc".to_string()],
+            forbidden_paths: vec![
+                "/etc".to_string(),
+                "/usr".to_string(),
+                "/bin".to_string(),
+                "/sys".to_string(),
+                "/proc".to_string(),
+            ],
         };
         ToolCallHandler::new(permissions)
     }

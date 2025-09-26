@@ -75,7 +75,10 @@ impl ClaudeAgent {
     }
 
     /// Parse and validate a session ID from a SessionId wrapper
-    fn parse_session_id(&self, session_id: &SessionId) -> Result<ulid::Ulid, agent_client_protocol::Error> {
+    fn parse_session_id(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<ulid::Ulid, agent_client_protocol::Error> {
         session_id
             .0
             .as_ref()
@@ -205,7 +208,11 @@ impl Agent for ClaudeAgent {
             self.session_manager
                 .update_session(&session_id, |session| {
                     // Store the actual MCP server info from the request (convert to debug string for now)
-                    session.mcp_servers = request.mcp_servers.iter().map(|server| format!("{:?}", server)).collect();
+                    session.mcp_servers = request
+                        .mcp_servers
+                        .iter()
+                        .map(|server| format!("{:?}", server))
+                        .collect();
                 })
                 .map_err(|_e| agent_client_protocol::Error::internal_error())?;
         }
