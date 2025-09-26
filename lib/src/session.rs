@@ -103,7 +103,9 @@ impl SessionManager {
         let session_id = Ulid::new();
         let session = Session::new(session_id);
 
-        let mut sessions = self.sessions.write()
+        let mut sessions = self
+            .sessions
+            .write()
             .map_err(|_| crate::AgentError::Session("Failed to acquire write lock".to_string()))?;
 
         sessions.insert(session_id, session);
@@ -113,7 +115,9 @@ impl SessionManager {
 
     /// Get a session by ID
     pub fn get_session(&self, session_id: &SessionId) -> crate::Result<Option<Session>> {
-        let sessions = self.sessions.read()
+        let sessions = self
+            .sessions
+            .read()
             .map_err(|_| crate::AgentError::Session("Failed to acquire read lock".to_string()))?;
 
         Ok(sessions.get(session_id).cloned())
@@ -124,7 +128,9 @@ impl SessionManager {
     where
         F: FnOnce(&mut Session),
     {
-        let mut sessions = self.sessions.write()
+        let mut sessions = self
+            .sessions
+            .write()
             .map_err(|_| crate::AgentError::Session("Failed to acquire write lock".to_string()))?;
 
         if let Some(session) = sessions.get_mut(session_id) {
@@ -140,7 +146,9 @@ impl SessionManager {
 
     /// Remove a session and return it if it existed
     pub fn remove_session(&self, session_id: &SessionId) -> crate::Result<Option<Session>> {
-        let mut sessions = self.sessions.write()
+        let mut sessions = self
+            .sessions
+            .write()
             .map_err(|_| crate::AgentError::Session("Failed to acquire write lock".to_string()))?;
 
         let removed = sessions.remove(session_id);
@@ -152,7 +160,9 @@ impl SessionManager {
 
     /// List all session IDs
     pub fn list_sessions(&self) -> crate::Result<Vec<SessionId>> {
-        let sessions = self.sessions.read()
+        let sessions = self
+            .sessions
+            .read()
             .map_err(|_| crate::AgentError::Session("Failed to acquire read lock".to_string()))?;
 
         Ok(sessions.keys().cloned().collect())
@@ -160,7 +170,9 @@ impl SessionManager {
 
     /// Get the number of active sessions
     pub fn session_count(&self) -> crate::Result<usize> {
-        let sessions = self.sessions.read()
+        let sessions = self
+            .sessions
+            .read()
             .map_err(|_| crate::AgentError::Session("Failed to acquire read lock".to_string()))?;
 
         Ok(sessions.len())
@@ -173,7 +185,10 @@ impl SessionManager {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(manager.cleanup_interval);
 
-            tracing::info!("Session cleanup task started with interval: {:?}", manager.cleanup_interval);
+            tracing::info!(
+                "Session cleanup task started with interval: {:?}",
+                manager.cleanup_interval
+            );
 
             loop {
                 interval.tick().await;
@@ -191,8 +206,9 @@ impl SessionManager {
 
         // Find expired sessions
         {
-            let sessions = self.sessions.read()
-                .map_err(|_| crate::AgentError::Session("Failed to acquire read lock".to_string()))?;
+            let sessions = self.sessions.read().map_err(|_| {
+                crate::AgentError::Session("Failed to acquire read lock".to_string())
+            })?;
 
             for (id, session) in sessions.iter() {
                 if let Ok(age) = now.duration_since(session.last_accessed) {
@@ -238,7 +254,7 @@ mod tests {
     #[test]
     fn test_message_creation() {
         let message = Message::new(MessageRole::User, "Hello".to_string());
-        
+
         assert!(matches!(message.role, MessageRole::User));
         assert_eq!(message.content, "Hello");
     }
@@ -271,7 +287,7 @@ mod tests {
         let cleanup_interval = Duration::from_secs(60);
         let max_age = Duration::from_secs(1800);
         let manager = SessionManager::with_cleanup_settings(cleanup_interval, max_age);
-        
+
         assert_eq!(manager.cleanup_interval, cleanup_interval);
         assert_eq!(manager.max_session_age, max_age);
     }
@@ -303,9 +319,11 @@ mod tests {
 
         let message = Message::new(MessageRole::User, "Hello".to_string());
 
-        manager.update_session(&session_id, |session| {
-            session.add_message(message.clone());
-        }).unwrap();
+        manager
+            .update_session(&session_id, |session| {
+                session.add_message(message.clone());
+            })
+            .unwrap();
 
         let session = manager.get_session(&session_id).unwrap().unwrap();
         assert_eq!(session.context.len(), 1);
@@ -408,10 +426,10 @@ mod tests {
     #[tokio::test]
     async fn test_cleanup_task_startup() {
         let manager = Arc::new(SessionManager::new());
-        
+
         // This should not panic or block
         manager.clone().start_cleanup_task().await;
-        
+
         // Give the task a moment to start
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

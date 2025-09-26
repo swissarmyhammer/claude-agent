@@ -1,0 +1,61 @@
+todo:
+- id: 01K63HTZ8XWGXKCWYE0CPK0E2S
+  task: Examine existing codebase structure for agent.rs and claude.rs
+  context: Need to understand current implementation state, existing imports, and dependencies before implementing session_prompt
+  done: false
+- id: 01K63HV4CFCWR7AV6TEGQ9X7DZ
+  task: Implement session_prompt method in ClaudeAgent
+  context: Core method to handle user prompts with session context, including session retrieval, message storage, and Claude client integration
+  done: false
+- id: 01K63J7VNBCFFPHZASD2Q5FA1A
+  task: Perform code review of current branch
+  context: Review files changed on issue/PLAN_000006_agent_trait_prompting branch
+  done: false
+- id: 01K63J8QAT8806HXZZK4TABW10
+  task: Review lib/src/agent.rs for code quality and standards
+  context: Check for placeholders, TODOs, missing tests, documentation, lint issues
+  done: false
+- id: 01K63J8QC3077R6R7P3CY9N2AZ
+  task: Review lib/src/claude.rs for code quality and standards
+  context: Check for placeholders, TODOs, missing tests, documentation, lint issues
+  done: false
+- id: 01K63J8QDH7MJRQG0CW9JAPSDP
+  task: Review issue file PLAN_000006_agent_trait_prompting.md
+  context: Check if implementation matches issue requirements
+  done: false
+- id: 01K63J8QF8HQV1S3AE96G8HWRH
+  task: Run Rust lint checks on modified files
+  context: cargo clippy and cargo fmt to identify violations
+  done: false
+- id: 01K63J8QGTGN12PBJKZ8H84AW3
+  task: Create CODE_REVIEW.md with findings
+  context: Compile all identified issues into review document
+  done: false
+- id: 01K63JC2CW1PCDQ8S1CBZPS4FM
+  task: Fix unused variable in lib/src/agent.rs:260
+  context: Remove unused variable `let session = self.session_manager.get_session(&session_id)` or prefix with underscore
+  done: true
+- id: 01K63JC5N0YDGZYEPVGK2YZYZD
+  task: Fix dead code in lib/src/claude.rs:14
+  context: 'Remove unused `config: Config` field or use it in implementation'
+  done: false
+- id: 01K63JC92CJVXCB3YHSVASX8T1
+  task: Fix redundant closures in lib/src/agent.rs
+  context: Replace `ok_or_else(|| Error::invalid_params())` with `ok_or_else(Error::invalid_params)` at lines 262 and 278
+  done: false
+- id: 01K63JCCDEYDRW14V78ZM9VHDX
+  task: Fix unnecessary literal unwrap in lib/src/error.rs
+  context: Remove unnecessary `.expect()` calls on literal Ok/Err values at lines 83-84
+  done: false
+- id: 01K63JJMM7AHAPEXK7K4FDDVWQ
+  task: Evaluate git status and determine files to commit
+  context: Check current git status, identify modified and untracked files, clean up scratch files
+  done: true
+- id: 01K63JJZW0KA0V2J06Q3S1ZX09
+  task: Check todo directory contents and clean up scratch files
+  context: Examine .swissarmyhammer/todo/ to determine if it contains scratch files
+  done: true
+- id: 01K63JKJF25SH1B5SXVEGC0788
+  task: Add modified files to git staging
+  context: Stage all modified source files and completed issue file for commit
+  done: false

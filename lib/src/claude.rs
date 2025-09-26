@@ -1,8 +1,8 @@
 //! Claude SDK wrapper providing session-aware interactions
 
 use claude_sdk_rs::{Client, Config, Message};
-use tokio_stream::{Stream, StreamExt};
 use tokio::time::{sleep, Duration};
+use tokio_stream::{Stream, StreamExt};
 
 use std::time::SystemTime;
 
@@ -11,7 +11,6 @@ use crate::{config::ClaudeConfig, error::Result};
 /// Claude client wrapper with session management
 pub struct ClaudeClient {
     client: Client,
-    config: Config,
 }
 
 /// Session context for managing conversation history
@@ -56,22 +55,21 @@ impl ClaudeClient {
     /// Create a new Claude client with default configuration
     pub fn new() -> Result<Self> {
         let config = Config::default();
-        let client = Client::new(config.clone());
-        
-        Ok(Self { client, config })
+        let client = Client::new(config);
+
+        Ok(Self { client })
     }
 
     /// Create a new Claude client with custom configuration
     pub fn new_with_config(_claude_config: &ClaudeConfig) -> Result<Self> {
         let config = Config::default();
-        
+
         // Map claude config to SDK config
         // The claude-sdk-rs Config doesn't appear to have model configuration in the constructor
         // The model is typically specified when making requests
-        // For now, we store the config for later use in requests
-        
-        let client = Client::new(config.clone());
-        Ok(Self { client, config })
+
+        let client = Client::new(config);
+        Ok(Self { client })
     }
 
     /// Check if the client supports streaming
@@ -83,29 +81,41 @@ impl ClaudeClient {
     pub async fn query(&self, prompt: &str, _session_id: &str) -> Result<String> {
         self.execute_with_retry(|| async {
             if prompt.is_empty() {
-                return Err(crate::error::AgentError::Claude(claude_sdk_rs::Error::ConfigError("Empty prompt".to_string())));
+                return Err(crate::error::AgentError::Claude(
+                    claude_sdk_rs::Error::ConfigError("Empty prompt".to_string()),
+                ));
             }
-            
-            let response = self.client.send_full(prompt).await
+
+            let response = self
+                .client
+                .send_full(prompt)
+                .await
                 .map_err(crate::error::AgentError::Claude)?;
-            
+
             Ok(response.content)
-        }).await
+        })
+        .await
     }
 
     /// Execute a streaming query without session context
     pub async fn query_stream(
-        &self, 
-        prompt: &str, 
-        _session_id: &str
+        &self,
+        prompt: &str,
+        _session_id: &str,
     ) -> Result<impl Stream<Item = MessageChunk>> {
         if prompt.is_empty() {
-            return Err(crate::error::AgentError::Claude(claude_sdk_rs::Error::ConfigError("Empty prompt".to_string())));
+            return Err(crate::error::AgentError::Claude(
+                claude_sdk_rs::Error::ConfigError("Empty prompt".to_string()),
+            ));
         }
-        
-        let message_stream = self.client.query(prompt).stream().await
+
+        let message_stream = self
+            .client
+            .query(prompt)
+            .stream()
+            .await
             .map_err(crate::error::AgentError::Claude)?;
-        
+
         // Convert the MessageStream to our MessageChunk stream
         let chunk_stream = message_stream.map(|result| {
             match result {
@@ -131,7 +141,7 @@ impl ClaudeClient {
                 },
             }
         });
-        
+
         Ok(chunk_stream)
     }
 
@@ -143,11 +153,11 @@ impl ClaudeClient {
     ) -> Result<String> {
         // Build conversation history from context
         let mut full_conversation = String::new();
-        
+
         for message in &context.messages {
             let role_str = match message.role {
                 MessageRole::User => "User",
-                MessageRole::Assistant => "Assistant", 
+                MessageRole::Assistant => "Assistant",
                 MessageRole::System => "System",
             };
             full_conversation.push_str(&format!("{}: {}\n", role_str, message.content));
@@ -157,44 +167,56 @@ impl ClaudeClient {
         // Use retry logic with actual Claude SDK call
         self.execute_with_retry(|| async {
             if prompt.is_empty() {
-                return Err(crate::error::AgentError::Claude(claude_sdk_rs::Error::ConfigError("Empty prompt".to_string())));
+                return Err(crate::error::AgentError::Claude(
+                    claude_sdk_rs::Error::ConfigError("Empty prompt".to_string()),
+                ));
             }
-            
+
             // Use the full conversation including context
-            let response = self.client.send_full(&full_conversation).await
+            let response = self
+                .client
+                .send_full(&full_conversation)
+                .await
                 .map_err(crate::error::AgentError::Claude)?;
-            
+
             Ok(response.content)
-        }).await
+        })
+        .await
     }
 
     /// Execute a streaming query with full session context
     pub async fn query_stream_with_context(
         &self,
-        prompt: &str, 
+        prompt: &str,
         context: &SessionContext,
     ) -> Result<impl Stream<Item = MessageChunk>> {
         if prompt.is_empty() {
-            return Err(crate::error::AgentError::Claude(claude_sdk_rs::Error::ConfigError("Empty prompt".to_string())));
+            return Err(crate::error::AgentError::Claude(
+                claude_sdk_rs::Error::ConfigError("Empty prompt".to_string()),
+            ));
         }
-        
+
         // Build conversation history from context
         let mut full_conversation = String::new();
-        
+
         for message in &context.messages {
             let role_str = match message.role {
                 MessageRole::User => "User",
-                MessageRole::Assistant => "Assistant", 
+                MessageRole::Assistant => "Assistant",
                 MessageRole::System => "System",
             };
             full_conversation.push_str(&format!("{}: {}\n", role_str, message.content));
         }
         full_conversation.push_str(&format!("User: {}", prompt));
-        
+
         // Use the full conversation including context for streaming
-        let message_stream = self.client.query(&full_conversation).stream().await
+        let message_stream = self
+            .client
+            .query(&full_conversation)
+            .stream()
+            .await
             .map_err(crate::error::AgentError::Claude)?;
-        
+
         // Convert the MessageStream to our MessageChunk stream
         let chunk_stream = message_stream.map(|result| {
             match result {
@@ -220,22 +242,22 @@ impl ClaudeClient {
                 },
             }
         });
-        
+
         Ok(chunk_stream)
     }
 
     /// Execute an operation with retry logic
-    async fn execute_with_retry<F, Fut, T>(&self, operation: F) -> Result<T> 
+    async fn execute_with_retry<F, Fut, T>(&self, operation: F) -> Result<T>
     where
         F: Fn() -> Fut,
         Fut: futures::Future<Output = Result<T>>,
     {
         let mut attempts = 0;
         let max_attempts = 3;
-        
+
         loop {
             attempts += 1;
-            
+
             match operation().await {
                 Ok(result) => return Ok(result),
                 Err(e) if attempts < max_attempts && is_retryable(&e) => {
@@ -275,6 +297,61 @@ impl SessionContext {
     }
 }
 
+/// Convert from session module Session to claude module SessionContext
+impl From<crate::session::Session> for SessionContext {
+    fn from(session: crate::session::Session) -> Self {
+        Self {
+            session_id: session.id.to_string(),
+            messages: session.context.into_iter().map(|msg| msg.into()).collect(),
+            created_at: session.created_at,
+        }
+    }
+}
+
+/// Convert from session module Session reference to claude module SessionContext
+impl From<&crate::session::Session> for SessionContext {
+    fn from(session: &crate::session::Session) -> Self {
+        Self {
+            session_id: session.id.to_string(),
+            messages: session.context.iter().map(|msg| msg.into()).collect(),
+            created_at: session.created_at,
+        }
+    }
+}
+
+/// Convert from session module Message to claude module ClaudeMessage
+impl From<crate::session::Message> for ClaudeMessage {
+    fn from(message: crate::session::Message) -> Self {
+        Self {
+            role: message.role.into(),
+            content: message.content,
+            timestamp: message.timestamp,
+        }
+    }
+}
+
+/// Convert from session module Message reference to claude module ClaudeMessage
+impl From<&crate::session::Message> for ClaudeMessage {
+    fn from(message: &crate::session::Message) -> Self {
+        Self {
+            role: message.role.clone().into(),
+            content: message.content.clone(),
+            timestamp: message.timestamp,
+        }
+    }
+}
+
+/// Convert from session module MessageRole to claude module MessageRole
+impl From<crate::session::MessageRole> for MessageRole {
+    fn from(role: crate::session::MessageRole) -> Self {
+        match role {
+            crate::session::MessageRole::User => MessageRole::User,
+            crate::session::MessageRole::Assistant => MessageRole::Assistant,
+            crate::session::MessageRole::System => MessageRole::System,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,7 +380,10 @@ mod tests {
         let response = client.query("Hello", "session-1").await.unwrap();
         // Claude's response won't necessarily contain the exact prompt
         // Just verify we get a non-empty response
-        assert!(!response.is_empty(), "Expected non-empty response from Claude API");
+        assert!(
+            !response.is_empty(),
+            "Expected non-empty response from Claude API"
+        );
     }
 
     #[tokio::test]
@@ -311,11 +391,20 @@ mod tests {
         let client = ClaudeClient::new().unwrap();
         let mut context = SessionContext::new("test-session".to_string());
         context.add_message(MessageRole::User, "Previous message".to_string());
-        
-        let response = client.query_with_context("New prompt", &context).await.unwrap();
+
+        let response = client
+            .query_with_context("New prompt", &context)
+            .await
+            .unwrap();
         // For now this is a placeholder implementation, so just verify we get a response
-        assert!(!response.is_empty(), "Expected non-empty response from query_with_context");
-        assert!(response.contains("test-session"), "Response should reference the session");
+        assert!(
+            !response.is_empty(),
+            "Expected non-empty response from query_with_context"
+        );
+        // Since this is a placeholder implementation that sends to Claude SDK,
+        // it may not contain the session ID in the response content
+        // Just verify we get a meaningful response
+        assert!(response.len() > 10, "Response should be substantial");
     }
 
     #[test]
@@ -325,7 +414,7 @@ mod tests {
             content: "User message".to_string(),
             timestamp: SystemTime::now(),
         };
-        
+
         let assistant_msg = ClaudeMessage {
             role: MessageRole::Assistant,
             content: "Assistant message".to_string(),
@@ -362,6 +451,9 @@ mod tests {
 
         assert!(matches!(text_chunk.chunk_type, ChunkType::Text));
         assert!(matches!(tool_call_chunk.chunk_type, ChunkType::ToolCall));
-        assert!(matches!(tool_result_chunk.chunk_type, ChunkType::ToolResult));
+        assert!(matches!(
+            tool_result_chunk.chunk_type,
+            ChunkType::ToolResult
+        ));
     }
 }

@@ -1,14 +1,13 @@
 //! Agent Client Protocol implementation for Claude Agent
 
+use crate::{claude::ClaudeClient, config::AgentConfig, session::SessionManager};
 use agent_client_protocol::{
-    Agent, AuthenticateRequest, AuthenticateResponse, InitializeRequest, InitializeResponse,
-    NewSessionRequest, NewSessionResponse, LoadSessionRequest, LoadSessionResponse,
-    SetSessionModeRequest, SetSessionModeResponse, PromptRequest, PromptResponse,
-    CancelNotification, ExtRequest, ExtNotification, RawValue, AgentCapabilities,
-    SessionId, StopReason,
+    Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
+    ExtNotification, ExtRequest, InitializeRequest, InitializeResponse, LoadSessionRequest,
+    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+    RawValue, SessionId, SetSessionModeRequest, SetSessionModeResponse, StopReason,
 };
 use std::sync::Arc;
-use crate::{session::SessionManager, claude::ClaudeClient, config::AgentConfig};
 
 /// The main Claude Agent implementing the Agent Client Protocol
 pub struct ClaudeAgent {
@@ -23,7 +22,7 @@ impl ClaudeAgent {
     pub fn new(config: AgentConfig) -> crate::Result<Self> {
         let session_manager = Arc::new(SessionManager::new());
         let claude_client = Arc::new(ClaudeClient::new_with_config(&config.claude)?);
-        
+
         let capabilities = AgentCapabilities {
             load_session: true,
             prompt_capabilities: agent_client_protocol::PromptCapabilities {
@@ -40,13 +39,13 @@ impl ClaudeAgent {
             meta: Some(serde_json::json!({
                 "tools": [
                     "fs_read",
-                    "fs_write", 
+                    "fs_write",
                     "terminal_create",
                     "terminal_write"
                 ]
             })),
         };
-        
+
         Ok(Self {
             session_manager,
             claude_client,
@@ -59,22 +58,68 @@ impl ClaudeAgent {
     fn log_request<T: std::fmt::Debug>(&self, method: &str, request: &T) {
         tracing::debug!("Handling {} request: {:?}", method, request);
     }
-    
+
     /// Log outgoing response for debugging purposes
     fn log_response<T: std::fmt::Debug>(&self, method: &str, response: &T) {
         tracing::debug!("Returning {} response: {:?}", method, response);
+    }
+
+    /// Validate a prompt request for common issues
+    async fn validate_prompt_request(
+        &self,
+        request: &PromptRequest,
+    ) -> Result<(), agent_client_protocol::Error> {
+        // Validate session ID format
+        request
+            .session_id
+            .0
+            .as_ref()
+            .parse::<ulid::Ulid>()
+            .map_err(|_| agent_client_protocol::Error::invalid_params())?;
+
+        // Extract text content from the prompt
+        let mut prompt_text = String::new();
+        for content_block in &request.prompt {
+            match content_block {
+                agent_client_protocol::ContentBlock::Text(text_content) => {
+                    prompt_text.push_str(&text_content.text);
+                }
+                _ => {
+                    // For now, we only support text content blocks
+                    return Err(agent_client_protocol::Error::invalid_params());
+                }
+            }
+        }
+
+        // Check if prompt is empty
+        if prompt_text.trim().is_empty() {
+            return Err(agent_client_protocol::Error::invalid_params());
+        }
+
+        // Check if prompt is too long (100KB limit)
+        if prompt_text.len() > 100_000 {
+            return Err(agent_client_protocol::Error::invalid_params());
+        }
+
+        Ok(())
     }
 }
 
 #[async_trait::async_trait(?Send)]
 impl Agent for ClaudeAgent {
-    async fn initialize(&self, request: InitializeRequest) -> Result<InitializeResponse, agent_client_protocol::Error> {
+    async fn initialize(
+        &self,
+        request: InitializeRequest,
+    ) -> Result<InitializeResponse, agent_client_protocol::Error> {
         self.log_request("initialize", &request);
-        tracing::info!("Initializing agent with client capabilities: {:?}", request.client_capabilities);
-        
+        tracing::info!(
+            "Initializing agent with client capabilities: {:?}",
+            request.client_capabilities
+        );
+
         let response = InitializeResponse {
             agent_capabilities: self.capabilities.clone(),
-            auth_methods: vec![agent_client_protocol::AuthMethod { 
+            auth_methods: vec![agent_client_protocol::AuthMethod {
                 id: agent_client_protocol::AuthMethodId("none".to_string().into()),
                 name: "No Authentication".to_string(),
                 description: Some("No authentication required".to_string()),
@@ -92,10 +137,16 @@ impl Agent for ClaudeAgent {
         Ok(response)
     }
 
-    async fn authenticate(&self, request: AuthenticateRequest) -> Result<AuthenticateResponse, agent_client_protocol::Error> {
+    async fn authenticate(
+        &self,
+        request: AuthenticateRequest,
+    ) -> Result<AuthenticateResponse, agent_client_protocol::Error> {
         self.log_request("authenticate", &request);
-        tracing::info!("Authentication requested with method: {:?}", request.method_id);
-        
+        tracing::info!(
+            "Authentication requested with method: {:?}",
+            request.method_id
+        );
+
         // For now, always succeed with authentication
         let response = match request.method_id.0.as_ref() {
             "none" => {
@@ -123,23 +174,30 @@ impl Agent for ClaudeAgent {
         Ok(response)
     }
 
-    async fn new_session(&self, request: NewSessionRequest) -> Result<NewSessionResponse, agent_client_protocol::Error> {
+    async fn new_session(
+        &self,
+        request: NewSessionRequest,
+    ) -> Result<NewSessionResponse, agent_client_protocol::Error> {
         self.log_request("new_session", &request);
         tracing::info!("Creating new session");
-        
-        let session_id = self.session_manager.create_session()
+
+        let session_id = self
+            .session_manager
+            .create_session()
             .map_err(|_e| agent_client_protocol::Error::internal_error())?;
-        
-        // Store MCP servers in the session if provided  
+
+        // Store MCP servers in the session if provided
         if !request.mcp_servers.is_empty() {
-            self.session_manager.update_session(&session_id, |session| {
-                // Store MCP server names from request - for now just placeholder
-                session.mcp_servers = vec!["mcp_server".to_string()];
-            }).map_err(|_e| agent_client_protocol::Error::internal_error())?;
+            self.session_manager
+                .update_session(&session_id, |session| {
+                    // Store MCP server names from request - for now just placeholder
+                    session.mcp_servers = vec!["mcp_server".to_string()];
+                })
+                .map_err(|_e| agent_client_protocol::Error::internal_error())?;
         }
-        
+
         tracing::info!("Created session: {}", session_id);
-        
+
         let response = NewSessionResponse {
             session_id: SessionId(session_id.to_string().into()),
             modes: None, // No specific modes for now
@@ -152,16 +210,25 @@ impl Agent for ClaudeAgent {
         Ok(response)
     }
 
-    async fn load_session(&self, request: LoadSessionRequest) -> Result<LoadSessionResponse, agent_client_protocol::Error> {
+    async fn load_session(
+        &self,
+        request: LoadSessionRequest,
+    ) -> Result<LoadSessionResponse, agent_client_protocol::Error> {
         self.log_request("load_session", &request);
         tracing::info!("Loading session: {}", request.session_id);
-        
-        let session_id = request.session_id.0.as_ref().parse()
+
+        let session_id = request
+            .session_id
+            .0
+            .as_ref()
+            .parse()
             .map_err(|_e| agent_client_protocol::Error::invalid_params())?;
-        
-        let session = self.session_manager.get_session(&session_id)
+
+        let session = self
+            .session_manager
+            .get_session(&session_id)
             .map_err(|_e| agent_client_protocol::Error::internal_error())?;
-        
+
         match session {
             Some(session) => {
                 tracing::info!("Loaded session: {}", session_id);
@@ -177,15 +244,16 @@ impl Agent for ClaudeAgent {
                 self.log_response("load_session", &response);
                 Ok(response)
             }
-            None => {
-                Err(agent_client_protocol::Error::invalid_params())
-            }
+            None => Err(agent_client_protocol::Error::invalid_params()),
         }
     }
 
-    async fn set_session_mode(&self, request: SetSessionModeRequest) -> Result<SetSessionModeResponse, agent_client_protocol::Error> {
+    async fn set_session_mode(
+        &self,
+        request: SetSessionModeRequest,
+    ) -> Result<SetSessionModeResponse, agent_client_protocol::Error> {
         self.log_request("set_session_mode", &request);
-        
+
         // For now, accept any session mode
         let response = SetSessionModeResponse {
             meta: Some(serde_json::json!({
@@ -198,43 +266,101 @@ impl Agent for ClaudeAgent {
         Ok(response)
     }
 
-    async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, agent_client_protocol::Error> {
+    async fn prompt(
+        &self,
+        request: PromptRequest,
+    ) -> Result<PromptResponse, agent_client_protocol::Error> {
         self.log_request("prompt", &request);
-        tracing::info!("Processing prompt request for session: {}", request.session_id);
-        
+        tracing::info!(
+            "Processing prompt request for session: {}",
+            request.session_id
+        );
+
+        // Validate the request
+        self.validate_prompt_request(&request).await?;
+
+        // Parse session ID
+        let session_id = request
+            .session_id
+            .0
+            .as_ref()
+            .parse::<ulid::Ulid>()
+            .map_err(|_| agent_client_protocol::Error::invalid_params())?;
+
         // Extract text content from the prompt
         let mut prompt_text = String::new();
         for content_block in &request.prompt {
             match content_block {
                 agent_client_protocol::ContentBlock::Text(text_content) => {
                     prompt_text.push_str(&text_content.text);
-                    prompt_text.push('\n');
                 }
-                // For now, we only handle text content blocks
                 _ => {
-                    tracing::warn!("Non-text content blocks not yet supported");
+                    // Already validated in validate_prompt_request
+                    return Err(agent_client_protocol::Error::invalid_params());
                 }
             }
         }
-        
-        if prompt_text.trim().is_empty() {
-            return Err(agent_client_protocol::Error::invalid_params());
-        }
-        
-        // Use the Claude client to process the prompt
-        let session_id_str = request.session_id.0.as_ref();
-        match self.claude_client.query(&prompt_text, session_id_str).await {
+
+        // Validate session exists
+        self.session_manager
+            .get_session(&session_id)
+            .map_err(|_| agent_client_protocol::Error::internal_error())?
+            .ok_or_else(agent_client_protocol::Error::invalid_params)?;
+
+        // Add user message to session
+        let user_message = crate::session::Message {
+            role: crate::session::MessageRole::User,
+            content: prompt_text.clone(),
+            timestamp: std::time::SystemTime::now(),
+        };
+
+        self.session_manager
+            .update_session(&session_id, |session| {
+                session.add_message(user_message);
+            })
+            .map_err(|_| agent_client_protocol::Error::internal_error())?;
+
+        // Query Claude with session context
+        let updated_session = self
+            .session_manager
+            .get_session(&session_id)
+            .map_err(|_| agent_client_protocol::Error::internal_error())?
+            .ok_or_else(agent_client_protocol::Error::internal_error)?;
+
+        let session_context: crate::claude::SessionContext = (&updated_session).into();
+
+        match self
+            .claude_client
+            .query_with_context(&prompt_text, &session_context)
+            .await
+        {
             Ok(claude_response) => {
-                tracing::info!("Successfully processed prompt for session: {}", session_id_str);
+                tracing::info!("Successfully processed prompt for session: {}", session_id);
+
+                // Add assistant response to session
+                let assistant_message = crate::session::Message {
+                    role: crate::session::MessageRole::Assistant,
+                    content: claude_response.clone(),
+                    timestamp: std::time::SystemTime::now(),
+                };
+
+                self.session_manager
+                    .update_session(&session_id, |session| {
+                        session.add_message(assistant_message);
+                    })
+                    .map_err(|_| agent_client_protocol::Error::internal_error())?;
+
                 let response = PromptResponse {
                     stop_reason: StopReason::EndTurn,
                     meta: Some(serde_json::json!({
                         "processed": true,
                         "response_type": "text",
                         "claude_response": claude_response,
-                        "model": self.config.claude.model
+                        "model": self.config.claude.model,
+                        "session_messages": updated_session.context.len() + 1 // +1 for the assistant response we just added
                     })),
                 };
+
                 self.log_response("prompt", &response);
                 Ok(response)
             }
@@ -245,34 +371,43 @@ impl Agent for ClaudeAgent {
         }
     }
 
-    async fn cancel(&self, notification: CancelNotification) -> Result<(), agent_client_protocol::Error> {
+    async fn cancel(
+        &self,
+        notification: CancelNotification,
+    ) -> Result<(), agent_client_protocol::Error> {
         self.log_request("cancel", &notification);
         tracing::info!("Cancel notification received");
-        
+
         // Handle cancellation logic here
         Ok(())
     }
 
-    async fn ext_method(&self, request: ExtRequest) -> Result<Arc<RawValue>, agent_client_protocol::Error> {
+    async fn ext_method(
+        &self,
+        request: ExtRequest,
+    ) -> Result<Arc<RawValue>, agent_client_protocol::Error> {
         self.log_request("ext_method", &request);
         tracing::info!("Extension method called: {}", request.method);
-        
+
         // Return a placeholder response
         let response = serde_json::json!({
             "method": request.method,
             "result": "Extension method not implemented"
         });
-        
+
         let raw_value = RawValue::from_string(response.to_string())
             .map_err(|_e| agent_client_protocol::Error::internal_error())?;
-        
+
         Ok(Arc::from(raw_value))
     }
 
-    async fn ext_notification(&self, notification: ExtNotification) -> Result<(), agent_client_protocol::Error> {
+    async fn ext_notification(
+        &self,
+        notification: ExtNotification,
+    ) -> Result<(), agent_client_protocol::Error> {
         self.log_request("ext_notification", &notification);
         tracing::info!("Extension notification received: {}", notification.method);
-        
+
         // Handle extension notifications
         Ok(())
     }
@@ -283,20 +418,20 @@ mod tests {
     use super::*;
     // Import specific types as needed
     use std::sync::Arc;
-    
+
     fn create_test_agent() -> ClaudeAgent {
         let config = AgentConfig::default();
         ClaudeAgent::new(config).unwrap()
     }
-    
+
     #[tokio::test]
     async fn test_initialize() {
         let agent = create_test_agent();
-        
+
         let request = InitializeRequest {
             client_capabilities: agent_client_protocol::ClientCapabilities {
-                fs: agent_client_protocol::FileSystemCapability { 
-                    read_text_file: true, 
+                fs: agent_client_protocol::FileSystemCapability {
+                    read_text_file: true,
                     write_text_file: true,
                     meta: None,
                 },
@@ -306,43 +441,43 @@ mod tests {
             protocol_version: Default::default(),
             meta: None,
         };
-        
+
         let response = agent.initialize(request).await.unwrap();
-        
+
         assert!(response.agent_capabilities.meta.is_some());
         assert!(!response.auth_methods.is_empty());
         assert!(response.meta.is_some());
         // Protocol version should be the default value
         assert_eq!(response.protocol_version, Default::default());
     }
-    
+
     #[tokio::test]
     async fn test_authenticate() {
         let agent = create_test_agent();
-        
+
         let request = AuthenticateRequest {
             method_id: agent_client_protocol::AuthMethodId("none".to_string().into()),
             meta: None,
         };
-        
+
         let response = agent.authenticate(request).await.unwrap();
         assert!(response.meta.is_some());
     }
-    
+
     #[tokio::test]
     async fn test_new_session() {
         let agent = create_test_agent();
-        
+
         let request = NewSessionRequest {
             cwd: std::path::PathBuf::from("/tmp"),
             mcp_servers: vec![],
             meta: Some(serde_json::json!({"test": true})),
         };
-        
+
         let response = agent.new_session(request).await.unwrap();
         assert!(!response.session_id.0.is_empty());
         assert!(response.meta.is_some());
-        
+
         // Verify the session was actually created
         let session_id = response.session_id.0.parse().unwrap();
         let session = agent.session_manager.get_session(&session_id).unwrap();
@@ -352,7 +487,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_session() {
         let agent = create_test_agent();
-        
+
         // First create a session
         let new_request = NewSessionRequest {
             cwd: std::path::PathBuf::from("/tmp"),
@@ -360,7 +495,7 @@ mod tests {
             meta: Some(serde_json::json!({"test": true})),
         };
         let new_response = agent.new_session(new_request).await.unwrap();
-        
+
         // Now load it
         let load_request = LoadSessionRequest {
             session_id: new_response.session_id,
@@ -368,7 +503,7 @@ mod tests {
             mcp_servers: vec![],
             meta: None,
         };
-        
+
         let load_response = agent.load_session(load_request).await.unwrap();
         assert!(load_response.meta.is_some());
     }
@@ -376,14 +511,14 @@ mod tests {
     #[tokio::test]
     async fn test_load_nonexistent_session() {
         let agent = create_test_agent();
-        
+
         let request = LoadSessionRequest {
             session_id: SessionId("01234567890123456789012345".to_string().into()), // Invalid ULID
             cwd: std::path::PathBuf::from("/tmp"),
             mcp_servers: vec![],
             meta: None,
         };
-        
+
         let result = agent.load_session(request).await;
         assert!(result.is_err());
     }
@@ -391,13 +526,13 @@ mod tests {
     #[tokio::test]
     async fn test_set_session_mode() {
         let agent = create_test_agent();
-        
+
         let request = SetSessionModeRequest {
             session_id: SessionId("test_session".to_string().into()),
             mode_id: agent_client_protocol::SessionModeId("interactive".to_string().into()),
             meta: Some(serde_json::json!({"mode": "interactive"})),
         };
-        
+
         let response = agent.set_session_mode(request).await.unwrap();
         assert!(response.meta.is_some());
     }
@@ -405,19 +540,27 @@ mod tests {
     #[tokio::test]
     async fn test_prompt() {
         let agent = create_test_agent();
-        
+
+        // First create a session
+        let new_session_request = NewSessionRequest {
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![],
+            meta: None,
+        };
+        let new_session_response = agent.new_session(new_session_request).await.unwrap();
+
         let request = PromptRequest {
-            session_id: SessionId("test_session".to_string().into()),
+            session_id: new_session_response.session_id,
             prompt: vec![agent_client_protocol::ContentBlock::Text(
-                agent_client_protocol::TextContent { 
+                agent_client_protocol::TextContent {
                     text: "Hello, world!".to_string(),
                     annotations: None,
                     meta: None,
-                }
+                },
             )],
             meta: Some(serde_json::json!({"prompt": "Hello, world!"})),
         };
-        
+
         let response = agent.prompt(request).await.unwrap();
         assert!(response.meta.is_some());
     }
@@ -425,12 +568,12 @@ mod tests {
     #[tokio::test]
     async fn test_cancel() {
         let agent = create_test_agent();
-        
+
         let notification = CancelNotification {
             session_id: SessionId("test_session".to_string().into()),
             meta: Some(serde_json::json!({"reason": "user_request"})),
         };
-        
+
         let result = agent.cancel(notification).await;
         assert!(result.is_ok());
     }
@@ -438,12 +581,12 @@ mod tests {
     #[tokio::test]
     async fn test_ext_method() {
         let agent = create_test_agent();
-        
+
         let request = ExtRequest {
             method: "test_method".to_string().into(),
             params: Arc::from(RawValue::from_string("{}".to_string()).unwrap()),
         };
-        
+
         let response = agent.ext_method(request).await.unwrap();
         assert!(!response.get().is_empty());
     }
@@ -451,12 +594,12 @@ mod tests {
     #[tokio::test]
     async fn test_ext_notification() {
         let agent = create_test_agent();
-        
+
         let notification = ExtNotification {
             method: "test_notification".to_string().into(),
             params: Arc::from(RawValue::from_string("{}".to_string()).unwrap()),
         };
-        
+
         let result = agent.ext_notification(notification).await;
         assert!(result.is_ok());
     }
@@ -466,8 +609,238 @@ mod tests {
         let config = AgentConfig::default();
         let agent = ClaudeAgent::new(config);
         assert!(agent.is_ok());
-        
+
         let agent = agent.unwrap();
         assert!(agent.capabilities.meta.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_full_prompt_flow() {
+        let agent = create_test_agent();
+
+        // Create session
+        let new_session_request = NewSessionRequest {
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![],
+            meta: None,
+        };
+        let new_session_response = agent.new_session(new_session_request).await.unwrap();
+
+        // Send prompt
+        let prompt_request = PromptRequest {
+            session_id: new_session_response.session_id.clone(),
+            prompt: vec![agent_client_protocol::ContentBlock::Text(
+                agent_client_protocol::TextContent {
+                    text: "Hello, how are you?".to_string(),
+                    annotations: None,
+                    meta: None,
+                },
+            )],
+            meta: Some(serde_json::json!({"test": "full_flow"})),
+        };
+
+        let prompt_response = agent.prompt(prompt_request).await.unwrap();
+
+        assert_eq!(prompt_response.stop_reason, StopReason::EndTurn);
+        assert!(prompt_response.meta.is_some());
+
+        // Verify session was updated with both user and assistant messages
+        let session_id = new_session_response.session_id.0.as_ref().parse().unwrap();
+        let session = agent
+            .session_manager
+            .get_session(&session_id)
+            .unwrap()
+            .unwrap();
+
+        // Should have user message and assistant response
+        assert_eq!(session.context.len(), 2);
+        assert!(matches!(
+            session.context[0].role,
+            crate::session::MessageRole::User
+        ));
+        assert_eq!(session.context[0].content, "Hello, how are you?");
+        assert!(matches!(
+            session.context[1].role,
+            crate::session::MessageRole::Assistant
+        ));
+        assert!(!session.context[1].content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_prompt_validation_invalid_session_id() {
+        let agent = create_test_agent();
+
+        // Test invalid session ID
+        let prompt_request = PromptRequest {
+            session_id: SessionId("invalid-uuid".to_string().into()),
+            prompt: vec![agent_client_protocol::ContentBlock::Text(
+                agent_client_protocol::TextContent {
+                    text: "Hello".to_string(),
+                    annotations: None,
+                    meta: None,
+                },
+            )],
+            meta: None,
+        };
+
+        let result = agent.prompt(prompt_request).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_prompt_validation_empty_prompt() {
+        let agent = create_test_agent();
+
+        // Create a valid session first
+        let new_session_request = NewSessionRequest {
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![],
+            meta: None,
+        };
+        let session_response = agent.new_session(new_session_request).await.unwrap();
+
+        // Test empty prompt
+        let prompt_request = PromptRequest {
+            session_id: session_response.session_id,
+            prompt: vec![agent_client_protocol::ContentBlock::Text(
+                agent_client_protocol::TextContent {
+                    text: "   ".to_string(), // Only whitespace
+                    annotations: None,
+                    meta: None,
+                },
+            )],
+            meta: None,
+        };
+
+        let result = agent.prompt(prompt_request).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_prompt_validation_non_text_content() {
+        let agent = create_test_agent();
+
+        // Create a valid session first
+        let new_session_request = NewSessionRequest {
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![],
+            meta: None,
+        };
+        let session_response = agent.new_session(new_session_request).await.unwrap();
+
+        // Test non-text content block
+        let prompt_request = PromptRequest {
+            session_id: session_response.session_id,
+            prompt: vec![agent_client_protocol::ContentBlock::Image(
+                agent_client_protocol::ImageContent {
+                    data: "base64data".to_string(),
+                    mime_type: "image/png".to_string(),
+                    uri: Some("data:image/png;base64,base64data".to_string()),
+                    annotations: None,
+                    meta: None,
+                },
+            )],
+            meta: None,
+        };
+
+        let result = agent.prompt(prompt_request).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_conversation_context_maintained() {
+        let agent = create_test_agent();
+
+        // Create session
+        let new_session_request = NewSessionRequest {
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![],
+            meta: None,
+        };
+        let new_session_response = agent.new_session(new_session_request).await.unwrap();
+
+        // Send first prompt
+        let prompt_request_1 = PromptRequest {
+            session_id: new_session_response.session_id.clone(),
+            prompt: vec![agent_client_protocol::ContentBlock::Text(
+                agent_client_protocol::TextContent {
+                    text: "My name is Alice".to_string(),
+                    annotations: None,
+                    meta: None,
+                },
+            )],
+            meta: None,
+        };
+
+        agent.prompt(prompt_request_1).await.unwrap();
+
+        // Send second prompt that references the first
+        let prompt_request_2 = PromptRequest {
+            session_id: new_session_response.session_id.clone(),
+            prompt: vec![agent_client_protocol::ContentBlock::Text(
+                agent_client_protocol::TextContent {
+                    text: "What is my name?".to_string(),
+                    annotations: None,
+                    meta: None,
+                },
+            )],
+            meta: None,
+        };
+
+        let response_2 = agent.prompt(prompt_request_2).await.unwrap();
+
+        // Verify session has 4 messages (2 user + 2 assistant)
+        let session_id = new_session_response.session_id.0.as_ref().parse().unwrap();
+        let session = agent
+            .session_manager
+            .get_session(&session_id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(session.context.len(), 4);
+
+        // Verify the sequence of messages
+        assert!(matches!(
+            session.context[0].role,
+            crate::session::MessageRole::User
+        ));
+        assert_eq!(session.context[0].content, "My name is Alice");
+        assert!(matches!(
+            session.context[1].role,
+            crate::session::MessageRole::Assistant
+        ));
+        assert!(matches!(
+            session.context[2].role,
+            crate::session::MessageRole::User
+        ));
+        assert_eq!(session.context[2].content, "What is my name?");
+        assert!(matches!(
+            session.context[3].role,
+            crate::session::MessageRole::Assistant
+        ));
+
+        assert_eq!(response_2.stop_reason, StopReason::EndTurn);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_nonexistent_session() {
+        let agent = create_test_agent();
+
+        // Use a valid ULID but for a session that doesn't exist
+        let nonexistent_session_id = ulid::Ulid::new();
+        let prompt_request = PromptRequest {
+            session_id: SessionId(nonexistent_session_id.to_string().into()),
+            prompt: vec![agent_client_protocol::ContentBlock::Text(
+                agent_client_protocol::TextContent {
+                    text: "Hello".to_string(),
+                    annotations: None,
+                    meta: None,
+                },
+            )],
+            meta: None,
+        };
+
+        let result = agent.prompt(prompt_request).await;
+        assert!(result.is_err());
     }
 }

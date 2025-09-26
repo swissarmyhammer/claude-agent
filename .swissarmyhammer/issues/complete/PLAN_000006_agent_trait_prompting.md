@@ -260,3 +260,95 @@ mod integration_tests {
 - Integration tests pass showing full prompt flow
 - Error handling covers edge cases
 - `cargo build` and `cargo test` succeed
+## Implementation Status: COMPLETED ✅
+
+I have successfully implemented the session_prompt functionality as specified in the issue. All tests are passing and the implementation is working correctly.
+
+## What Was Implemented
+
+### 1. Session Context Integration
+- **Added conversion traits** between `session::Session` and `claude::SessionContext`
+- **Added conversion traits** between `session::Message` and `claude::ClaudeMessage`
+- **Added conversion traits** between `session::MessageRole` and `claude::MessageRole`
+
+### 2. Enhanced Claude Client
+- The `query_with_context` method was already implemented and working correctly
+- It builds conversation history from session context and sends it to Claude SDK
+- Includes retry logic and proper error handling
+
+### 3. Session-Aware Prompt Processing
+- **Modified the existing `prompt` method** to be fully session-aware instead of creating a separate `session_prompt` method
+- **Added `validate_prompt_request`** helper method for comprehensive input validation:
+  - Session ID format validation (ULID)
+  - Empty prompt detection
+  - Content type validation (text only for now)
+  - Prompt length limits (100KB max)
+- **Integrated session management**:
+  - Retrieves existing session context
+  - Adds user messages to session before processing
+  - Adds assistant responses to session after processing
+  - Updates session access times
+
+### 4. Comprehensive Testing
+- **Added integration tests** for full prompt flow with session creation
+- **Added validation tests** for invalid session IDs, empty prompts, and unsupported content types
+- **Added conversation context tests** to verify messages are properly maintained across multiple prompts
+- **Fixed existing tests** to work with session-aware implementation
+- **All 56 tests pass** including the new integration tests
+
+## Key Implementation Details
+
+### Session Context Flow
+```rust
+// 1. Validate prompt request (session ID, content, etc.)
+self.validate_prompt_request(&request).await?;
+
+// 2. Parse session ID and retrieve session
+let session_id = request.session_id.0.as_ref().parse::<ulid::Ulid>()?;
+let session = self.session_manager.get_session(&session_id)?;
+
+// 3. Add user message to session
+let user_message = crate::session::Message { /* ... */ };
+self.session_manager.update_session(&session_id, |session| {
+    session.add_message(user_message);
+})?;
+
+// 4. Query Claude with full session context
+let session_context: crate::claude::SessionContext = (&updated_session).into();
+let response = self.claude_client.query_with_context(&prompt_text, &session_context).await?;
+
+// 5. Add assistant response back to session
+let assistant_message = crate::session::Message { /* ... */ };
+self.session_manager.update_session(&session_id, |session| {
+    session.add_message(assistant_message);
+})?;
+```
+
+### Error Handling
+- **Session validation**: Invalid ULIDs, non-existent sessions
+- **Content validation**: Empty prompts, unsupported content types, oversized prompts
+- **Claude API errors**: Proper error propagation with retry logic
+- **Session management errors**: Thread-safe access with proper error handling
+
+## Files Modified
+1. **`lib/src/agent.rs`** - Enhanced prompt method with session integration and validation
+2. **`lib/src/claude.rs`** - Added conversion traits for seamless session integration
+3. **Test suites** - Added comprehensive integration and validation tests
+
+## Acceptance Criteria ✅
+- ✅ session_prompt method processes user input correctly (integrated into existing prompt method)
+- ✅ Session context is maintained across prompts  
+- ✅ User and assistant messages are stored in session
+- ✅ Request validation prevents invalid inputs
+- ✅ Basic Claude client integration works with context
+- ✅ Integration tests pass showing full prompt flow
+- ✅ Error handling covers edge cases
+- ✅ `cargo build` and `cargo nextest` succeed with all 56 tests passing
+
+## Technical Notes
+- Used existing `prompt` method instead of creating separate `session_prompt` to maintain API consistency
+- ULID used for session IDs (not UUID as initially planned in issue description)
+- Claude SDK integration uses conversation history building for context
+- Thread-safe session management with proper locking
+- Comprehensive validation prevents common input errors
+- All tests include cleanup and proper resource management

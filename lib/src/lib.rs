@@ -4,15 +4,15 @@
 //! wrapping Claude Code functionality to enable any ACP-compatible client
 //! to interact with Claude Code.
 
+pub mod agent;
+pub mod claude;
 pub mod config;
 pub mod error;
-pub mod claude;
 pub mod session;
-pub mod agent;
 
+pub use agent::ClaudeAgent;
 pub use config::AgentConfig;
 pub use error::{AgentError, Result};
-pub use agent::ClaudeAgent;
 
 /// The main Claude Agent ACP server
 pub struct ClaudeAgentServer {
