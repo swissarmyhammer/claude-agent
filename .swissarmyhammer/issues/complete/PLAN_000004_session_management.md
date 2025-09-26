@@ -242,3 +242,58 @@ mod tests {
 - Session cleanup removes expired sessions
 - Unit tests pass for all functionality
 - `cargo build` and `cargo test` succeed
+
+## Proposed Solution
+
+Based on my analysis of the existing codebase, I will implement the session management system as follows:
+
+### Implementation Steps:
+1. **Create `lib/src/session.rs`** - Implement Session, Message, MessageRole types and SessionManager
+2. **Use existing dependencies** - Leverage ulid for SessionId (instead of uuid), existing error types, and tokio for async cleanup
+3. **Thread-safe design** - Use Arc<RwLock<HashMap>> for concurrent access to sessions
+4. **Cleanup mechanism** - Implement async cleanup task with configurable intervals
+5. **Integration** - Export session module in lib.rs and ensure error handling integrates with existing AgentError types
+
+### Key Design Decisions:
+- Use `ulid::Ulid` instead of `uuid::Uuid` for SessionId (aligns with workspace dependencies)
+- Integrate with existing `AgentError::Session` variant for error handling  
+- Follow existing code patterns for module structure and testing
+- Use proper Rust conventions for async cleanup tasks
+
+This approach will provide a thread-safe, efficient session management system that integrates seamlessly with the existing Claude Agent architecture.
+## Implementation Complete
+
+✅ **Session Management System Successfully Implemented**
+
+### What was implemented:
+1. **`lib/src/session.rs`** - Complete session management system with:
+   - `Session` struct with conversation context and metadata
+   - `Message` and `MessageRole` types for conversation history
+   - `SessionManager` with thread-safe operations using `Arc<RwLock<HashMap>>`
+   - Async cleanup task for removing expired sessions
+   - Comprehensive error handling using existing `AgentError::Session` variant
+
+2. **Updated `lib/src/lib.rs`** - Added session module export
+
+3. **Key Features Implemented**:
+   - Thread-safe session creation, retrieval, updating, and removal
+   - ULID-based session identifiers (following workspace conventions)
+   - Configurable cleanup intervals and session expiration times  
+   - Message history tracking with timestamps
+   - Client capabilities and MCP server association per session
+   - Comprehensive unit and integration tests (39 tests total)
+
+### Test Results:
+- ✅ All 39 tests pass including new session management tests
+- ✅ `cargo build` succeeds without errors
+- ✅ `cargo clippy` shows only pre-existing warnings in unrelated code
+- ✅ No dead code warnings for session module
+
+### Integration:
+The session management system integrates seamlessly with the existing Claude Agent architecture using:
+- Existing `AgentError` types for consistent error handling
+- ULID for session IDs (matching workspace dependency choices)
+- Tokio for async cleanup tasks
+- Proper logging with tracing crate
+
+The implementation is production-ready and follows all Rust best practices including thread safety, proper error handling, and comprehensive testing.

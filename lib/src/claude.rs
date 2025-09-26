@@ -87,7 +87,7 @@ impl ClaudeClient {
             }
             
             let response = self.client.send_full(prompt).await
-                .map_err(|e| crate::error::AgentError::Claude(e))?;
+                .map_err(crate::error::AgentError::Claude)?;
             
             Ok(response.content)
         }).await
@@ -104,7 +104,7 @@ impl ClaudeClient {
         }
         
         let message_stream = self.client.query(prompt).stream().await
-            .map_err(|e| crate::error::AgentError::Claude(e))?;
+            .map_err(crate::error::AgentError::Claude)?;
         
         // Convert the MessageStream to our MessageChunk stream
         let chunk_stream = message_stream.map(|result| {

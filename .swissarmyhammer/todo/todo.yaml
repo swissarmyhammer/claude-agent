@@ -115,3 +115,47 @@ todo:
   task: Fix ClaudeResponse field access from result to content
   context: ClaudeResponse doesn't have a 'result' field, it has 'content', 'raw_json', 'metadata'. Need to update line 92 in claude.rs.
   done: false
+- id: 01K63F1QVHG528RR15JXT3R7V0
+  task: Check existing codebase for session management implementation
+  context: Search for existing session.rs or session management code to understand current state
+  done: true
+- id: 01K63F1XFQW8TB5GB37QM9E33R
+  task: Create lib/src/session.rs with session types and SessionManager
+  context: Implement Session, SessionManager structs and all required methods as specified in issue
+  done: true
+- id: 01K63F22XWNWV140CAHYW1ZB0V
+  task: Update lib/src/lib.rs to export session module
+  context: Add session module to lib.rs exports
+  done: true
+- id: 01K63F288NWWN54MYGDD4617QF
+  task: Run tests to ensure implementation works correctly
+  context: Execute cargo nextest run with proper flags as specified in rules
+  done: true
+- id: 01K63FMD24Y9CV90AP2A2KWZZZ
+  task: Check for existing CODE_REVIEW.md file
+  context: null
+  done: true
+- id: 01K63FMTB0TWBWE2Y6WXXVBQPG
+  task: Review lib/src/lib.rs for placeholders, coding standards violations, missing tests/docs
+  context: null
+  done: true
+- id: 01K63FMXQWYCKE3H5YN40XVETB
+  task: Review lib/src/session.rs for placeholders, coding standards violations, missing tests/docs
+  context: null
+  done: true
+- id: 01K63FN2CECT9N176G8MM4EHES
+  task: Run cargo clippy and cargo fmt to check for lint issues
+  context: null
+  done: true
+- id: 01K63FQQT6JERT18DBPW2VW95Y
+  task: Fix redundant closure in lib/src/claude.rs:90
+  context: Replace |e| crate::error::AgentError::Claude(e) with crate::error::AgentError::Claude
+  done: false
+- id: 01K63FQV2R0J0SVG7GMS6S2D0Q
+  task: Fix redundant closure in lib/src/claude.rs:107
+  context: Replace |e| crate::error::AgentError::Claude(e) with crate::error::AgentError::Claude
+  done: false
+- id: 01K63FQYFHSQ1ZP06XQG6BWF98
+  task: Fix dead code warnings by implementing actual Claude SDK usage
+  context: Client and config fields never read, execute_with_retry and is_retryable methods never used
+  done: false
