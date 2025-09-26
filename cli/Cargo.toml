@@ -1,0 +1,19 @@
+[package]
+name = "claude-agent-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Command-line interface for Claude Agent ACP server"
+authors = ["Claude Agent"]
+license = "MIT"
+
+[[bin]]
+name = "claude-agent"
+path = "src/main.rs"
+
+[dependencies]
+claude-agent-lib = { path = "../lib" }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }

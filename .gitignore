@@ -1,2 +1,20 @@
+# SwissArmyHammer
 mcp.log
 .swissarmyhammer/tmp
+.swissarmyhammer/search.db
+
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
