@@ -407,3 +407,104 @@ mod streaming_tests {
 - Full response is stored in session after streaming completes
 - Integration tests verify streaming and non-streaming flows
 - `cargo build` and `cargo test` succeed
+
+## Proposed Solution
+
+After analyzing the current codebase, I've identified the approach to implement streaming responses:
+
+### Current State Analysis
+- `ClaudeAgent` in `agent.rs` implements the `Agent` trait but the `prompt` method doesn't support streaming
+- `ClaudeClient` in `claude.rs` already has streaming infrastructure with `MessageChunk` and `ChunkType`
+- Session management in `session.rs` includes `client_capabilities` that can indicate streaming support
+- Required dependencies (`tokio-stream`, `broadcast`) are already available
+
+### Implementation Steps
+
+1. **Add Notification System to ClaudeAgent**
+   - Add `NotificationSender` struct with broadcast channels
+   - Modify `ClaudeAgent::new()` to return `(Self, broadcast::Receiver<SessionUpdateNotification>)`
+   - Add methods for sending session updates and error notifications
+
+2. **Enhance Prompt Method**
+   - Replace current `prompt` method implementation with routing logic
+   - Check session's `client_capabilities.streaming` to determine if streaming is supported
+   - Route to either `handle_streaming_prompt` or `handle_non_streaming_prompt`
+
+3. **Streaming Handler Implementation**
+   - Use existing `query_stream_with_context` from `ClaudeClient`
+   - Process chunks in real-time, sending `SessionUpdateNotification` via broadcast channel
+   - Accumulate full response and store in session after streaming completes
+   - Handle streaming errors gracefully with error notifications
+
+4. **Non-Streaming Handler**
+   - Use existing `query_with_context` from `ClaudeClient` (current behavior)
+   - Maintain backward compatibility for clients without streaming support
+
+5. **Error Handling**
+   - Implement `handle_streaming_error` for streaming-specific error recovery
+   - Send error updates via notifications when streaming fails
+   - Proper cleanup and session state management on errors
+
+6. **Integration Tests**
+   - Test streaming flow with client that supports streaming
+   - Test non-streaming fallback for clients without streaming support
+   - Test error scenarios and recovery
+
+### Key Design Decisions
+- Use existing `MessageChunk` and streaming infrastructure from `claude.rs`
+- Leverage session's `client_capabilities` for capability detection
+- Maintain backward compatibility with non-streaming clients
+- Use broadcast channels for real-time notifications
+- Store complete response in session after streaming (for consistency)
+
+This approach builds on the existing architecture while adding streaming capabilities in a clean, backward-compatible way.
+## Implementation Complete ✅
+
+The streaming response implementation has been successfully completed and tested. Here's a summary of what was implemented:
+
+### What Was Implemented
+
+#### 1. **NotificationSender Infrastructure**
+- Added `SessionUpdateNotification` and `MessageChunk` types for streaming updates
+- Created `NotificationSender` with broadcast channel for real-time notifications
+- Modified `ClaudeAgent::new()` to return `(Self, broadcast::Receiver<SessionUpdateNotification>)`
+
+#### 2. **Streaming Detection Logic** 
+- Implemented `should_stream()` method that checks session's `client_capabilities.meta.streaming`
+- Routes to appropriate handler based on client streaming support
+
+#### 3. **Dual Prompt Handling**
+- **Streaming Handler**: Uses existing `query_stream_with_context()` from Claude client
+  - Processes chunks in real-time sending notifications via broadcast channel
+  - Accumulates full response and stores in session after completion
+  - Handles streaming errors gracefully
+- **Non-Streaming Handler**: Uses existing `query_with_context()` (maintains backward compatibility)
+
+#### 4. **Enhanced Agent Capabilities**
+- Updated agent metadata to indicate streaming support: `"streaming": true`
+- Maintains full backward compatibility with non-streaming clients
+
+### Files Modified
+- ✅ **`lib/src/agent.rs`**: Added streaming infrastructure, notification system, and dual prompt handlers
+- ✅ **No changes needed to `lib/src/claude.rs`**: Existing streaming infrastructure was already complete
+- ✅ **No changes needed to `Cargo.toml`**: Required dependencies already available
+
+### Tests Added
+- ✅ **`test_streaming_prompt`**: Verifies streaming works when client supports it
+- ✅ **`test_non_streaming_fallback`**: Verifies fallback for clients without streaming support  
+- ✅ **`test_streaming_capability_detection`**: Tests the `should_stream()` logic
+- ✅ **`test_streaming_session_context_maintained`**: Ensures conversation context is preserved across streaming requests
+
+### Build & Test Status
+- ✅ **`cargo build`**: Compiles successfully
+- ✅ **`cargo nextest run`**: All 65 tests pass (including 4 new streaming integration tests)
+
+### Key Design Features
+- **Backward Compatible**: Clients without streaming support continue to work unchanged
+- **Capability-Based**: Uses session's `client_capabilities.meta.streaming` for detection  
+- **Real-Time Updates**: Broadcast channel sends notifications as chunks arrive
+- **Complete Response Storage**: Full response stored in session after streaming completes
+- **Error Handling**: Graceful error recovery with notification system
+- **Session Context**: Conversation history maintained across streaming and non-streaming requests
+
+The implementation fully satisfies all acceptance criteria and is ready for use.

@@ -82,19 +82,19 @@ todo:
 - id: 01K63K6EEFGP85RT2TQBWMBFYH
   task: Review lib/src/config.rs - check for TODOs, coding standards, tests, documentation
   context: null
-  done: false
+  done: true
 - id: 01K63K6HF7V7KGF0HP037C4HPN
   task: Review lib/src/lib.rs - check for TODOs, coding standards, tests, documentation
   context: null
-  done: false
+  done: true
 - id: 01K63K6MZ9GF5D83XW28MPKVJ2
   task: Review lib/src/tools.rs - check for TODOs, coding standards, tests, documentation
   context: null
-  done: false
+  done: true
 - id: 01K63K6RHJJCTD7T2YWKT6NNED
   task: Run cargo clippy and cargo fmt to check for lint issues
   context: null
-  done: false
+  done: true
 - id: 01K63KBAN7P5536PN0HQF57ST7
   task: Fix TODO placeholder in tools.rs:148 - handle_terminal_create
   context: Replace todo!() with proper implementation or error handling
@@ -127,3 +127,27 @@ todo:
   task: Create code review todo items for current branch
   context: Review changed files on issue/PLAN_000007_tool_call_foundation branch for completeness, standards violations, missing tests, and improvements
   done: true
+- id: 01K63NA0X4Y75K6286W0D7QHF0
+  task: Review lib/src/agent.rs for code quality, standards violations, missing tests, and documentation
+  context: null
+  done: false
+- id: 01K63NA49PZNBBTZFHQ2T7JFDV
+  task: Review lib/src/claude.rs for code quality, standards violations, missing tests, and documentation
+  context: null
+  done: false
+- id: 01K63NA7WJ727A40ER1G9ZTQMT
+  task: Review lib/src/config.rs for code quality, standards violations, missing tests, and documentation
+  context: null
+  done: false
+- id: 01K63NABVDRBRQHYDMVM704XPF
+  task: Review lib/src/error.rs for code quality, standards violations, missing tests, and documentation
+  context: null
+  done: false
+- id: 01K63ND4FBWS1NRZNHPN97WV2D
+  task: Fix TODO in lib/src/lib.rs - implement proper ACP server integration
+  context: The start_stdio method has a TODO comment about implementing proper ACP server using agent_client_protocol crate. This needs to be implemented to complete the server functionality.
+  done: false
+- id: 01K63NDWM3963H7CSQ06B8CHW8
+  task: Fix clippy warning - remove unused send_error_update method
+  context: Method `send_error_update` in lib/src/agent.rs:321 is never used and should be removed to clean up dead code warning
+  done: false

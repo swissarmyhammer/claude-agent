@@ -5,11 +5,48 @@ use crate::{
 };
 use agent_client_protocol::{
     Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    ExtNotification, ExtRequest, InitializeRequest, InitializeResponse, LoadSessionRequest,
-    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    RawValue, SessionId, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    ContentBlock, ExtNotification, ExtRequest, InitializeRequest, InitializeResponse,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
+    PromptResponse, RawValue, SessionId, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    TextContent,
 };
 use std::sync::Arc;
+use tokio::sync::broadcast;
+use tokio_stream::StreamExt;
+
+/// Session update notification for streaming responses
+#[derive(Debug, Clone)]
+pub struct SessionUpdateNotification {
+    pub session_id: String,
+    pub message_chunk: Option<MessageChunk>,
+}
+
+/// Message chunk for streaming responses
+#[derive(Debug, Clone)]
+pub struct MessageChunk {
+    pub content: Vec<ContentBlock>,
+}
+
+/// Notification sender for streaming updates
+pub struct NotificationSender {
+    sender: broadcast::Sender<SessionUpdateNotification>,
+}
+
+impl NotificationSender {
+    /// Create a new notification sender with receiver
+    pub fn new() -> (Self, broadcast::Receiver<SessionUpdateNotification>) {
+        let (sender, receiver) = broadcast::channel(1000);
+        (Self { sender }, receiver)
+    }
+
+    /// Send a session update notification
+    pub async fn send_update(&self, update: SessionUpdateNotification) -> crate::Result<()> {
+        self.sender
+            .send(update)
+            .map_err(|_| crate::AgentError::Protocol("Failed to send notification".to_string()))?;
+        Ok(())
+    }
+}
 
 /// The main Claude Agent implementing the Agent Client Protocol
 pub struct ClaudeAgent {
@@ -18,14 +55,19 @@ pub struct ClaudeAgent {
     tool_handler: Arc<ToolCallHandler>,
     config: AgentConfig,
     capabilities: AgentCapabilities,
+    notification_sender: Arc<NotificationSender>,
 }
 
 impl ClaudeAgent {
     /// Create a new Claude Agent instance
-    pub fn new(config: AgentConfig) -> crate::Result<Self> {
+    pub fn new(
+        config: AgentConfig,
+    ) -> crate::Result<(Self, broadcast::Receiver<SessionUpdateNotification>)> {
         let session_manager = Arc::new(SessionManager::new());
         let claude_client = Arc::new(ClaudeClient::new_with_config(&config.claude)?);
         let tool_handler = Arc::new(ToolCallHandler::new(config.security.to_tool_permissions()));
+
+        let (notification_sender, notification_receiver) = NotificationSender::new();
 
         let capabilities = AgentCapabilities {
             load_session: true,
@@ -46,17 +88,21 @@ impl ClaudeAgent {
                     "fs_write",
                     "terminal_create",
                     "terminal_write"
-                ]
+                ],
+                "streaming": true
             })),
         };
 
-        Ok(Self {
+        let agent = Self {
             session_manager,
             claude_client,
             tool_handler,
             config,
             capabilities,
-        })
+            notification_sender: Arc::new(notification_sender),
+        };
+
+        Ok((agent, notification_receiver))
     }
 
     /// Log incoming request for debugging purposes
@@ -120,6 +166,158 @@ impl ClaudeAgent {
 
         Ok(())
     }
+
+    /// Check if streaming is supported for this session
+    fn should_stream(&self, session: &crate::session::Session, _request: &PromptRequest) -> bool {
+        // Check if client supports streaming
+        session
+            .client_capabilities
+            .as_ref()
+            .and_then(|caps| caps.meta.as_ref())
+            .and_then(|meta| meta.get("streaming"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// Handle streaming prompt request
+    async fn handle_streaming_prompt(
+        &self,
+        session_id: &ulid::Ulid,
+        request: &PromptRequest,
+        session: &crate::session::Session,
+    ) -> Result<PromptResponse, agent_client_protocol::Error> {
+        tracing::info!("Handling streaming prompt for session: {}", session_id);
+
+        // Extract text content from the prompt
+        let mut prompt_text = String::new();
+        for content_block in &request.prompt {
+            match content_block {
+                ContentBlock::Text(text_content) => {
+                    prompt_text.push_str(&text_content.text);
+                }
+                _ => {
+                    return Err(agent_client_protocol::Error::invalid_params());
+                }
+            }
+        }
+
+        let context: crate::claude::SessionContext = session.into();
+        let mut stream = self
+            .claude_client
+            .query_stream_with_context(&prompt_text, &context)
+            .await
+            .map_err(|_| agent_client_protocol::Error::internal_error())?;
+
+        let mut full_response = String::new();
+        let mut chunk_count = 0;
+
+        while let Some(chunk) = stream.next().await {
+            chunk_count += 1;
+            full_response.push_str(&chunk.content);
+
+            // Send real-time update via session/update notification
+            if let Err(e) = self
+                .send_session_update(SessionUpdateNotification {
+                    session_id: session_id.to_string(),
+                    message_chunk: Some(MessageChunk {
+                        content: vec![ContentBlock::Text(TextContent {
+                            text: chunk.content,
+                            annotations: None,
+                            meta: None,
+                        })],
+                    }),
+                })
+                .await
+            {
+                tracing::warn!("Failed to send session update: {}", e);
+            }
+        }
+
+        tracing::info!("Completed streaming response with {} chunks", chunk_count);
+
+        // Store complete response in session
+        let assistant_message = crate::session::Message {
+            role: crate::session::MessageRole::Assistant,
+            content: full_response,
+            timestamp: std::time::SystemTime::now(),
+        };
+
+        self.session_manager
+            .update_session(session_id, |session| {
+                session.add_message(assistant_message);
+            })
+            .map_err(|_| agent_client_protocol::Error::internal_error())?;
+
+        Ok(PromptResponse {
+            stop_reason: StopReason::EndTurn,
+            meta: Some(serde_json::json!({
+                "processed": true,
+                "streaming": true,
+                "chunks_sent": chunk_count,
+                "session_messages": session.context.len() + 1
+            })),
+        })
+    }
+
+    /// Handle non-streaming prompt request
+    async fn handle_non_streaming_prompt(
+        &self,
+        session_id: &ulid::Ulid,
+        request: &PromptRequest,
+        session: &crate::session::Session,
+    ) -> Result<PromptResponse, agent_client_protocol::Error> {
+        tracing::info!("Handling non-streaming prompt for session: {}", session_id);
+
+        // Extract text content from the prompt
+        let mut prompt_text = String::new();
+        for content_block in &request.prompt {
+            match content_block {
+                ContentBlock::Text(text_content) => {
+                    prompt_text.push_str(&text_content.text);
+                }
+                _ => {
+                    return Err(agent_client_protocol::Error::invalid_params());
+                }
+            }
+        }
+
+        let context: crate::claude::SessionContext = session.into();
+        let response_content = self
+            .claude_client
+            .query_with_context(&prompt_text, &context)
+            .await
+            .map_err(|_| agent_client_protocol::Error::internal_error())?;
+
+        // Store assistant response in session
+        let assistant_message = crate::session::Message {
+            role: crate::session::MessageRole::Assistant,
+            content: response_content.clone(),
+            timestamp: std::time::SystemTime::now(),
+        };
+
+        self.session_manager
+            .update_session(session_id, |session| {
+                session.add_message(assistant_message);
+            })
+            .map_err(|_| agent_client_protocol::Error::internal_error())?;
+
+        Ok(PromptResponse {
+            stop_reason: StopReason::EndTurn,
+            meta: Some(serde_json::json!({
+                "processed": true,
+                "streaming": false,
+                "claude_response": response_content,
+                "session_messages": session.context.len() + 1
+            })),
+        })
+    }
+
+    /// Send session update notification
+    async fn send_session_update(&self, update: SessionUpdateNotification) -> crate::Result<()> {
+        self.notification_sender.send_update(update).await
+    }
+
+
 }
 
 #[async_trait::async_trait(?Send)]
@@ -302,7 +500,7 @@ impl Agent for ClaudeAgent {
         let mut prompt_text = String::new();
         for content_block in &request.prompt {
             match content_block {
-                agent_client_protocol::ContentBlock::Text(text_content) => {
+                ContentBlock::Text(text_content) => {
                     prompt_text.push_str(&text_content.text);
                 }
                 _ => {
@@ -312,8 +510,9 @@ impl Agent for ClaudeAgent {
             }
         }
 
-        // Validate session exists
-        self.session_manager
+        // Validate session exists and get it
+        let session = self
+            .session_manager
             .get_session(&session_id)
             .map_err(|_| agent_client_protocol::Error::internal_error())?
             .ok_or_else(agent_client_protocol::Error::invalid_params)?;
@@ -331,55 +530,24 @@ impl Agent for ClaudeAgent {
             })
             .map_err(|_| agent_client_protocol::Error::internal_error())?;
 
-        // Query Claude with session context
+        // Get updated session for context
         let updated_session = self
             .session_manager
             .get_session(&session_id)
             .map_err(|_| agent_client_protocol::Error::internal_error())?
             .ok_or_else(agent_client_protocol::Error::internal_error)?;
 
-        let session_context: crate::claude::SessionContext = (&updated_session).into();
+        // Check if streaming is supported and requested
+        let response = if self.should_stream(&session, &request) {
+            self.handle_streaming_prompt(&session_id, &request, &updated_session)
+                .await?
+        } else {
+            self.handle_non_streaming_prompt(&session_id, &request, &updated_session)
+                .await?
+        };
 
-        match self
-            .claude_client
-            .query_with_context(&prompt_text, &session_context)
-            .await
-        {
-            Ok(claude_response) => {
-                tracing::info!("Successfully processed prompt for session: {}", session_id);
-
-                // Add assistant response to session
-                let assistant_message = crate::session::Message {
-                    role: crate::session::MessageRole::Assistant,
-                    content: claude_response.clone(),
-                    timestamp: std::time::SystemTime::now(),
-                };
-
-                self.session_manager
-                    .update_session(&session_id, |session| {
-                        session.add_message(assistant_message);
-                    })
-                    .map_err(|_| agent_client_protocol::Error::internal_error())?;
-
-                let response = PromptResponse {
-                    stop_reason: StopReason::EndTurn,
-                    meta: Some(serde_json::json!({
-                        "processed": true,
-                        "response_type": "text",
-                        "claude_response": claude_response,
-                        "model": self.config.claude.model,
-                        "session_messages": updated_session.context.len() + 1 // +1 for the assistant response we just added
-                    })),
-                };
-
-                self.log_response("prompt", &response);
-                Ok(response)
-            }
-            Err(e) => {
-                tracing::error!("Claude client error: {:?}", e);
-                Err(agent_client_protocol::Error::internal_error())
-            }
-        }
+        self.log_response("prompt", &response);
+        Ok(response)
     }
 
     async fn cancel(
@@ -432,7 +600,7 @@ mod tests {
 
     fn create_test_agent() -> ClaudeAgent {
         let config = AgentConfig::default();
-        ClaudeAgent::new(config).unwrap()
+        ClaudeAgent::new(config).unwrap().0
     }
 
     #[tokio::test]
@@ -618,10 +786,10 @@ mod tests {
     #[test]
     fn test_agent_creation() {
         let config = AgentConfig::default();
-        let agent = ClaudeAgent::new(config);
-        assert!(agent.is_ok());
+        let result = ClaudeAgent::new(config);
+        assert!(result.is_ok());
 
-        let agent = agent.unwrap();
+        let (agent, _receiver) = result.unwrap();
         assert!(agent.capabilities.meta.is_some());
     }
 
@@ -853,5 +1021,301 @@ mod tests {
 
         let result = agent.prompt(prompt_request).await;
         assert!(result.is_err());
+    }
+
+    // Helper function for streaming tests
+    fn create_test_agent_with_notifications(
+    ) -> (ClaudeAgent, broadcast::Receiver<SessionUpdateNotification>) {
+        let config = AgentConfig::default();
+        ClaudeAgent::new(config).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_streaming_prompt() {
+        let (agent, _notification_receiver) = create_test_agent_with_notifications();
+
+        // Create session with streaming capabilities
+        let new_session_request = NewSessionRequest {
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![],
+            meta: Some(serde_json::json!({"streaming": true})),
+        };
+        let session_response = agent.new_session(new_session_request).await.unwrap();
+
+        // Update session to have client capabilities with streaming enabled
+        let session_id = session_response.session_id.0.as_ref().parse().unwrap();
+        agent
+            .session_manager
+            .update_session(&session_id, |session| {
+                session.client_capabilities = Some(agent_client_protocol::ClientCapabilities {
+                    fs: agent_client_protocol::FileSystemCapability {
+                        read_text_file: true,
+                        write_text_file: true,
+                        meta: None,
+                    },
+                    terminal: true,
+                    meta: Some(serde_json::json!({"streaming": true})),
+                });
+            })
+            .unwrap();
+
+        // Send streaming prompt
+        let prompt_request = PromptRequest {
+            session_id: session_response.session_id.clone(),
+            prompt: vec![ContentBlock::Text(TextContent {
+                text: "Tell me a story".to_string(),
+                annotations: None,
+                meta: None,
+            })],
+            meta: None,
+        };
+
+        // Execute streaming prompt directly (can't use tokio::spawn with ?Send trait)
+        let response = agent.prompt(prompt_request.clone()).await.unwrap();
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+
+        // Verify streaming metadata is present
+        assert!(response.meta.is_some());
+        let meta = response.meta.unwrap();
+        assert_eq!(
+            meta.get("streaming").unwrap(),
+            &serde_json::Value::Bool(true)
+        );
+
+        // Verify session was updated with both user and assistant messages  
+        let session = agent
+            .session_manager
+            .get_session(&session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.context.len(), 2); // user + assistant
+        assert!(matches!(
+            session.context[0].role,
+            crate::session::MessageRole::User
+        ));
+        assert!(matches!(
+            session.context[1].role,
+            crate::session::MessageRole::Assistant
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_non_streaming_fallback() {
+        let (agent, _notification_receiver) = create_test_agent_with_notifications();
+
+        // Create session without streaming capabilities
+        let new_session_request = NewSessionRequest {
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![],
+            meta: None,
+        };
+        let session_response = agent.new_session(new_session_request).await.unwrap();
+
+        // Session should not have streaming capabilities (default)
+        let session_id = session_response.session_id.0.as_ref().parse().unwrap();
+        let session = agent
+            .session_manager
+            .get_session(&session_id)
+            .unwrap()
+            .unwrap();
+        assert!(session.client_capabilities.is_none());
+
+        let prompt_request = PromptRequest {
+            session_id: session_response.session_id,
+            prompt: vec![ContentBlock::Text(TextContent {
+                text: "Hello, world!".to_string(),
+                annotations: None,
+                meta: None,
+            })],
+            meta: None,
+        };
+
+        let result = agent.prompt(prompt_request).await;
+        assert!(result.is_ok());
+
+        let response = result.unwrap();
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert!(response.meta.is_some());
+
+        // Verify meta indicates non-streaming
+        let meta = response.meta.unwrap();
+        assert_eq!(
+            meta.get("streaming").unwrap(),
+            &serde_json::Value::Bool(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_capability_detection() {
+        let (agent, _) = create_test_agent_with_notifications();
+
+        // Create a session
+        let new_session_request = NewSessionRequest {
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![],
+            meta: None,
+        };
+        let session_response = agent.new_session(new_session_request).await.unwrap();
+        let session_id = session_response.session_id.0.as_ref().parse().unwrap();
+
+        // Test should_stream with no capabilities
+        let session = agent
+            .session_manager
+            .get_session(&session_id)
+            .unwrap()
+            .unwrap();
+        let dummy_request = PromptRequest {
+            session_id: session_response.session_id,
+            prompt: vec![],
+            meta: None,
+        };
+        assert!(!agent.should_stream(&session, &dummy_request));
+
+        // Add client capabilities without streaming
+        agent
+            .session_manager
+            .update_session(&session_id, |session| {
+                session.client_capabilities = Some(agent_client_protocol::ClientCapabilities {
+                    fs: agent_client_protocol::FileSystemCapability {
+                        read_text_file: true,
+                        write_text_file: true,
+                        meta: None,
+                    },
+                    terminal: true,
+                    meta: None, // No streaming meta
+                });
+            })
+            .unwrap();
+
+        let session = agent
+            .session_manager
+            .get_session(&session_id)
+            .unwrap()
+            .unwrap();
+        assert!(!agent.should_stream(&session, &dummy_request));
+
+        // Add streaming capability
+        agent
+            .session_manager
+            .update_session(&session_id, |session| {
+                session.client_capabilities = Some(agent_client_protocol::ClientCapabilities {
+                    fs: agent_client_protocol::FileSystemCapability {
+                        read_text_file: true,
+                        write_text_file: true,
+                        meta: None,
+                    },
+                    terminal: true,
+                    meta: Some(serde_json::json!({"streaming": true})),
+                });
+            })
+            .unwrap();
+
+        let session = agent
+            .session_manager
+            .get_session(&session_id)
+            .unwrap()
+            .unwrap();
+        assert!(agent.should_stream(&session, &dummy_request));
+    }
+
+    #[tokio::test]
+    async fn test_streaming_session_context_maintained() {
+        let (agent, _notification_receiver) = create_test_agent_with_notifications();
+
+        // Create session with streaming capabilities
+        let new_session_request = NewSessionRequest {
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![],
+            meta: Some(serde_json::json!({"streaming": true})),
+        };
+        let session_response = agent.new_session(new_session_request).await.unwrap();
+
+        // Update session to have client capabilities with streaming enabled
+        let session_id = session_response.session_id.0.as_ref().parse().unwrap();
+        agent
+            .session_manager
+            .update_session(&session_id, |session| {
+                session.client_capabilities = Some(agent_client_protocol::ClientCapabilities {
+                    fs: agent_client_protocol::FileSystemCapability {
+                        read_text_file: true,
+                        write_text_file: true,
+                        meta: None,
+                    },
+                    terminal: true,
+                    meta: Some(serde_json::json!({"streaming": true})),
+                });
+            })
+            .unwrap();
+
+        // Send first streaming prompt
+        let prompt_request_1 = PromptRequest {
+            session_id: session_response.session_id.clone(),
+            prompt: vec![ContentBlock::Text(TextContent {
+                text: "My name is Alice".to_string(),
+                annotations: None,
+                meta: None,
+            })],
+            meta: None,
+        };
+
+        let response_1 = agent.prompt(prompt_request_1).await.unwrap();
+        assert_eq!(response_1.stop_reason, StopReason::EndTurn);
+
+        // Send second prompt that references the first
+        let prompt_request_2 = PromptRequest {
+            session_id: session_response.session_id.clone(),
+            prompt: vec![ContentBlock::Text(TextContent {
+                text: "What is my name?".to_string(),
+                annotations: None,
+                meta: None,
+            })],
+            meta: None,
+        };
+
+        let response_2 = agent.prompt(prompt_request_2).await.unwrap();
+        assert_eq!(response_2.stop_reason, StopReason::EndTurn);
+
+        // Verify session has 4 messages (2 user + 2 assistant)
+        let session = agent
+            .session_manager
+            .get_session(&session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.context.len(), 4);
+
+        // Verify the sequence of messages
+        assert!(matches!(
+            session.context[0].role,
+            crate::session::MessageRole::User
+        ));
+        assert_eq!(session.context[0].content, "My name is Alice");
+        assert!(matches!(
+            session.context[1].role,
+            crate::session::MessageRole::Assistant
+        ));
+        assert!(matches!(
+            session.context[2].role,
+            crate::session::MessageRole::User
+        ));
+        assert_eq!(session.context[2].content, "What is my name?");
+        assert!(matches!(
+            session.context[3].role,
+            crate::session::MessageRole::Assistant
+        ));
+
+        // Verify streaming metadata in responses
+        assert!(response_1.meta.is_some());
+        let meta_1 = response_1.meta.unwrap();
+        assert_eq!(
+            meta_1.get("streaming").unwrap(),
+            &serde_json::Value::Bool(true)
+        );
+
+        assert!(response_2.meta.is_some());
+        let meta_2 = response_2.meta.unwrap();
+        assert_eq!(
+            meta_2.get("streaming").unwrap(),
+            &serde_json::Value::Bool(true)
+        );
     }
 }
