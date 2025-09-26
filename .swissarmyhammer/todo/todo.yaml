@@ -63,3 +63,43 @@ todo:
   task: Create conventional commit with appropriate message
   context: Commit staged files with conventional commit format noting issue closure
   done: true
+- id: 01K63JPTK26DAFK0AHXN92APM1
+  task: Examine current codebase structure and dependencies
+  context: Need to understand existing code in lib/src/ before implementing tool call infrastructure
+  done: false
+- id: 01K63JPYTBQYJJENGN6W6W0MQ8
+  task: Create lib/src/tools.rs with ToolCallHandler and core types
+  context: Implement ToolCallHandler, ToolPermissions, ToolCallResult and basic structure
+  done: false
+- id: 01K63K6754B08KVPTM59X26JWX
+  task: Check for existing CODE_REVIEW.md and clean up done items
+  context: null
+  done: false
+- id: 01K63K6AZ1KNT2NPAZMCHW06BY
+  task: Review lib/src/agent.rs - check for TODOs, coding standards, tests, documentation
+  context: null
+  done: false
+- id: 01K63K6EEFGP85RT2TQBWMBFYH
+  task: Review lib/src/config.rs - check for TODOs, coding standards, tests, documentation
+  context: null
+  done: false
+- id: 01K63K6HF7V7KGF0HP037C4HPN
+  task: Review lib/src/lib.rs - check for TODOs, coding standards, tests, documentation
+  context: null
+  done: false
+- id: 01K63K6MZ9GF5D83XW28MPKVJ2
+  task: Review lib/src/tools.rs - check for TODOs, coding standards, tests, documentation
+  context: null
+  done: false
+- id: 01K63K6RHJJCTD7T2YWKT6NNED
+  task: Run cargo clippy and cargo fmt to check for lint issues
+  context: null
+  done: false
+- id: 01K63KBAN7P5536PN0HQF57ST7
+  task: Fix TODO placeholder in tools.rs:148 - handle_terminal_create
+  context: Replace todo!() with proper implementation or error handling
+  done: false
+- id: 01K63KBDNG3FWW65EWJ5YQ8X80
+  task: Fix TODO placeholder in tools.rs:153 - handle_terminal_write
+  context: Replace todo!() with proper implementation or error handling
+  done: false

@@ -9,10 +9,12 @@ pub mod claude;
 pub mod config;
 pub mod error;
 pub mod session;
+pub mod tools;
 
 pub use agent::ClaudeAgent;
 pub use config::AgentConfig;
 pub use error::{AgentError, Result};
+pub use tools::{ToolCallHandler, ToolCallResult, ToolPermissions};
 
 /// The main Claude Agent ACP server
 pub struct ClaudeAgentServer {
@@ -32,38 +34,15 @@ impl ClaudeAgentServer {
             self.config.claude.model
         );
 
-        // Basic ACP server implementation using stdio
-        tracing::info!("ACP server listening on stdio for requests");
+        // Create the Claude Agent that will handle ACP requests
+        let _claude_agent = ClaudeAgent::new(self.config.clone())?;
 
-        // Read from stdin and write to stdout
-        use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-        let stdin = io::stdin();
-        let mut stdout = io::stdout();
-        let reader = BufReader::new(stdin);
-        let mut lines = reader.lines();
-
-        tracing::info!("Server ready to process ACP messages");
-
-        // Simple message loop for ACP protocol
-        while let Some(line) = lines.next_line().await? {
-            tracing::debug!("Received: {}", line);
-
-            // For now, echo back a basic ACP response
-            // In a full implementation, this would parse the ACP message
-            // and route to appropriate Claude Code functionality
-            let response = format!(
-                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"processed: {}\"}}\n",
-                line
-            );
-            stdout.write_all(response.as_bytes()).await?;
-            stdout.flush().await?;
-
-            tracing::debug!("Sent response");
-        }
-
-        tracing::info!("ACP server shutting down");
-        Ok(())
+        // TODO: Implement proper ACP server using agent_client_protocol
+        // For now, return an error indicating this needs implementation
+        tracing::error!("ACP server implementation not yet complete");
+        Err(AgentError::ServerError(
+            "ACP server implementation requires integration with agent_client_protocol crate".to_string()
+        ))
     }
 }
 

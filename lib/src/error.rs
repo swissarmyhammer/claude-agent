@@ -20,6 +20,9 @@ pub enum AgentError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    #[error("Server error: {0}")]
+    ServerError(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -80,7 +83,15 @@ mod tests {
 
         assert!(success.is_ok());
         assert!(failure.is_err());
-        assert_eq!(success.unwrap(), 42);
-        assert!(matches!(failure.unwrap_err(), AgentError::Protocol(_)));
+
+        // Test successful result
+        if let Ok(value) = success {
+            assert_eq!(value, 42);
+        }
+
+        // Test error result
+        if let Err(error) = failure {
+            assert!(matches!(error, AgentError::Protocol(_)));
+        }
     }
 }

@@ -1,6 +1,8 @@
 //! Agent Client Protocol implementation for Claude Agent
 
-use crate::{claude::ClaudeClient, config::AgentConfig, session::SessionManager};
+use crate::{
+    claude::ClaudeClient, config::AgentConfig, session::SessionManager, tools::ToolCallHandler,
+};
 use agent_client_protocol::{
     Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
     ExtNotification, ExtRequest, InitializeRequest, InitializeResponse, LoadSessionRequest,
@@ -13,6 +15,7 @@ use std::sync::Arc;
 pub struct ClaudeAgent {
     session_manager: Arc<SessionManager>,
     claude_client: Arc<ClaudeClient>,
+    tool_handler: Arc<ToolCallHandler>,
     config: AgentConfig,
     capabilities: AgentCapabilities,
 }
@@ -22,6 +25,7 @@ impl ClaudeAgent {
     pub fn new(config: AgentConfig) -> crate::Result<Self> {
         let session_manager = Arc::new(SessionManager::new());
         let claude_client = Arc::new(ClaudeClient::new_with_config(&config.claude)?);
+        let tool_handler = Arc::new(ToolCallHandler::new(config.security.to_tool_permissions()));
 
         let capabilities = AgentCapabilities {
             load_session: true,
@@ -49,6 +53,7 @@ impl ClaudeAgent {
         Ok(Self {
             session_manager,
             claude_client,
+            tool_handler,
             config,
             capabilities,
         })
@@ -64,18 +69,27 @@ impl ClaudeAgent {
         tracing::debug!("Returning {} response: {:?}", method, response);
     }
 
+    /// Get the tool handler for processing tool calls
+    pub fn tool_handler(&self) -> &ToolCallHandler {
+        &self.tool_handler
+    }
+
+    /// Parse and validate a session ID from a SessionId wrapper
+    fn parse_session_id(&self, session_id: &SessionId) -> Result<ulid::Ulid, agent_client_protocol::Error> {
+        session_id
+            .0
+            .as_ref()
+            .parse::<ulid::Ulid>()
+            .map_err(|_| agent_client_protocol::Error::invalid_params())
+    }
+
     /// Validate a prompt request for common issues
     async fn validate_prompt_request(
         &self,
         request: &PromptRequest,
     ) -> Result<(), agent_client_protocol::Error> {
         // Validate session ID format
-        request
-            .session_id
-            .0
-            .as_ref()
-            .parse::<ulid::Ulid>()
-            .map_err(|_| agent_client_protocol::Error::invalid_params())?;
+        self.parse_session_id(&request.session_id)?;
 
         // Extract text content from the prompt
         let mut prompt_text = String::new();
@@ -96,8 +110,8 @@ impl ClaudeAgent {
             return Err(agent_client_protocol::Error::invalid_params());
         }
 
-        // Check if prompt is too long (100KB limit)
-        if prompt_text.len() > 100_000 {
+        // Check if prompt is too long (configurable limit)
+        if prompt_text.len() > self.config.max_prompt_length {
             return Err(agent_client_protocol::Error::invalid_params());
         }
 
@@ -190,8 +204,8 @@ impl Agent for ClaudeAgent {
         if !request.mcp_servers.is_empty() {
             self.session_manager
                 .update_session(&session_id, |session| {
-                    // Store MCP server names from request - for now just placeholder
-                    session.mcp_servers = vec!["mcp_server".to_string()];
+                    // Store the actual MCP server info from the request (convert to debug string for now)
+                    session.mcp_servers = request.mcp_servers.iter().map(|server| format!("{:?}", server)).collect();
                 })
                 .map_err(|_e| agent_client_protocol::Error::internal_error())?;
         }
@@ -217,12 +231,7 @@ impl Agent for ClaudeAgent {
         self.log_request("load_session", &request);
         tracing::info!("Loading session: {}", request.session_id);
 
-        let session_id = request
-            .session_id
-            .0
-            .as_ref()
-            .parse()
-            .map_err(|_e| agent_client_protocol::Error::invalid_params())?;
+        let session_id = self.parse_session_id(&request.session_id)?;
 
         let session = self
             .session_manager
@@ -280,12 +289,7 @@ impl Agent for ClaudeAgent {
         self.validate_prompt_request(&request).await?;
 
         // Parse session ID
-        let session_id = request
-            .session_id
-            .0
-            .as_ref()
-            .parse::<ulid::Ulid>()
-            .map_err(|_| agent_client_protocol::Error::invalid_params())?;
+        let session_id = self.parse_session_id(&request.session_id)?;
 
         // Extract text content from the prompt
         let mut prompt_text = String::new();

@@ -2,6 +2,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Default value for max_prompt_length
+fn default_max_prompt_length() -> usize {
+    100_000
+}
+
 /// Main configuration structure for the Claude Agent
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentConfig {
@@ -9,6 +14,9 @@ pub struct AgentConfig {
     pub server: ServerConfig,
     pub security: SecurityConfig,
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Maximum allowed prompt length in characters (default: 100,000)
+    #[serde(default = "default_max_prompt_length")]
+    pub max_prompt_length: usize,
 }
 
 /// Configuration for Claude SDK integration
@@ -69,6 +77,7 @@ impl Default for AgentConfig {
                 require_permission_for: vec!["fs_write".to_string(), "terminal_create".to_string()],
             },
             mcp_servers: vec![],
+            max_prompt_length: 100_000,
         }
     }
 }
@@ -119,6 +128,17 @@ impl AgentConfig {
     /// Serialize configuration to JSON string
     pub fn to_json(&self) -> crate::error::Result<String> {
         Ok(serde_json::to_string_pretty(self)?)
+    }
+}
+
+impl SecurityConfig {
+    /// Convert SecurityConfig to ToolPermissions for tool call handler
+    pub fn to_tool_permissions(&self) -> crate::tools::ToolPermissions {
+        crate::tools::ToolPermissions {
+            require_permission_for: self.require_permission_for.clone(),
+            auto_approved: vec![], // Can be extended later if needed
+            forbidden_paths: self.forbidden_paths.clone(),
+        }
     }
 }
 
@@ -265,6 +285,7 @@ mod tests {
         assert_eq!(config.mcp_servers[0].name, "test-server");
         assert_eq!(config.mcp_servers[0].command, "test-command");
         assert_eq!(config.mcp_servers[0].args, vec!["--test"]);
+        assert_eq!(config.max_prompt_length, 100_000); // Should use default value
     }
 
     #[test]
