@@ -25,3 +25,5 @@ chrono = { workspace = true }
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.10"
+futures = { workspace = true }
+uuid = "1.10"
