@@ -80,7 +80,7 @@ mod tests {
 
         assert!(success.is_ok());
         assert!(failure.is_err());
-        assert_eq!(success.unwrap(), 42);
-        assert!(matches!(failure.unwrap_err(), AgentError::Protocol(_)));
+        assert_eq!(success.expect("success should be Ok"), 42);
+        assert!(matches!(failure.expect_err("failure should be Err"), AgentError::Protocol(_)));
     }
 }
