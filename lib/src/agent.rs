@@ -11,7 +11,8 @@ use agent_client_protocol::{
     TextContent,
 };
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use std::collections::HashMap;
+use tokio::sync::{broadcast, RwLock};
 use tokio_stream::StreamExt;
 
 /// Session update notification for streaming responses
@@ -19,6 +20,43 @@ use tokio_stream::StreamExt;
 pub struct SessionUpdateNotification {
     pub session_id: String,
     pub message_chunk: Option<MessageChunk>,
+    pub tool_call_result: Option<ToolCallContent>,
+}
+
+/// Tool call content for notifications
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ToolCallContent {
+    pub tool_call_id: String,
+    pub result: String,
+}
+
+/// Manages pending tool calls awaiting permission
+pub struct PendingToolCallManager {
+    pending_calls: Arc<RwLock<HashMap<String, (crate::tools::InternalToolRequest, String)>>>, // tool_call_id -> (tool_call, session_id)
+}
+
+impl PendingToolCallManager {
+    pub fn new() -> Self {
+        Self {
+            pending_calls: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+    
+    pub async fn add_pending_call(&self, tool_call: crate::tools::InternalToolRequest, session_id: String) -> crate::Result<()> {
+        let mut calls = self.pending_calls.write().await;
+        calls.insert(tool_call.id.clone(), (tool_call, session_id));
+        Ok(())
+    }
+    
+    pub async fn get_pending_call(&self, tool_call_id: &str) -> Option<(crate::tools::InternalToolRequest, String)> {
+        let calls = self.pending_calls.read().await;
+        calls.get(tool_call_id).cloned()
+    }
+    
+    pub async fn remove_pending_call(&self, tool_call_id: &str) -> Option<(crate::tools::InternalToolRequest, String)> {
+        let mut calls = self.pending_calls.write().await;
+        calls.remove(tool_call_id)
+    }
 }
 
 /// Message chunk for streaming responses
@@ -56,6 +94,7 @@ pub struct ClaudeAgent {
     config: AgentConfig,
     capabilities: AgentCapabilities,
     notification_sender: Arc<NotificationSender>,
+    pending_tool_calls: Arc<PendingToolCallManager>,
 }
 
 impl ClaudeAgent {
@@ -100,6 +139,7 @@ impl ClaudeAgent {
             config,
             capabilities,
             notification_sender: Arc::new(notification_sender),
+            pending_tool_calls: Arc::new(PendingToolCallManager::new()),
         };
 
         Ok((agent, notification_receiver))
@@ -226,6 +266,7 @@ impl ClaudeAgent {
                             meta: None,
                         })],
                     }),
+                    tool_call_result: None,
                 })
                 .await
             {
@@ -317,6 +358,67 @@ impl ClaudeAgent {
         self.notification_sender.send_update(update).await
     }
 
+    /// Execute a pending tool call by ID
+    async fn execute_pending_tool_call(&self, tool_call_id: &str) -> crate::Result<ToolCallContent> {
+        if let Some((tool_call, _session_id)) = self.pending_tool_calls.get_pending_call(tool_call_id).await {
+            // Execute the tool call using the handler
+            let result = self.tool_handler.handle_tool_request(tool_call).await?;
+            
+            match result {
+                crate::tools::ToolCallResult::Success(content) => {
+                    self.pending_tool_calls.remove_pending_call(tool_call_id).await;
+                    Ok(ToolCallContent {
+                        tool_call_id: tool_call_id.to_string(),
+                        result: content,
+                    })
+                }
+                crate::tools::ToolCallResult::Error(msg) => {
+                    self.pending_tool_calls.remove_pending_call(tool_call_id).await;
+                    Err(crate::AgentError::ToolExecution(msg))
+                }
+                crate::tools::ToolCallResult::PermissionRequired(_) => {
+                    // This shouldn't happen since we're granting permission
+                    Err(crate::AgentError::ToolExecution("Unexpected permission request".to_string()))
+                }
+            }
+        } else {
+            Err(crate::AgentError::ToolExecution(format!("Tool call {} not found", tool_call_id)))
+        }
+    }
+    
+    /// Remove a pending tool call by ID
+    async fn remove_pending_tool_call(&self, tool_call_id: &str) -> crate::Result<()> {
+        self.pending_tool_calls.remove_pending_call(tool_call_id).await;
+        Ok(())
+    }
+
+    /// Send tool result as session update
+    async fn send_tool_result_update(&self, session_id: &str, result: ToolCallContent) -> crate::Result<()> {
+        let update = SessionUpdateNotification {
+            session_id: session_id.to_string(),
+            tool_call_result: Some(result),
+            message_chunk: None,
+        };
+        
+        self.send_session_update(update).await
+    }
+    
+    /// Send tool denial notification
+    async fn send_tool_denial_update(&self, session_id: &str, tool_call_id: &str) -> crate::Result<()> {
+        let update = SessionUpdateNotification {
+            session_id: session_id.to_string(),
+            message_chunk: Some(MessageChunk {
+                content: vec![ContentBlock::Text(TextContent {
+                    text: format!("Tool call {} was denied by user", tool_call_id),
+                    annotations: None,
+                    meta: None,
+                })],
+            }),
+            tool_call_result: None,
+        };
+        
+        self.send_session_update(update).await
+    }
 
 }
 
@@ -590,6 +692,8 @@ impl Agent for ClaudeAgent {
         // Handle extension notifications
         Ok(())
     }
+
+
 }
 
 #[cfg(test)]
@@ -1317,5 +1421,207 @@ mod tests {
             meta_2.get("streaming").unwrap(),
             &serde_json::Value::Bool(true)
         );
+    }
+
+    // Protocol Compliance Tests
+    
+    #[tokio::test]
+    async fn test_full_protocol_flow() {
+        let (agent, _notifications) = create_test_agent_with_notifications();
+        
+        // Test initialize
+        let init_request = InitializeRequest {
+            client_capabilities: agent_client_protocol::ClientCapabilities {
+                fs: agent_client_protocol::FileSystemCapability {
+                    read_text_file: true,
+                    write_text_file: true,
+                    meta: None,
+                },
+                terminal: true,
+                meta: Some(serde_json::json!({"streaming": true})),
+            },
+            protocol_version: Default::default(),
+            meta: None,
+        };
+        
+        let init_response = agent.initialize(init_request).await.unwrap();
+        assert!(init_response.agent_capabilities.meta.is_some());
+        assert!(!init_response.auth_methods.is_empty());
+        
+        // Test authenticate
+        let auth_request = AuthenticateRequest {
+            method_id: agent_client_protocol::AuthMethodId("none".to_string().into()),
+            meta: None,
+        };
+        
+        let auth_response = agent.authenticate(auth_request).await.unwrap();
+        assert!(auth_response.meta.is_some());
+        
+        // Test session creation
+        let session_request = NewSessionRequest {
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![],
+            meta: None,
+        };
+        
+        let session_response = agent.new_session(session_request).await.unwrap();
+        assert!(!session_response.session_id.0.is_empty());
+        
+        // Test prompt
+        let prompt_request = PromptRequest {
+            session_id: session_response.session_id.clone(),
+            prompt: vec![ContentBlock::Text(TextContent {
+                text: "Hello, can you help me?".to_string(),
+                annotations: None,
+                meta: None,
+            })],
+            meta: None,
+        };
+        
+        let prompt_response = agent.prompt(prompt_request).await.unwrap();
+        assert_eq!(prompt_response.stop_reason, StopReason::EndTurn);
+        assert!(prompt_response.meta.is_some());
+    }
+    
+    #[tokio::test]
+    async fn test_tool_permission_flow() {
+        let (agent, _) = create_test_agent_with_notifications();
+        
+        // Create session
+        let session_response = agent.new_session(NewSessionRequest {
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![],
+            meta: None,
+        }).await.unwrap();
+        
+        // Simulate tool call that requires permission
+        let tool_call = crate::tools::InternalToolRequest {
+            id: "test-tool-call".to_string(),
+            name: "fs_write".to_string(),
+            arguments: serde_json::json!({
+                "path": "/tmp/test.txt",
+                "content": "Hello, World!"
+            }),
+        };
+        
+        // Add to pending calls
+        agent.pending_tool_calls.add_pending_call(
+            tool_call.clone(), 
+            session_response.session_id.0.to_string()
+        ).await.unwrap();
+        
+        // Test permission grant
+        let grant_request = ToolPermissionGrantRequest {
+            tool_call_id: tool_call.id.clone(),
+            session_id: session_response.session_id.clone(),
+        };
+        
+        let grant_response = agent.tool_permission_grant(grant_request).await.unwrap();
+        // Response may succeed or fail depending on tool execution
+        // but should not error on the protocol level
+        assert!(grant_response.success || !grant_response.error_message.is_none());
+        
+        // Test permission deny with another call
+        let tool_call_2 = crate::tools::InternalToolRequest {
+            id: "test-tool-call-2".to_string(),
+            name: "fs_write".to_string(),
+            arguments: serde_json::json!({
+                "path": "/tmp/test2.txt",
+                "content": "Hello, World 2!"
+            }),
+        };
+        
+        agent.pending_tool_calls.add_pending_call(
+            tool_call_2.clone(),
+            session_response.session_id.0.to_string()
+        ).await.unwrap();
+        
+        let deny_request = ToolPermissionDenyRequest {
+            tool_call_id: tool_call_2.id,
+            session_id: session_response.session_id,
+        };
+        
+        let deny_response = agent.tool_permission_deny(deny_request).await.unwrap();
+        assert!(deny_response.success);
+    }
+    
+    #[tokio::test]
+    async fn test_protocol_error_handling() {
+        let (agent, _) = create_test_agent_with_notifications();
+        
+        // Test invalid session ID
+        let invalid_prompt = PromptRequest {
+            session_id: SessionId("invalid-uuid".to_string().into()),
+            prompt: vec![ContentBlock::Text(TextContent {
+                text: "Hello".to_string(),
+                annotations: None,
+                meta: None,
+            })],
+            meta: None,
+        };
+        
+        let result = agent.prompt(invalid_prompt).await;
+        assert!(result.is_err());
+        
+        // Test tool permission grant with non-existent tool call
+        let invalid_grant = ToolPermissionGrantRequest {
+            tool_call_id: "non-existent-id".to_string(),
+            session_id: SessionId("test-session".to_string().into()),
+        };
+        
+        let grant_result = agent.tool_permission_grant(invalid_grant).await.unwrap();
+        assert!(!grant_result.success);
+        assert!(grant_result.error_message.is_some());
+        
+        // Test tool permission deny with non-existent tool call
+        let invalid_deny = ToolPermissionDenyRequest {
+            tool_call_id: "non-existent-id".to_string(),
+            session_id: SessionId("test-session".to_string().into()),
+        };
+        
+        let deny_result = agent.tool_permission_deny(invalid_deny).await.unwrap();
+        assert!(deny_result.success); // Should succeed even if tool call doesn't exist
+    }
+
+    #[tokio::test]
+    async fn test_pending_tool_call_management() {
+        let (agent, _) = create_test_agent_with_notifications();
+        
+        let tool_call = crate::tools::InternalToolRequest {
+            id: "test-id".to_string(),
+            name: "fs_read".to_string(),
+            arguments: serde_json::json!({"path": "/tmp/test.txt"}),
+        };
+        
+        let session_id = "test-session-id".to_string();
+        
+        // Add pending call
+        agent.pending_tool_calls.add_pending_call(
+            tool_call.clone(),
+            session_id.clone()
+        ).await.unwrap();
+        
+        // Verify it was added
+        let retrieved = agent.pending_tool_calls.get_pending_call("test-id").await;
+        assert!(retrieved.is_some());
+        let (retrieved_call, retrieved_session) = retrieved.unwrap();
+        assert_eq!(retrieved_call.id, tool_call.id);
+        assert_eq!(retrieved_call.name, tool_call.name);
+        assert_eq!(retrieved_session, session_id);
+        
+        // Remove pending call
+        let removed = agent.pending_tool_calls.remove_pending_call("test-id").await;
+        assert!(removed.is_some());
+        
+        // Verify it was removed
+        let retrieved_after_removal = agent.pending_tool_calls.get_pending_call("test-id").await;
+        assert!(retrieved_after_removal.is_none());
+    }
+
+    #[test]
+    fn test_compile_time_agent_check() {
+        // Compile-time check that all Agent trait methods are implemented
+        fn assert_agent_impl<T: Agent>() {}
+        assert_agent_impl::<ClaudeAgent>();
     }
 }

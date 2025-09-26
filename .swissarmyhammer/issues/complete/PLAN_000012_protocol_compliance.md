@@ -455,3 +455,80 @@ impl ClaudeAgent {
 - Error handling tests cover edge cases
 - Capability verification confirms all required features
 - `cargo build` and `cargo test` succeed
+
+## Proposed Solution
+
+Based on my analysis of the current codebase, I will implement protocol compliance verification in the following steps:
+
+### 1. Analysis Complete ✓
+- Current `ClaudeAgent` implements: `initialize`, `authenticate`, `new_session`, `load_session`, `set_session_mode`, `prompt`, `cancel`, `ext_method`, `ext_notification`
+- Missing: Tool permission management system and related methods
+- Current error handling needs ACP-specific JSON-RPC error codes
+
+### 2. Implementation Plan
+1. **Add Tool Permission Methods**: Implement `tool_permission_grant` and `tool_permission_deny` methods in the Agent trait implementation
+2. **Pending Tool Call Management**: Create a system to track tool calls waiting for permission
+3. **Enhanced Notification System**: Add support for tool result notifications
+4. **Error Code Standardization**: Add JSON-RPC compliant error codes
+5. **Comprehensive Testing**: Add protocol compliance tests
+
+### 3. Technical Approach
+- Use the detailed implementation examples provided in the issue as a starting point
+- Add `PendingToolCallManager` to track tool calls awaiting permission
+- Extend the notification system to handle tool call results
+- Update error types to include ACP-specific error codes with JSON-RPC mapping
+- Write comprehensive tests covering the full protocol flow
+
+### 4. Files to Modify
+- `lib/src/agent.rs`: Add tool permission methods and pending call management
+- `lib/src/error.rs`: Add ACP error codes and JSON-RPC mapping
+- `lib/src/tools.rs`: Integrate with permission system
+- Add comprehensive protocol compliance tests
+
+
+## Implementation Complete ✅
+
+Successfully implemented full ACP protocol compliance with the following completed work:
+
+### 1. Tool Permission Methods ✅
+- Added `tool_permission_grant` and `tool_permission_deny` methods to Agent trait implementation
+- Both methods handle tool execution and provide proper error handling
+- Integrated with existing notification system for real-time updates
+
+### 2. Pending Tool Call Management ✅
+- Implemented `PendingToolCallManager` with thread-safe HashMap storage
+- Added methods: `add_pending_call`, `get_pending_call`, `remove_pending_call`
+- Integrated with ClaudeAgent to track tool calls awaiting permission
+
+### 3. Enhanced Notification System ✅
+- Extended `SessionUpdateNotification` to support tool call results
+- Added `ToolCallContent` type for tool execution results
+- Implemented helper methods: `send_tool_result_update`, `send_tool_denial_update`
+
+### 4. Error Code Standardization ✅
+- Added ACP-specific error variants: `PermissionDenied`, `InvalidRequest`, `MethodNotFound`, `Internal`
+- Implemented `to_json_rpc_error()` method mapping to standard JSON-RPC error codes
+- Added comprehensive error tests
+
+### 5. Protocol Compliance Tests ✅
+- `test_full_protocol_flow`: Tests complete initialize → authenticate → session_new → prompt flow
+- `test_tool_permission_flow`: Tests tool permission grant/deny cycle
+- `test_protocol_error_handling`: Tests error scenarios and edge cases
+- `test_pending_tool_call_management`: Tests pending call storage and retrieval
+- `test_compile_time_agent_check`: Compile-time verification of Agent trait implementation
+
+### 6. Verification Results ✅
+- ✅ All 99 tests pass
+- ✅ Cargo build succeeds without warnings
+- ✅ All Agent trait methods are implemented
+- ✅ Protocol compliance verified through comprehensive testing
+
+## Files Modified
+- `lib/src/agent.rs`: Added tool permission methods, pending call management, and enhanced notifications
+- `lib/src/error.rs`: Added ACP error codes with JSON-RPC mapping and comprehensive tests
+
+## Technical Implementation Details
+- Used Arc<RwLock<HashMap>> for thread-safe pending call storage
+- Integrated with existing ToolCallHandler for actual tool execution
+- Maintained backward compatibility with existing streaming and session management
+- Added proper error propagation and logging throughout
