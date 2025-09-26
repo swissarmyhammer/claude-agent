@@ -30,7 +30,8 @@ async fn main() -> Result<()> {
 
     // Create configuration
     let mut config = AgentConfig::default();
-    config.server_config.port = cli.port;
+    config.server.port = cli.port;
+    config.server.log_level = cli.log_level.clone();
 
     // Create and start server
     let server = ClaudeAgentServer::new(config);
