@@ -47,6 +47,44 @@ pub struct McpServerConfig {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
+    #[serde(default)]
+    pub protocol: McpProtocolConfig,
+}
+
+/// MCP protocol configuration settings
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpProtocolConfig {
+    /// MCP protocol version (default: "2024-11-05")
+    #[serde(default = "default_mcp_protocol_version")]
+    pub version: String,
+    /// Connection timeout in seconds (default: 30)
+    #[serde(default = "default_mcp_timeout")]
+    pub timeout_seconds: u64,
+    /// Maximum retries for initialization (default: 3)
+    #[serde(default = "default_mcp_max_retries")]
+    pub max_retries: u32,
+}
+
+fn default_mcp_protocol_version() -> String {
+    "2024-11-05".to_string()
+}
+
+fn default_mcp_timeout() -> u64 {
+    30
+}
+
+fn default_mcp_max_retries() -> u32 {
+    3
+}
+
+impl Default for McpProtocolConfig {
+    fn default() -> Self {
+        Self {
+            version: default_mcp_protocol_version(),
+            timeout_seconds: default_mcp_timeout(),
+            max_retries: default_mcp_max_retries(),
+        }
+    }
 }
 
 /// Stream format options for Claude responses
@@ -202,6 +240,7 @@ mod tests {
             name: String::new(),
             command: "test".to_string(),
             args: vec![],
+            protocol: McpProtocolConfig::default(),
         });
 
         let result = config.validate();
@@ -219,6 +258,7 @@ mod tests {
             name: "test".to_string(),
             command: String::new(),
             args: vec![],
+            protocol: McpProtocolConfig::default(),
         });
 
         let result = config.validate();

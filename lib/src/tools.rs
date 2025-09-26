@@ -10,8 +10,8 @@
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
-use tokio::process::{Command, Child};
 
 /// Internal representation of a tool request from an LLM
 #[derive(Debug, Clone)]
@@ -43,6 +43,7 @@ pub struct TerminalSession {
 pub struct ToolCallHandler {
     permissions: ToolPermissions,
     terminal_manager: Arc<TerminalManager>,
+    mcp_manager: Option<Arc<crate::mcp::McpServerManager>>,
 }
 
 /// Configuration for tool permissions and security policies
@@ -93,7 +94,9 @@ impl TerminalManager {
         let terminal_id = ulid::Ulid::new().to_string();
         let working_dir = working_dir
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+            .unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            });
 
         let session = TerminalSession {
             process: None,
@@ -111,15 +114,18 @@ impl TerminalManager {
     /// Execute a command in the specified terminal session
     pub async fn execute_command(&self, terminal_id: &str, command: &str) -> crate::Result<String> {
         let mut terminals = self.terminals.write().await;
-        let session = terminals.get_mut(terminal_id)
-            .ok_or_else(|| crate::AgentError::ToolExecution(format!("Terminal {} not found", terminal_id)))?;
+        let session = terminals.get_mut(terminal_id).ok_or_else(|| {
+            crate::AgentError::ToolExecution(format!("Terminal {} not found", terminal_id))
+        })?;
 
         tracing::info!("Executing command in terminal {}: {}", terminal_id, command);
 
         // Parse command and arguments
         let parts: Vec<&str> = command.split_whitespace().collect();
         if parts.is_empty() {
-            return Err(crate::AgentError::ToolExecution("Empty command".to_string()));
+            return Err(crate::AgentError::ToolExecution(
+                "Empty command".to_string(),
+            ));
         }
 
         let program = parts[0];
@@ -132,7 +138,9 @@ impl TerminalManager {
             .envs(&session.environment)
             .output()
             .await
-            .map_err(|e| crate::AgentError::ToolExecution(format!("Failed to execute command: {}", e)))?;
+            .map_err(|e| {
+                crate::AgentError::ToolExecution(format!("Failed to execute command: {}", e))
+            })?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -152,15 +160,19 @@ impl TerminalManager {
             }
         };
 
-        tracing::info!("Command completed with exit code: {:?}", output.status.code());
+        tracing::info!(
+            "Command completed with exit code: {:?}",
+            output.status.code()
+        );
         Ok(result)
     }
 
     /// Change the working directory for a terminal session
     pub async fn change_directory(&self, terminal_id: &str, path: &str) -> crate::Result<String> {
         let mut terminals = self.terminals.write().await;
-        let session = terminals.get_mut(terminal_id)
-            .ok_or_else(|| crate::AgentError::ToolExecution(format!("Terminal {} not found", terminal_id)))?;
+        let session = terminals.get_mut(terminal_id).ok_or_else(|| {
+            crate::AgentError::ToolExecution(format!("Terminal {} not found", terminal_id))
+        })?;
 
         let new_path = if std::path::Path::new(path).is_absolute() {
             std::path::PathBuf::from(path)
@@ -169,13 +181,20 @@ impl TerminalManager {
         };
 
         if new_path.exists() && new_path.is_dir() {
-            session.working_dir = new_path.canonicalize()
-                .map_err(|e| crate::AgentError::ToolExecution(format!("Failed to resolve path: {}", e)))?;
+            session.working_dir = new_path.canonicalize().map_err(|e| {
+                crate::AgentError::ToolExecution(format!("Failed to resolve path: {}", e))
+            })?;
 
             tracing::info!("Changed directory to: {}", session.working_dir.display());
-            Ok(format!("Changed directory to: {}", session.working_dir.display()))
+            Ok(format!(
+                "Changed directory to: {}",
+                session.working_dir.display()
+            ))
         } else {
-            Err(crate::AgentError::ToolExecution(format!("Directory does not exist: {}", path)))
+            Err(crate::AgentError::ToolExecution(format!(
+                "Directory does not exist: {}",
+                path
+            )))
         }
     }
 
@@ -201,17 +220,47 @@ impl Default for TerminalManager {
 impl ToolCallHandler {
     /// Create a new tool call handler with the given permissions
     pub fn new(permissions: ToolPermissions) -> Self {
-        Self { 
+        Self {
             permissions,
             terminal_manager: Arc::new(TerminalManager::new()),
+            mcp_manager: None,
         }
     }
 
     /// Create a new tool call handler with custom terminal manager
-    pub fn new_with_terminal_manager(permissions: ToolPermissions, terminal_manager: Arc<TerminalManager>) -> Self {
-        Self { 
+    pub fn new_with_terminal_manager(
+        permissions: ToolPermissions,
+        terminal_manager: Arc<TerminalManager>,
+    ) -> Self {
+        Self {
             permissions,
             terminal_manager,
+            mcp_manager: None,
+        }
+    }
+
+    /// Create a new tool call handler with MCP manager
+    pub fn new_with_mcp_manager(
+        permissions: ToolPermissions,
+        mcp_manager: Arc<crate::mcp::McpServerManager>,
+    ) -> Self {
+        Self {
+            permissions,
+            terminal_manager: Arc::new(TerminalManager::new()),
+            mcp_manager: Some(mcp_manager),
+        }
+    }
+
+    /// Create a new tool call handler with custom terminal manager and MCP manager
+    pub fn new_with_terminal_and_mcp_manager(
+        permissions: ToolPermissions,
+        terminal_manager: Arc<TerminalManager>,
+        mcp_manager: Arc<crate::mcp::McpServerManager>,
+    ) -> Self {
+        Self {
+            permissions,
+            terminal_manager,
+            mcp_manager: Some(mcp_manager),
         }
     }
 
@@ -250,6 +299,14 @@ impl ToolCallHandler {
 impl ToolCallHandler {
     /// Route and execute a tool request based on its name
     async fn execute_tool_request(&self, request: &InternalToolRequest) -> crate::Result<String> {
+        // Check if this is an MCP tool call
+        if let Some(server_name) = self.extract_mcp_server_name(&request.name) {
+            if let Some(ref mcp_manager) = self.mcp_manager {
+                return mcp_manager.execute_tool_call(server_name, request).await;
+            }
+        }
+
+        // Handle built-in tools
         match request.name.as_str() {
             "fs_read" => self.handle_fs_read(request).await,
             "fs_write" => self.handle_fs_write(request).await,
@@ -261,6 +318,35 @@ impl ToolCallHandler {
                 request.name
             ))),
         }
+    }
+
+    /// Extract MCP server name from tool name
+    fn extract_mcp_server_name<'a>(&self, tool_name: &'a str) -> Option<&'a str> {
+        // Tool names from MCP servers are prefixed with server name
+        // e.g., "filesystem:read_file" -> server "filesystem"
+        if tool_name.contains(':') {
+            tool_name.split(':').next()
+        } else {
+            None
+        }
+    }
+
+    /// List all available tools including MCP tools
+    pub async fn list_all_available_tools(&self) -> Vec<String> {
+        let mut tools = vec![
+            "fs_read".to_string(),
+            "fs_write".to_string(),
+            "fs_list".to_string(),
+            "terminal_create".to_string(),
+            "terminal_write".to_string(),
+        ];
+
+        if let Some(ref mcp_manager) = self.mcp_manager {
+            let mcp_tools = mcp_manager.list_available_tools().await;
+            tools.extend(mcp_tools);
+        }
+
+        tools
     }
 
     /// Handle file read operations with security validation
@@ -306,7 +392,10 @@ impl ToolCallHandler {
         if let Some(parent) = std::path::Path::new(path).parent() {
             if !parent.exists() {
                 tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                    crate::AgentError::ToolExecution(format!("Failed to create parent directories for {}: {}", path, e))
+                    crate::AgentError::ToolExecution(format!(
+                        "Failed to create parent directories for {}: {}",
+                        path, e
+                    ))
                 })?;
             }
         }
@@ -327,9 +416,7 @@ impl ToolCallHandler {
     /// Handle directory listing operations with security validation
     async fn handle_fs_list(&self, request: &InternalToolRequest) -> crate::Result<String> {
         let args = self.parse_tool_args(&request.arguments)?;
-        let path = args.get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or(".");
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
         tracing::debug!("Listing directory: {}", path);
 
@@ -341,7 +428,7 @@ impl ToolCallHandler {
         })?;
 
         let mut files = Vec::new();
-        
+
         while let Some(entry) = dir_reader.next_entry().await.map_err(|e| {
             crate::AgentError::ToolExecution(format!("Error reading directory entry: {}", e))
         })? {
@@ -349,8 +436,16 @@ impl ToolCallHandler {
                 crate::AgentError::ToolExecution(format!("Failed to get metadata: {}", e))
             })?;
 
-            let file_type = if metadata.is_dir() { "directory" } else { "file" };
-            let size = if metadata.is_file() { metadata.len() } else { 0 };
+            let file_type = if metadata.is_dir() {
+                "directory"
+            } else {
+                "file"
+            };
+            let size = if metadata.is_file() {
+                metadata.len()
+            } else {
+                0
+            };
 
             files.push(format!(
                 "{} ({}, {} bytes)",
@@ -371,14 +466,14 @@ impl ToolCallHandler {
     }
 
     /// Handle terminal creation operations
-    async fn handle_terminal_create(
-        &self,
-        request: &InternalToolRequest,
-    ) -> crate::Result<String> {
+    async fn handle_terminal_create(&self, request: &InternalToolRequest) -> crate::Result<String> {
         let args = self.parse_tool_args(&request.arguments)?;
         let working_dir = args.get("working_dir").and_then(|v| v.as_str());
 
-        let terminal_id = self.terminal_manager.create_terminal(working_dir.map(String::from)).await?;
+        let terminal_id = self
+            .terminal_manager
+            .create_terminal(working_dir.map(String::from))
+            .await?;
 
         Ok(format!("Created terminal session: {}", terminal_id))
     }
@@ -386,12 +481,18 @@ impl ToolCallHandler {
     /// Handle terminal write/command execution operations
     async fn handle_terminal_write(&self, request: &InternalToolRequest) -> crate::Result<String> {
         let args = self.parse_tool_args(&request.arguments)?;
-        let terminal_id = args.get("terminal_id")
+        let terminal_id = args
+            .get("terminal_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| crate::AgentError::ToolExecution("Missing 'terminal_id' argument".to_string()))?;
-        let command = args.get("command")
+            .ok_or_else(|| {
+                crate::AgentError::ToolExecution("Missing 'terminal_id' argument".to_string())
+            })?;
+        let command = args
+            .get("command")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| crate::AgentError::ToolExecution("Missing 'command' argument".to_string()))?;
+            .ok_or_else(|| {
+                crate::AgentError::ToolExecution("Missing 'command' argument".to_string())
+            })?;
 
         // Validate command security
         self.validate_command(command)?;
@@ -399,12 +500,18 @@ impl ToolCallHandler {
         // Check if this is a directory change command
         if command.trim().starts_with("cd ") {
             let path = command.trim().strip_prefix("cd ").unwrap_or("").trim();
-            let result = self.terminal_manager.change_directory(terminal_id, path).await?;
+            let result = self
+                .terminal_manager
+                .change_directory(terminal_id, path)
+                .await?;
             return Ok(result);
         }
 
         // Execute the command
-        let result = self.terminal_manager.execute_command(terminal_id, command).await?;
+        let result = self
+            .terminal_manager
+            .execute_command(terminal_id, command)
+            .await?;
         Ok(result)
     }
 }
@@ -447,9 +554,10 @@ impl ToolCallHandler {
             let forbidden_prefixes = ["/etc", "/usr", "/bin", "/sys", "/proc", "/dev"];
             for prefix in &forbidden_prefixes {
                 if path_str.starts_with(prefix) {
-                    return Err(crate::AgentError::ToolExecution(
-                        format!("Access to {} is forbidden", prefix)
-                    ));
+                    return Err(crate::AgentError::ToolExecution(format!(
+                        "Access to {} is forbidden",
+                        prefix
+                    )));
                 }
             }
         }
@@ -458,9 +566,10 @@ impl ToolCallHandler {
         if let Some(ext) = path.extension() {
             let dangerous_extensions = ["exe", "bat", "cmd", "scr", "com", "pif"];
             if dangerous_extensions.contains(&ext.to_string_lossy().as_ref()) {
-                return Err(crate::AgentError::ToolExecution(
-                    format!("File extension .{} is not allowed", ext.to_string_lossy())
-                ));
+                return Err(crate::AgentError::ToolExecution(format!(
+                    "File extension .{} is not allowed",
+                    ext.to_string_lossy()
+                )));
             }
         }
 
@@ -473,7 +582,9 @@ impl ToolCallHandler {
 
         // Check for empty commands
         if trimmed.is_empty() {
-            return Err(crate::AgentError::ToolExecution("Empty command not allowed".to_string()));
+            return Err(crate::AgentError::ToolExecution(
+                "Empty command not allowed".to_string(),
+            ));
         }
 
         // Check for dangerous command patterns
@@ -495,20 +606,25 @@ impl ToolCallHandler {
         let command_lower = trimmed.to_lowercase();
         for pattern in &dangerous_patterns {
             if command_lower.contains(pattern) {
-                return Err(crate::AgentError::ToolExecution(
-                    format!("Dangerous command pattern '{}' not allowed", pattern)
-                ));
+                return Err(crate::AgentError::ToolExecution(format!(
+                    "Dangerous command pattern '{}' not allowed",
+                    pattern
+                )));
             }
         }
 
         // Check command length
         if trimmed.len() > 1000 {
-            return Err(crate::AgentError::ToolExecution("Command too long".to_string()));
+            return Err(crate::AgentError::ToolExecution(
+                "Command too long".to_string(),
+            ));
         }
 
         // Check for null bytes
         if trimmed.contains('\0') {
-            return Err(crate::AgentError::ToolExecution("Null bytes in command not allowed".to_string()));
+            return Err(crate::AgentError::ToolExecution(
+                "Null bytes in command not allowed".to_string(),
+            ));
         }
 
         Ok(())
@@ -781,7 +897,7 @@ mod tests {
     #[tokio::test]
     async fn test_fs_write_and_read_integration() {
         use tempfile::TempDir;
-        
+
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test_file.txt");
         let file_path_str = file_path.to_string_lossy();
@@ -833,9 +949,9 @@ mod tests {
     #[tokio::test]
     async fn test_fs_list() {
         use tempfile::TempDir;
-        
+
         let temp_dir = TempDir::new().unwrap();
-        
+
         // Create some test files
         let file1 = temp_dir.path().join("file1.txt");
         let file2 = temp_dir.path().join("file2.txt");
@@ -909,7 +1025,9 @@ mod tests {
         let write_result = handler.handle_tool_request(write_request).await.unwrap();
         match write_result {
             ToolCallResult::Success(output) => {
-                assert!(output.contains("Command output:") || output.contains("Hello from terminal"));
+                assert!(
+                    output.contains("Command output:") || output.contains("Hello from terminal")
+                );
             }
             _ => panic!("Command execution should succeed"),
         }
@@ -918,7 +1036,7 @@ mod tests {
     #[tokio::test]
     async fn test_terminal_cd_operation() {
         use tempfile::TempDir;
-        
+
         let temp_dir = TempDir::new().unwrap();
         let temp_path = temp_dir.path().to_string_lossy();
 
@@ -938,9 +1056,7 @@ mod tests {
 
         let create_result = handler.handle_tool_request(create_request).await.unwrap();
         let terminal_id = match create_result {
-            ToolCallResult::Success(msg) => {
-                msg.split_whitespace().last().unwrap().to_string()
-            }
+            ToolCallResult::Success(msg) => msg.split_whitespace().last().unwrap().to_string(),
             _ => panic!("Terminal creation should succeed"),
         };
 
@@ -1017,7 +1133,7 @@ mod tests {
 
         // Test null byte injection
         assert!(handler.validate_file_path("file\0.txt").is_err());
-        
+
         // Test dangerous extensions
         let dangerous_files = vec![
             "malware.exe",

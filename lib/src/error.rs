@@ -46,15 +46,15 @@ impl AgentError {
     /// Convert agent error to JSON-RPC error code
     pub fn to_json_rpc_error(&self) -> i32 {
         match self {
-            AgentError::Protocol(_) => -32600, // Invalid Request
-            AgentError::MethodNotFound(_) => -32601, // Method not found
-            AgentError::InvalidRequest(_) => -32602, // Invalid params
-            AgentError::Internal(_) => -32603, // Internal error
+            AgentError::Protocol(_) => -32600,         // Invalid Request
+            AgentError::MethodNotFound(_) => -32601,   // Method not found
+            AgentError::InvalidRequest(_) => -32602,   // Invalid params
+            AgentError::Internal(_) => -32603,         // Internal error
             AgentError::PermissionDenied(_) => -32000, // Server error
-            AgentError::ToolExecution(_) => -32000, // Server error
-            AgentError::Session(_) => -32000, // Server error
-            AgentError::Config(_) => -32000, // Server error
-            _ => -32603, // Internal error (default)
+            AgentError::ToolExecution(_) => -32000,    // Server error
+            AgentError::Session(_) => -32000,          // Server error
+            AgentError::Config(_) => -32000,           // Server error
+            _ => -32603,                               // Internal error (default)
         }
     }
 }

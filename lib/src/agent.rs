@@ -15,7 +15,7 @@ use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 
 /// Session update notification for streaming responses
-/// 
+///
 /// This notification is sent when there are real-time updates to a session,
 /// such as streaming message chunks or tool call results. It enables clients
 /// to receive live updates during long-running operations.
@@ -30,7 +30,7 @@ pub struct SessionUpdateNotification {
 }
 
 /// Tool call content for notifications
-/// 
+///
 /// Represents the result of executing a tool call, containing both the
 /// identifier of the original tool call and the execution result.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -41,10 +41,8 @@ pub struct ToolCallContent {
     pub result: String,
 }
 
-
-
 /// Message chunk for streaming responses
-/// 
+///
 /// Represents a portion of a larger message that is being sent incrementally
 /// during streaming operations. Each chunk contains content blocks that can
 /// be processed and displayed to the user in real-time.
@@ -55,7 +53,7 @@ pub struct MessageChunk {
 }
 
 /// Notification sender for streaming updates
-/// 
+///
 /// Manages the broadcasting of session update notifications to multiple receivers.
 /// This allows the agent to send real-time updates about session state changes,
 /// streaming content, and tool execution results to interested subscribers.
@@ -66,13 +64,13 @@ pub struct NotificationSender {
 
 impl NotificationSender {
     /// Create a new notification sender with receiver
-    /// 
+    ///
     /// Returns a tuple containing the sender and a receiver that can be used
     /// to listen for session update notifications. The receiver can be cloned
     /// to create multiple subscribers.
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// A tuple of (NotificationSender, Receiver) where the receiver can be used
     /// to subscribe to session update notifications.
     pub fn new() -> (Self, broadcast::Receiver<SessionUpdateNotification>) {
@@ -81,17 +79,17 @@ impl NotificationSender {
     }
 
     /// Send a session update notification
-    /// 
+    ///
     /// Broadcasts a session update notification to all subscribers. This is used
     /// to notify clients of real-time changes in session state, streaming content,
     /// or tool execution results.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `update` - The session update notification to broadcast
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// Returns `Ok(())` if the notification was sent successfully, or an error
     /// if the broadcast channel has no receivers or encounters other issues.
     pub async fn send_update(&self, update: SessionUpdateNotification) -> crate::Result<()> {
@@ -103,12 +101,12 @@ impl NotificationSender {
 }
 
 /// The main Claude Agent implementing the Agent Client Protocol
-/// 
+///
 /// ClaudeAgent is the core implementation of the Agent Client Protocol (ACP),
 /// providing a bridge between clients and the Claude AI service. It manages
 /// sessions, handles streaming responses, processes tool calls, and maintains
 /// the conversation context.
-/// 
+///
 /// The agent supports:
 /// - Session management with conversation history
 /// - Streaming and non-streaming responses  
@@ -119,42 +117,60 @@ pub struct ClaudeAgent {
     session_manager: Arc<SessionManager>,
     claude_client: Arc<ClaudeClient>,
     tool_handler: Arc<ToolCallHandler>,
+    mcp_manager: Option<Arc<crate::mcp::McpServerManager>>,
     config: AgentConfig,
     capabilities: AgentCapabilities,
     notification_sender: Arc<NotificationSender>,
-
 }
 
 impl ClaudeAgent {
     /// Create a new Claude Agent instance
-    /// 
+    ///
     /// Initializes a new ClaudeAgent with the provided configuration. The agent
     /// will set up all necessary components including session management, Claude
     /// client connection, tool handling, and notification broadcasting.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `config` - The agent configuration containing Claude API settings,
-    ///              security policies, and other operational parameters
-    /// 
+    ///   security policies, and other operational parameters
+    ///
     /// # Returns
-    /// 
+    ///
     /// Returns a tuple containing:
     /// - The initialized ClaudeAgent instance
     /// - A broadcast receiver for subscribing to session update notifications
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if the agent cannot be initialized due to configuration
     /// issues or if the Claude client cannot be created.
-    pub fn new(
+    pub async fn new(
         config: AgentConfig,
     ) -> crate::Result<(Self, broadcast::Receiver<SessionUpdateNotification>)> {
+        // Validate configuration including MCP servers
+        config.validate()?;
+
         let session_manager = Arc::new(SessionManager::new());
         let claude_client = Arc::new(ClaudeClient::new_with_config(&config.claude)?);
-        let tool_handler = Arc::new(ToolCallHandler::new(config.security.to_tool_permissions()));
 
         let (notification_sender, notification_receiver) = NotificationSender::new();
+
+        // Create and initialize MCP manager
+        let mut mcp_manager = crate::mcp::McpServerManager::new();
+        mcp_manager
+            .connect_servers(config.mcp_servers.clone())
+            .await?;
+        let mcp_manager = Arc::new(mcp_manager);
+
+        // Create tool handler with MCP support
+        let tool_handler = Arc::new(ToolCallHandler::new_with_mcp_manager(
+            config.security.to_tool_permissions(),
+            Arc::clone(&mcp_manager),
+        ));
+
+        // Get all available tools for capabilities
+        let available_tools = tool_handler.list_all_available_tools().await;
 
         let capabilities = AgentCapabilities {
             load_session: true,
@@ -170,12 +186,7 @@ impl ClaudeAgent {
                 meta: None,
             },
             meta: Some(serde_json::json!({
-                "tools": [
-                    "fs_read",
-                    "fs_write",
-                    "terminal_create",
-                    "terminal_write"
-                ],
+                "tools": available_tools,
                 "streaming": true
             })),
         };
@@ -184,12 +195,25 @@ impl ClaudeAgent {
             session_manager,
             claude_client,
             tool_handler,
+            mcp_manager: Some(mcp_manager),
             config,
             capabilities,
             notification_sender: Arc::new(notification_sender),
         };
 
         Ok((agent, notification_receiver))
+    }
+
+    /// Shutdown the agent and clean up resources
+    pub async fn shutdown(&self) -> crate::Result<()> {
+        tracing::info!("Shutting down Claude Agent");
+
+        if let Some(ref mcp_manager) = self.mcp_manager {
+            mcp_manager.shutdown().await?;
+        }
+
+        tracing::info!("Agent shutdown complete");
+        Ok(())
     }
 
     /// Log incoming request for debugging purposes
@@ -203,13 +227,13 @@ impl ClaudeAgent {
     }
 
     /// Get the tool handler for processing tool calls
-    /// 
+    ///
     /// Returns a reference to the tool call handler that manages the execution
     /// of file system, terminal, and other tool operations. The handler enforces
     /// security policies and permission requirements.
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// A reference to the ToolCallHandler instance used by this agent.
     pub fn tool_handler(&self) -> &ToolCallHandler {
         &self.tool_handler
@@ -413,8 +437,30 @@ impl ClaudeAgent {
         self.notification_sender.send_update(update).await
     }
 
+    /// Shutdown active sessions gracefully
+    pub async fn shutdown_sessions(&self) -> crate::Result<()> {
+        // Session manager cleanup is handled by dropping the Arc
+        // Sessions will be automatically cleaned up when no longer referenced
+        tracing::info!("Sessions shutdown complete");
+        Ok(())
+    }
 
+    /// Shutdown MCP server connections gracefully
+    pub async fn shutdown_mcp_connections(&self) -> crate::Result<()> {
+        if let Some(_mcp_manager) = &self.mcp_manager {
+            // The MCP manager will handle cleanup when dropped
+            tracing::info!("MCP connections shutdown initiated");
+        }
+        Ok(())
+    }
 
+    /// Shutdown tool handler gracefully
+    pub async fn shutdown_tool_handler(&self) -> crate::Result<()> {
+        // Tool handler cleanup is handled by dropping the Arc
+        // Any background processes should be terminated gracefully
+        tracing::info!("Tool handler shutdown complete");
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -687,8 +733,6 @@ impl Agent for ClaudeAgent {
         // Handle extension notifications
         Ok(())
     }
-
-
 }
 
 #[cfg(test)]
@@ -697,14 +741,14 @@ mod tests {
     // Import specific types as needed
     use std::sync::Arc;
 
-    fn create_test_agent() -> ClaudeAgent {
+    async fn create_test_agent() -> ClaudeAgent {
         let config = AgentConfig::default();
-        ClaudeAgent::new(config).unwrap().0
+        ClaudeAgent::new(config).await.unwrap().0
     }
 
     #[tokio::test]
     async fn test_initialize() {
-        let agent = create_test_agent();
+        let agent = create_test_agent().await;
 
         let request = InitializeRequest {
             client_capabilities: agent_client_protocol::ClientCapabilities {
@@ -731,7 +775,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authenticate() {
-        let agent = create_test_agent();
+        let agent = create_test_agent().await;
 
         let request = AuthenticateRequest {
             method_id: agent_client_protocol::AuthMethodId("none".to_string().into()),
@@ -744,7 +788,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_session() {
-        let agent = create_test_agent();
+        let agent = create_test_agent().await;
 
         let request = NewSessionRequest {
             cwd: std::path::PathBuf::from("/tmp"),
@@ -764,7 +808,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_session() {
-        let agent = create_test_agent();
+        let agent = create_test_agent().await;
 
         // First create a session
         let new_request = NewSessionRequest {
@@ -788,7 +832,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_nonexistent_session() {
-        let agent = create_test_agent();
+        let agent = create_test_agent().await;
 
         let request = LoadSessionRequest {
             session_id: SessionId("01234567890123456789012345".to_string().into()), // Invalid ULID
@@ -803,7 +847,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_session_mode() {
-        let agent = create_test_agent();
+        let agent = create_test_agent().await;
 
         let request = SetSessionModeRequest {
             session_id: SessionId("test_session".to_string().into()),
@@ -817,7 +861,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prompt() {
-        let agent = create_test_agent();
+        let agent = create_test_agent().await;
 
         // First create a session
         let new_session_request = NewSessionRequest {
@@ -845,7 +889,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancel() {
-        let agent = create_test_agent();
+        let agent = create_test_agent().await;
 
         let notification = CancelNotification {
             session_id: SessionId("test_session".to_string().into()),
@@ -858,7 +902,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ext_method() {
-        let agent = create_test_agent();
+        let agent = create_test_agent().await;
 
         let request = ExtRequest {
             method: "test_method".to_string().into(),
@@ -871,7 +915,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ext_notification() {
-        let agent = create_test_agent();
+        let agent = create_test_agent().await;
 
         let notification = ExtNotification {
             method: "test_notification".to_string().into(),
@@ -882,10 +926,10 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_agent_creation() {
+    #[tokio::test]
+    async fn test_agent_creation() {
         let config = AgentConfig::default();
-        let result = ClaudeAgent::new(config);
+        let result = ClaudeAgent::new(config).await;
         assert!(result.is_ok());
 
         let (agent, _receiver) = result.unwrap();
@@ -894,7 +938,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_full_prompt_flow() {
-        let agent = create_test_agent();
+        let agent = create_test_agent().await;
 
         // Create session
         let new_session_request = NewSessionRequest {
@@ -946,7 +990,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prompt_validation_invalid_session_id() {
-        let agent = create_test_agent();
+        let agent = create_test_agent().await;
 
         // Test invalid session ID
         let prompt_request = PromptRequest {
@@ -967,7 +1011,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prompt_validation_empty_prompt() {
-        let agent = create_test_agent();
+        let agent = create_test_agent().await;
 
         // Create a valid session first
         let new_session_request = NewSessionRequest {
@@ -996,7 +1040,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prompt_validation_non_text_content() {
-        let agent = create_test_agent();
+        let agent = create_test_agent().await;
 
         // Create a valid session first
         let new_session_request = NewSessionRequest {
@@ -1027,7 +1071,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_conversation_context_maintained() {
-        let agent = create_test_agent();
+        let agent = create_test_agent().await;
 
         // Create session
         let new_session_request = NewSessionRequest {
@@ -1102,7 +1146,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prompt_nonexistent_session() {
-        let agent = create_test_agent();
+        let agent = create_test_agent().await;
 
         // Use a valid ULID but for a session that doesn't exist
         let nonexistent_session_id = ulid::Ulid::new();
@@ -1123,15 +1167,15 @@ mod tests {
     }
 
     // Helper function for streaming tests
-    fn create_test_agent_with_notifications(
+    async fn create_test_agent_with_notifications(
     ) -> (ClaudeAgent, broadcast::Receiver<SessionUpdateNotification>) {
         let config = AgentConfig::default();
-        ClaudeAgent::new(config).unwrap()
+        ClaudeAgent::new(config).await.unwrap()
     }
 
     #[tokio::test]
     async fn test_streaming_prompt() {
-        let (agent, _notification_receiver) = create_test_agent_with_notifications();
+        let (agent, _notification_receiver) = create_test_agent_with_notifications().await;
 
         // Create session with streaming capabilities
         let new_session_request = NewSessionRequest {
@@ -1181,7 +1225,7 @@ mod tests {
             &serde_json::Value::Bool(true)
         );
 
-        // Verify session was updated with both user and assistant messages  
+        // Verify session was updated with both user and assistant messages
         let session = agent
             .session_manager
             .get_session(&session_id)
@@ -1200,7 +1244,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_non_streaming_fallback() {
-        let (agent, _notification_receiver) = create_test_agent_with_notifications();
+        let (agent, _notification_receiver) = create_test_agent_with_notifications().await;
 
         // Create session without streaming capabilities
         let new_session_request = NewSessionRequest {
@@ -1246,7 +1290,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_streaming_capability_detection() {
-        let (agent, _) = create_test_agent_with_notifications();
+        let (agent, _) = create_test_agent_with_notifications().await;
 
         // Create a session
         let new_session_request = NewSessionRequest {
@@ -1319,7 +1363,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_streaming_session_context_maintained() {
-        let (agent, _notification_receiver) = create_test_agent_with_notifications();
+        let (agent, _notification_receiver) = create_test_agent_with_notifications().await;
 
         // Create session with streaming capabilities
         let new_session_request = NewSessionRequest {
@@ -1419,11 +1463,11 @@ mod tests {
     }
 
     // Protocol Compliance Tests
-    
+
     #[tokio::test]
     async fn test_full_protocol_flow() {
-        let (agent, _notifications) = create_test_agent_with_notifications();
-        
+        let (agent, _notifications) = create_test_agent_with_notifications().await;
+
         // Test initialize
         let init_request = InitializeRequest {
             client_capabilities: agent_client_protocol::ClientCapabilities {
@@ -1438,30 +1482,30 @@ mod tests {
             protocol_version: Default::default(),
             meta: None,
         };
-        
+
         let init_response = agent.initialize(init_request).await.unwrap();
         assert!(init_response.agent_capabilities.meta.is_some());
         assert!(!init_response.auth_methods.is_empty());
-        
+
         // Test authenticate
         let auth_request = AuthenticateRequest {
             method_id: agent_client_protocol::AuthMethodId("none".to_string().into()),
             meta: None,
         };
-        
+
         let auth_response = agent.authenticate(auth_request).await.unwrap();
         assert!(auth_response.meta.is_some());
-        
+
         // Test session creation
         let session_request = NewSessionRequest {
             cwd: std::path::PathBuf::from("/tmp"),
             mcp_servers: vec![],
             meta: None,
         };
-        
+
         let session_response = agent.new_session(session_request).await.unwrap();
         assert!(!session_response.session_id.0.is_empty());
-        
+
         // Test prompt
         let prompt_request = PromptRequest {
             session_id: session_response.session_id.clone(),
@@ -1472,24 +1516,24 @@ mod tests {
             })],
             meta: None,
         };
-        
+
         let prompt_response = agent.prompt(prompt_request).await.unwrap();
         assert_eq!(prompt_response.stop_reason, StopReason::EndTurn);
         assert!(prompt_response.meta.is_some());
     }
-    
+
     // TODO: Implement tool permission flow when ToolPermissionGrantRequest/DenyRequest types are available
     // #[tokio::test]
     // async fn test_tool_permission_flow() {
     //     let (agent, _) = create_test_agent_with_notifications();
-    //     
+    //
     //     // Create session
     //     let session_response = agent.new_session(NewSessionRequest {
     //         cwd: std::path::PathBuf::from("/tmp"),
     //         mcp_servers: vec![],
     //         meta: None,
     //     }).await.unwrap();
-    //     
+    //
     //     // Simulate tool call that requires permission
     //     let tool_call = crate::tools::InternalToolRequest {
     //         id: "test-tool-call".to_string(),
@@ -1499,24 +1543,24 @@ mod tests {
     //             "content": "Hello, World!"
     //         }),
     //     };
-    //     
+    //
     //     // Add to pending calls
     //     agent.pending_tool_calls.add_pending_call(
-    //         tool_call.clone(), 
+    //         tool_call.clone(),
     //         session_response.session_id.0.to_string()
     //     ).await.unwrap();
-    //     
+    //
     //     // Test permission grant
     //     let grant_request = ToolPermissionGrantRequest {
     //         tool_call_id: tool_call.id.clone(),
     //         session_id: session_response.session_id.clone(),
     //     };
-    //     
+    //
     //     let grant_response = agent.tool_permission_grant(grant_request).await.unwrap();
     //     // Response may succeed or fail depending on tool execution
     //     // but should not error on the protocol level
     //     assert!(grant_response.success || !grant_response.error_message.is_none());
-    //     
+    //
     //     // Test permission deny with another call
     //     let tool_call_2 = crate::tools::InternalToolRequest {
     //         id: "test-tool-call-2".to_string(),
@@ -1526,25 +1570,25 @@ mod tests {
     //             "content": "Hello, World 2!"
     //         }),
     //     };
-    //     
+    //
     //     agent.pending_tool_calls.add_pending_call(
     //         tool_call_2.clone(),
     //         session_response.session_id.0.to_string()
     //     ).await.unwrap();
-    //     
+    //
     //     let deny_request = ToolPermissionDenyRequest {
     //         tool_call_id: tool_call_2.id,
     //         session_id: session_response.session_id,
     //     };
-    //     
+    //
     //     let deny_response = agent.tool_permission_deny(deny_request).await.unwrap();
     //     assert!(deny_response.success);
     // }
-    
+
     #[tokio::test]
     async fn test_protocol_error_handling() {
-        let (agent, _) = create_test_agent_with_notifications();
-        
+        let (agent, _) = create_test_agent_with_notifications().await;
+
         // Test invalid session ID
         let invalid_prompt = PromptRequest {
             session_id: SessionId("invalid-uuid".to_string().into()),
@@ -1555,32 +1599,30 @@ mod tests {
             })],
             meta: None,
         };
-        
+
         let result = agent.prompt(invalid_prompt).await;
         assert!(result.is_err());
-        
+
         // TODO: Add tool permission tests when ToolPermissionGrantRequest/DenyRequest types are available
         // Test tool permission grant with non-existent tool call
         // let invalid_grant = ToolPermissionGrantRequest {
         //     tool_call_id: "non-existent-id".to_string(),
         //     session_id: SessionId("test-session".to_string().into()),
         // };
-        // 
+        //
         // let grant_result = agent.tool_permission_grant(invalid_grant).await.unwrap();
         // assert!(!grant_result.success);
         // assert!(grant_result.error_message.is_some());
-        // 
+        //
         // // Test tool permission deny with non-existent tool call
         // let invalid_deny = ToolPermissionDenyRequest {
         //     tool_call_id: "non-existent-id".to_string(),
         //     session_id: SessionId("test-session".to_string().into()),
         // };
-        // 
+        //
         // let deny_result = agent.tool_permission_deny(invalid_deny).await.unwrap();
         // assert!(deny_result.success); // Should succeed even if tool call doesn't exist
     }
-
-
 
     #[test]
     fn test_compile_time_agent_check() {

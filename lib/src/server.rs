@@ -8,8 +8,8 @@ use crate::{agent::ClaudeAgent, config::AgentConfig, error::AgentError};
 use agent_client_protocol::Agent;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::broadcast;
 use tokio::signal;
+use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 /// The main ACP server that handles JSON-RPC communication
@@ -20,9 +20,9 @@ pub struct ClaudeAgentServer {
 
 impl ClaudeAgentServer {
     /// Create a new Claude Agent server with the given configuration
-    pub fn new(config: AgentConfig) -> crate::Result<Self> {
-        let (agent, notification_receiver) = ClaudeAgent::new(config)?;
-        
+    pub async fn new(config: AgentConfig) -> crate::Result<Self> {
+        let (agent, notification_receiver) = ClaudeAgent::new(config).await?;
+
         Ok(Self {
             agent: Arc::new(agent),
             notification_receiver,
@@ -32,20 +32,20 @@ impl ClaudeAgentServer {
     /// Start the server using stdio (standard ACP pattern)
     pub async fn start_stdio(&self) -> crate::Result<()> {
         info!("Starting ACP server on stdio");
-        
+
         let stdin = tokio::io::stdin();
         let stdout = tokio::io::stdout();
-        
+
         self.start_with_streams(stdin, stdout).await
     }
 
     /// Start the server with graceful shutdown handling
     pub async fn start_with_shutdown(&self) -> crate::Result<()> {
         info!("Starting ACP server with shutdown handling");
-        
+
         let shutdown_signal = self.setup_shutdown_handler();
         let server_task = self.start_stdio();
-        
+
         tokio::select! {
             result = server_task => {
                 info!("Server task completed: {:?}", result);
@@ -67,7 +67,7 @@ impl ClaudeAgentServer {
                 .map_err(AgentError::Io)?;
             let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
                 .map_err(AgentError::Io)?;
-            
+
             tokio::select! {
                 _ = sigterm.recv() => {
                     info!("Received SIGTERM");
@@ -77,24 +77,38 @@ impl ClaudeAgentServer {
                 }
             }
         }
-        
+
         #[cfg(not(unix))]
         {
             signal::ctrl_c().await.map_err(|e| AgentError::Io(e))?;
             info!("Received Ctrl+C");
         }
-        
+
         Ok(())
     }
 
     /// Perform graceful shutdown
     async fn shutdown(&self) -> crate::Result<()> {
         info!("Shutting down server");
-        
-        // Clean up active sessions
-        // Stop notification tasks
-        // Close connections gracefully
-        
+
+        // Clean up active sessions by shutting down the session manager
+        if let Err(e) = self.agent.shutdown_sessions().await {
+            warn!("Error shutting down sessions: {}", e);
+        }
+
+        // Close MCP server connections if any exist
+        if let Err(e) = self.agent.shutdown_mcp_connections().await {
+            warn!("Error shutting down MCP connections: {}", e);
+        }
+
+        // Stop any background tool processes
+        if let Err(e) = self.agent.shutdown_tool_handler().await {
+            warn!("Error shutting down tool handler: {}", e);
+        }
+
+        // The notification channel will be dropped when the server is dropped,
+        // which will automatically close all receivers
+
         info!("Server shutdown complete");
         Ok(())
     }
@@ -106,14 +120,14 @@ impl ClaudeAgentServer {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         info!("Starting ACP server with custom streams");
-        
+
         // Create shared writer for responses and notifications
         let writer = Arc::new(tokio::sync::Mutex::new(writer));
         let agent = Arc::clone(&self.agent);
-        
+
         // Handle requests directly without spawning (avoids Send issues)
         let mut notification_receiver = self.notification_receiver.resubscribe();
-        
+
         // For now, just handle requests sequentially
         // In a production system, we'd need a more sophisticated approach
         // to handle notifications and requests concurrently
@@ -134,33 +148,35 @@ impl ClaudeAgentServer {
                 warn!("Notification handler completed");
             }
         }
-        
+
         Ok(())
     }
 
     /// Handle incoming JSON-RPC requests
     async fn handle_requests<R, W>(
-        reader: R, 
-        writer: Arc<tokio::sync::Mutex<W>>, 
-        agent: Arc<ClaudeAgent>
+        reader: R,
+        writer: Arc<tokio::sync::Mutex<W>>,
+        agent: Arc<ClaudeAgent>,
     ) -> crate::Result<()>
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let mut lines = BufReader::new(reader).lines();
-        
+
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
                 continue;
             }
-            
+
             // Handle request directly to avoid Send issues
-            if let Err(e) = Self::handle_single_request(line, Arc::clone(&writer), Arc::clone(&agent)).await {
+            if let Err(e) =
+                Self::handle_single_request(line, Arc::clone(&writer), Arc::clone(&agent)).await
+            {
                 error!("Failed to handle request: {}", e);
             }
         }
-        
+
         Ok(())
     }
 
@@ -175,47 +191,69 @@ impl ClaudeAgentServer {
     {
         // Parse the JSON-RPC request
         let request: serde_json::Value = serde_json::from_str(&line)?;
-        
-        let method = request.get("method")
+
+        let method = request
+            .get("method")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AgentError::Protocol("Missing method".to_string()))?;
-            
+
         let id = request.get("id").cloned();
-        let params = request.get("params").cloned().unwrap_or(serde_json::Value::Null);
-        
+        let params = request
+            .get("params")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+
         info!("Handling request: method={}, id={:?}", method, id);
-        
+
         // Route to appropriate agent method
         let response_result = match method {
             "initialize" => {
                 let req = serde_json::from_value(params)?;
-                agent.initialize(req).await.map(|r| serde_json::to_value(r).unwrap())
+                agent
+                    .initialize(req)
+                    .await
+                    .map(|r| serde_json::to_value(r).unwrap())
             }
             "authenticate" => {
                 let req = serde_json::from_value(params)?;
-                agent.authenticate(req).await.map(|r| serde_json::to_value(r).unwrap())
+                agent
+                    .authenticate(req)
+                    .await
+                    .map(|r| serde_json::to_value(r).unwrap())
             }
             "session/new" => {
                 let req = serde_json::from_value(params)?;
-                agent.new_session(req).await.map(|r| serde_json::to_value(r).unwrap())
+                agent
+                    .new_session(req)
+                    .await
+                    .map(|r| serde_json::to_value(r).unwrap())
             }
             "session/load" => {
                 let req = serde_json::from_value(params)?;
-                agent.load_session(req).await.map(|r| serde_json::to_value(r).unwrap())
+                agent
+                    .load_session(req)
+                    .await
+                    .map(|r| serde_json::to_value(r).unwrap())
             }
             "session/set-mode" => {
                 let req = serde_json::from_value(params)?;
-                agent.set_session_mode(req).await.map(|r| serde_json::to_value(r).unwrap())
+                agent
+                    .set_session_mode(req)
+                    .await
+                    .map(|r| serde_json::to_value(r).unwrap())
             }
             "session/prompt" => {
                 let req = serde_json::from_value(params)?;
-                agent.prompt(req).await.map(|r| serde_json::to_value(r).unwrap())
+                agent
+                    .prompt(req)
+                    .await
+                    .map(|r| serde_json::to_value(r).unwrap())
             }
             _ => {
                 return Err(AgentError::Protocol(format!("Unknown method: {}", method)));
             }
         };
-        
+
         // Send response
         let response = match response_result {
             Ok(result) => {
@@ -237,7 +275,7 @@ impl ClaudeAgentServer {
                 })
             }
         };
-        
+
         Self::send_response(writer, response).await
     }
 
@@ -250,11 +288,11 @@ impl ClaudeAgentServer {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let response_line = format!("{}\n", serde_json::to_string(&response)?);
-        
+
         let mut writer_guard = writer.lock().await;
         writer_guard.write_all(response_line.as_bytes()).await?;
         writer_guard.flush().await?;
-        
+
         Ok(())
     }
 
@@ -274,17 +312,15 @@ impl ClaudeAgentServer {
                 "message_chunk": notification.message_chunk
             }
         });
-        
+
         let notification_line = format!("{}\n", serde_json::to_string(&notification_msg)?);
-        
+
         let mut writer_guard = writer.lock().await;
         writer_guard.write_all(notification_line.as_bytes()).await?;
         writer_guard.flush().await?;
-        
+
         Ok(())
     }
-
-
 }
 
 /// Connection manager for tracking active connections
@@ -305,12 +341,18 @@ impl ConnectionManager {
     /// Create a new connection manager
     pub fn new() -> Self {
         Self {
-            active_connections: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            active_connections: Arc::new(
+                tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            ),
         }
     }
 
     /// Register a new connection
-    pub async fn register_connection(&self, id: String, protocol_version: String) -> crate::Result<()> {
+    pub async fn register_connection(
+        &self,
+        id: String,
+        protocol_version: String,
+    ) -> crate::Result<()> {
         let now = std::time::SystemTime::now();
         let info = ConnectionInfo {
             id: id.clone(),
@@ -362,14 +404,14 @@ mod tests {
     use super::*;
     use tokio::io::duplex;
 
-    fn create_test_server() -> ClaudeAgentServer {
+    async fn create_test_server() -> ClaudeAgentServer {
         let config = AgentConfig::default();
-        ClaudeAgentServer::new(config).unwrap()
+        ClaudeAgentServer::new(config).await.unwrap()
     }
 
     #[tokio::test]
     async fn test_server_creation() {
-        let server = create_test_server();
+        let server = create_test_server().await;
         // Just ensure we can create a server without panicking
         assert!(std::ptr::eq(server.agent.as_ref(), server.agent.as_ref()));
     }
@@ -378,10 +420,10 @@ mod tests {
     async fn test_connection_manager() {
         let manager = ConnectionManager::new();
 
-        manager.register_connection(
-            "test-conn".to_string(),
-            "1.0.0".to_string(),
-        ).await.unwrap();
+        manager
+            .register_connection("test-conn".to_string(), "1.0.0".to_string())
+            .await
+            .unwrap();
 
         let connections = manager.list_connections().await.unwrap();
         assert_eq!(connections.len(), 1);
@@ -397,22 +439,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_server_startup() {
-        let _server = create_test_server();
-        
+        let _server = create_test_server().await;
+
         let (_client_stream, _server_stream) = duplex(1024);
-        
+
         // For now, just test that we can create the server without panicking
         // Full integration testing would require more sophisticated test setup
         // to handle the Agent trait's Send bounds
-        
+
         // If we get here without panicking, the server was created successfully
         assert!(true);
     }
 
-    #[tokio::test] 
+    #[tokio::test]
     async fn test_json_rpc_request_parsing() {
-        let _server = create_test_server();
-        
+        let _server = create_test_server().await;
+
         // Test that we can parse a basic JSON-RPC request without panicking
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -429,11 +471,14 @@ mod tests {
                 "protocol_version": "1.0.0"
             }
         });
-        
+
         let line = serde_json::to_string(&request).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
-        
-        assert_eq!(parsed.get("method").unwrap().as_str().unwrap(), "initialize");
+
+        assert_eq!(
+            parsed.get("method").unwrap().as_str().unwrap(),
+            "initialize"
+        );
         assert_eq!(parsed.get("id").unwrap().as_i64().unwrap(), 1);
     }
 }

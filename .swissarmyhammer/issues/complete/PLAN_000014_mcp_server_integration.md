@@ -632,3 +632,54 @@ tokio-util = { version = "0.7", features = ["codec"] }
 - Error handling covers MCP server failures and timeouts
 - Tool permission system works with MCP tools
 - `cargo build` and `cargo test` succeed
+
+## Proposed Solution
+
+After analyzing the current codebase, I've identified a strategic approach to implement MCP server integration. The config infrastructure is already in place, which simplifies our implementation.
+
+### Key Findings from Codebase Analysis
+
+1. **Config Structure**: `McpServerConfig` already exists with validation in `config.rs`
+2. **Tool Architecture**: Robust `ToolCallHandler` with permission system ready for extension
+3. **Agent Structure**: Well-separated concerns with managers for different functionalities
+4. **Dependencies**: Most required dependencies already available (tokio, serde_json, etc.)
+
+### Implementation Steps
+
+1. **Create MCP Manager** (`lib/src/mcp.rs`)
+   - Implement `McpServerManager` struct for process lifecycle management
+   - Handle JSON-RPC communication over stdin/stdout with MCP servers
+   - Manage tool discovery and routing
+   - Include proper error handling and cleanup
+
+2. **Extend Tool Handler** (`lib/src/tools.rs`)
+   - Add MCP manager integration to `ToolCallHandler` 
+   - Implement tool name parsing to route MCP calls (e.g., "server:tool_name")
+   - Extend `list_available_tools()` to include MCP tools
+   - Add new constructor `new_with_mcp_manager()`
+
+3. **Update Agent** (`lib/src/agent.rs`)
+   - Initialize MCP manager in agent constructor
+   - Add shutdown method for cleanup
+   - Update capabilities to include MCP tools
+
+4. **Extend Config** (`lib/src/config.rs`)
+   - Add validation methods for MCP server configurations (some already exist)
+   - Extend `AgentConfig::validate()` to include MCP validation
+
+### Technical Implementation Details
+
+- **Communication Protocol**: JSON-RPC 2.0 over stdin/stdout pipes
+- **Tool Naming**: Use "server_name:tool_name" convention for MCP tools
+- **Error Handling**: Graceful degradation when MCP servers fail
+- **Lifecycle Management**: Proper startup, shutdown, and cleanup of child processes
+- **Thread Safety**: Use Arc/RwLock for shared state management
+
+### Testing Strategy
+
+- Unit tests for MCP manager with mock processes
+- Integration tests with echo-based mock servers
+- Tool routing and permission system tests
+- Agent lifecycle and capability tests
+
+This approach leverages existing infrastructure while providing a clean extension point for MCP server integration.
