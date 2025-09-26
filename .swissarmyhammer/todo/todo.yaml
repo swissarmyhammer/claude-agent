@@ -1,0 +1,37 @@
+todo:
+- id: 01K63D4V1YMS176PKTXPMX6YZ0
+  task: Review Cargo.toml for dependency additions
+  context: null
+  done: true
+- id: 01K63D4XRYS81PPATKHD2CEEC0
+  task: Review lib/Cargo.toml for dependency additions
+  context: null
+  done: true
+- id: 01K63D56NYZ1HGT5ZZ02C42KK7
+  task: Review lib/src/lib.rs for coding standard violations and missing items
+  context: null
+  done: false
+- id: 01K63D5AJS0MDR3HFGREHDTSX2
+  task: Review lib/src/claude.rs for placeholders, TODOs, and coding standards
+  context: null
+  done: false
+- id: 01K63D5E9Z07F1HA0GKXWB01F1
+  task: Run cargo clippy to check for lint warnings and errors
+  context: null
+  done: false
+- id: 01K63D8QGBMZD30Q8JYK379NE4
+  task: 'Fix clippy warning: unused variable claude_config in new_with_config method'
+  context: 'lib/src/claude.rs:65:28 - unused variable: `claude_config`'
+  done: false
+- id: 01K63D8TNZB2NE8SP7SYWATVY8
+  task: 'Fix clippy warning: remove unnecessary mut from config variable'
+  context: lib/src/claude.rs:66:13 - variable does not need to be mutable
+  done: false
+- id: 01K63D8YP2QH6VK8P9V4TVGQZE
+  task: Fix dead code warnings by implementing actual Claude SDK usage
+  context: Fields client and config are never read, methods execute_with_retry and is_retryable are never used
+  done: false
+- id: 01K63D91J1293NDS9HC5E3HNHM
+  task: Implement actual Claude SDK query method
+  context: Replace placeholder implementation in query method with real Claude SDK calls
+  done: false

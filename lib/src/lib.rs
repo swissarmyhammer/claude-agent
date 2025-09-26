@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod error;
+pub mod claude;
 
 pub use config::AgentConfig;
 pub use error::{AgentError, Result};
