@@ -8,9 +8,11 @@ pub mod config;
 pub mod error;
 pub mod claude;
 pub mod session;
+pub mod agent;
 
 pub use config::AgentConfig;
 pub use error::{AgentError, Result};
+pub use agent::ClaudeAgent;
 
 /// The main Claude Agent ACP server
 pub struct ClaudeAgentServer {

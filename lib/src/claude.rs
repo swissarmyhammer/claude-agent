@@ -141,12 +141,6 @@ impl ClaudeClient {
         prompt: &str,
         context: &SessionContext,
     ) -> Result<String> {
-        // TODO: Implement actual Claude SDK query with context
-        // For now, use the client and build conversation history
-        
-        let _client = &self.client;
-        let _config = &self.config;
-        
         // Build conversation history from context
         let mut full_conversation = String::new();
         
@@ -160,13 +154,17 @@ impl ClaudeClient {
         }
         full_conversation.push_str(&format!("User: {}", prompt));
 
-        // Use retry logic
+        // Use retry logic with actual Claude SDK call
         self.execute_with_retry(|| async {
             if prompt.is_empty() {
-                Err(crate::error::AgentError::Claude(claude_sdk_rs::Error::ConfigError("Empty prompt".to_string())))
-            } else {
-                Ok(format!("Response with context (session: {}) to: {}", context.session_id, prompt))
+                return Err(crate::error::AgentError::Claude(claude_sdk_rs::Error::ConfigError("Empty prompt".to_string())));
             }
+            
+            // Use the full conversation including context
+            let response = self.client.send_full(&full_conversation).await
+                .map_err(crate::error::AgentError::Claude)?;
+            
+            Ok(response.content)
         }).await
     }
 
@@ -176,22 +174,54 @@ impl ClaudeClient {
         prompt: &str, 
         context: &SessionContext,
     ) -> Result<impl Stream<Item = MessageChunk>> {
-        // TODO: Implement actual Claude SDK streaming query with context
-        // For now, return a working stream that uses the client and context
+        if prompt.is_empty() {
+            return Err(crate::error::AgentError::Claude(claude_sdk_rs::Error::ConfigError("Empty prompt".to_string())));
+        }
         
-        let _client = &self.client;
-        let _config = &self.config;
+        // Build conversation history from context
+        let mut full_conversation = String::new();
         
-        // Create a simple stream that includes context information
-        let chunks = vec![
-            MessageChunk {
-                content: format!("Streaming response with context (session: {}, {} previous messages) to: {}", 
-                    context.session_id, context.messages.len(), prompt),
-                chunk_type: ChunkType::Text,
+        for message in &context.messages {
+            let role_str = match message.role {
+                MessageRole::User => "User",
+                MessageRole::Assistant => "Assistant", 
+                MessageRole::System => "System",
+            };
+            full_conversation.push_str(&format!("{}: {}\n", role_str, message.content));
+        }
+        full_conversation.push_str(&format!("User: {}", prompt));
+        
+        // Use the full conversation including context for streaming
+        let message_stream = self.client.query(&full_conversation).stream().await
+            .map_err(crate::error::AgentError::Claude)?;
+        
+        // Convert the MessageStream to our MessageChunk stream
+        let chunk_stream = message_stream.map(|result| {
+            match result {
+                Ok(Message::Assistant { content, .. }) => MessageChunk {
+                    content,
+                    chunk_type: ChunkType::Text,
+                },
+                Ok(Message::Tool { .. }) => MessageChunk {
+                    content: String::new(), // Tool calls don't have direct content
+                    chunk_type: ChunkType::ToolCall,
+                },
+                Ok(Message::ToolResult { .. }) => MessageChunk {
+                    content: String::new(), // Tool results handled separately
+                    chunk_type: ChunkType::ToolResult,
+                },
+                Ok(_) => MessageChunk {
+                    content: String::new(), // Other message types (Init, User, System, Result)
+                    chunk_type: ChunkType::Text,
+                },
+                Err(_) => MessageChunk {
+                    content: String::new(), // Error handling - could be improved
+                    chunk_type: ChunkType::Text,
+                },
             }
-        ];
+        });
         
-        Ok(tokio_stream::iter(chunks))
+        Ok(chunk_stream)
     }
 
     /// Execute an operation with retry logic
