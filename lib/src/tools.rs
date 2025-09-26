@@ -8,6 +8,10 @@
 //! types for request handling and converts to protocol types when needed.
 
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tokio::process::{Command, Child};
 
 /// Internal representation of a tool request from an LLM
 #[derive(Debug, Clone)]
@@ -20,10 +24,25 @@ pub struct InternalToolRequest {
     pub arguments: Value,
 }
 
+/// Manages terminal sessions for command execution
+#[derive(Debug, Clone)]
+pub struct TerminalManager {
+    terminals: Arc<RwLock<HashMap<String, TerminalSession>>>,
+}
+
+/// Represents a terminal session with working directory and environment
+#[derive(Debug)]
+pub struct TerminalSession {
+    process: Option<Child>,
+    working_dir: std::path::PathBuf,
+    environment: HashMap<String, String>,
+}
+
 /// Handles tool request execution with permission management and security validation
 #[derive(Debug, Clone)]
 pub struct ToolCallHandler {
     permissions: ToolPermissions,
+    terminal_manager: Arc<TerminalManager>,
 }
 
 /// Configuration for tool permissions and security policies
@@ -61,10 +80,139 @@ pub struct PermissionRequest {
     pub arguments: Value,
 }
 
+impl TerminalManager {
+    /// Create a new terminal manager
+    pub fn new() -> Self {
+        Self {
+            terminals: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Create a new terminal session
+    pub async fn create_terminal(&self, working_dir: Option<String>) -> crate::Result<String> {
+        let terminal_id = ulid::Ulid::new().to_string();
+        let working_dir = working_dir
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+
+        let session = TerminalSession {
+            process: None,
+            working_dir,
+            environment: std::env::vars().collect(),
+        };
+
+        let mut terminals = self.terminals.write().await;
+        terminals.insert(terminal_id.clone(), session);
+
+        tracing::info!("Created terminal session: {}", terminal_id);
+        Ok(terminal_id)
+    }
+
+    /// Execute a command in the specified terminal session
+    pub async fn execute_command(&self, terminal_id: &str, command: &str) -> crate::Result<String> {
+        let mut terminals = self.terminals.write().await;
+        let session = terminals.get_mut(terminal_id)
+            .ok_or_else(|| crate::AgentError::ToolExecution(format!("Terminal {} not found", terminal_id)))?;
+
+        tracing::info!("Executing command in terminal {}: {}", terminal_id, command);
+
+        // Parse command and arguments
+        let parts: Vec<&str> = command.split_whitespace().collect();
+        if parts.is_empty() {
+            return Err(crate::AgentError::ToolExecution("Empty command".to_string()));
+        }
+
+        let program = parts[0];
+        let args = &parts[1..];
+
+        // Execute command
+        let output = Command::new(program)
+            .args(args)
+            .current_dir(&session.working_dir)
+            .envs(&session.environment)
+            .output()
+            .await
+            .map_err(|e| crate::AgentError::ToolExecution(format!("Failed to execute command: {}", e)))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        let result = if output.status.success() {
+            if stdout.is_empty() {
+                "Command completed successfully (exit code: 0)".to_string()
+            } else {
+                format!("Command output:\n{}", stdout)
+            }
+        } else {
+            let exit_code = output.status.code().unwrap_or(-1);
+            if stderr.is_empty() {
+                format!("Command failed (exit code: {})", exit_code)
+            } else {
+                format!("Command failed (exit code: {}):\n{}", exit_code, stderr)
+            }
+        };
+
+        tracing::info!("Command completed with exit code: {:?}", output.status.code());
+        Ok(result)
+    }
+
+    /// Change the working directory for a terminal session
+    pub async fn change_directory(&self, terminal_id: &str, path: &str) -> crate::Result<String> {
+        let mut terminals = self.terminals.write().await;
+        let session = terminals.get_mut(terminal_id)
+            .ok_or_else(|| crate::AgentError::ToolExecution(format!("Terminal {} not found", terminal_id)))?;
+
+        let new_path = if std::path::Path::new(path).is_absolute() {
+            std::path::PathBuf::from(path)
+        } else {
+            session.working_dir.join(path)
+        };
+
+        if new_path.exists() && new_path.is_dir() {
+            session.working_dir = new_path.canonicalize()
+                .map_err(|e| crate::AgentError::ToolExecution(format!("Failed to resolve path: {}", e)))?;
+
+            tracing::info!("Changed directory to: {}", session.working_dir.display());
+            Ok(format!("Changed directory to: {}", session.working_dir.display()))
+        } else {
+            Err(crate::AgentError::ToolExecution(format!("Directory does not exist: {}", path)))
+        }
+    }
+
+    /// Remove a terminal session
+    pub async fn remove_terminal(&self, terminal_id: &str) -> crate::Result<()> {
+        let mut terminals = self.terminals.write().await;
+        if let Some(mut session) = terminals.remove(terminal_id) {
+            if let Some(mut process) = session.process.take() {
+                let _ = process.kill().await;
+            }
+            tracing::info!("Removed terminal session: {}", terminal_id);
+        }
+        Ok(())
+    }
+}
+
+impl Default for TerminalManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ToolCallHandler {
     /// Create a new tool call handler with the given permissions
     pub fn new(permissions: ToolPermissions) -> Self {
-        Self { permissions }
+        Self { 
+            permissions,
+            terminal_manager: Arc::new(TerminalManager::new()),
+        }
+    }
+
+    /// Create a new tool call handler with custom terminal manager
+    pub fn new_with_terminal_manager(permissions: ToolPermissions, terminal_manager: Arc<TerminalManager>) -> Self {
+        Self { 
+            permissions,
+            terminal_manager,
+        }
     }
 
     /// Handle an incoming tool request, checking permissions and executing if allowed
@@ -105,6 +253,7 @@ impl ToolCallHandler {
         match request.name.as_str() {
             "fs_read" => self.handle_fs_read(request).await,
             "fs_write" => self.handle_fs_write(request).await,
+            "fs_list" => self.handle_fs_list(request).await,
             "terminal_create" => self.handle_terminal_create(request).await,
             "terminal_write" => self.handle_terminal_write(request).await,
             _ => Err(crate::AgentError::ToolExecution(format!(
@@ -126,11 +275,12 @@ impl ToolCallHandler {
         // Validate path security
         self.validate_file_path(path)?;
 
-        // Read file (placeholder implementation for now)
-        let content = std::fs::read_to_string(path).map_err(|e| {
+        // Read file using tokio::fs for async operation
+        let content = tokio::fs::read_to_string(path).await.map_err(|e| {
             crate::AgentError::ToolExecution(format!("Failed to read file {}: {}", path, e))
         })?;
 
+        tracing::info!("Successfully read {} bytes from {}", content.len(), path);
         Ok(content)
     }
 
@@ -147,16 +297,26 @@ impl ToolCallHandler {
                 crate::AgentError::ToolExecution("Missing 'content' argument".to_string())
             })?;
 
-        tracing::debug!("Writing to file: {}", path);
+        tracing::debug!("Writing to file: {} ({} bytes)", path, content.len());
 
         // Validate path security
         self.validate_file_path(path)?;
 
-        // Write file
-        std::fs::write(path, content).map_err(|e| {
+        // Create parent directories if they don't exist
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.exists() {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    crate::AgentError::ToolExecution(format!("Failed to create parent directories for {}: {}", path, e))
+                })?;
+            }
+        }
+
+        // Write file using tokio::fs for async operation
+        tokio::fs::write(path, content).await.map_err(|e| {
             crate::AgentError::ToolExecution(format!("Failed to write file {}: {}", path, e))
         })?;
 
+        tracing::info!("Successfully wrote {} bytes to {}", content.len(), path);
         Ok(format!(
             "Successfully wrote {} bytes to {}",
             content.len(),
@@ -164,23 +324,88 @@ impl ToolCallHandler {
         ))
     }
 
+    /// Handle directory listing operations with security validation
+    async fn handle_fs_list(&self, request: &InternalToolRequest) -> crate::Result<String> {
+        let args = self.parse_tool_args(&request.arguments)?;
+        let path = args.get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
+
+        tracing::debug!("Listing directory: {}", path);
+
+        // Validate path security
+        self.validate_file_path(path)?;
+
+        let mut dir_reader = tokio::fs::read_dir(path).await.map_err(|e| {
+            crate::AgentError::ToolExecution(format!("Failed to list directory {}: {}", path, e))
+        })?;
+
+        let mut files = Vec::new();
+        
+        while let Some(entry) = dir_reader.next_entry().await.map_err(|e| {
+            crate::AgentError::ToolExecution(format!("Error reading directory entry: {}", e))
+        })? {
+            let metadata = entry.metadata().await.map_err(|e| {
+                crate::AgentError::ToolExecution(format!("Failed to get metadata: {}", e))
+            })?;
+
+            let file_type = if metadata.is_dir() { "directory" } else { "file" };
+            let size = if metadata.is_file() { metadata.len() } else { 0 };
+
+            files.push(format!(
+                "{} ({}, {} bytes)",
+                entry.file_name().to_string_lossy(),
+                file_type,
+                size
+            ));
+        }
+
+        let content = if files.is_empty() {
+            format!("Directory {} is empty", path)
+        } else {
+            format!("Contents of {}:\n{}", path, files.join("\n"))
+        };
+
+        tracing::info!("Listed {} items in directory {}", files.len(), path);
+        Ok(content)
+    }
+
     /// Handle terminal creation operations
     async fn handle_terminal_create(
         &self,
-        _request: &InternalToolRequest,
+        request: &InternalToolRequest,
     ) -> crate::Result<String> {
-        // Terminal creation functionality not yet implemented
-        Err(crate::AgentError::ToolExecution(
-            "Terminal creation is not yet implemented".to_string(),
-        ))
+        let args = self.parse_tool_args(&request.arguments)?;
+        let working_dir = args.get("working_dir").and_then(|v| v.as_str());
+
+        let terminal_id = self.terminal_manager.create_terminal(working_dir.map(String::from)).await?;
+
+        Ok(format!("Created terminal session: {}", terminal_id))
     }
 
     /// Handle terminal write/command execution operations
-    async fn handle_terminal_write(&self, _request: &InternalToolRequest) -> crate::Result<String> {
-        // Terminal write functionality not yet implemented
-        Err(crate::AgentError::ToolExecution(
-            "Terminal write is not yet implemented".to_string(),
-        ))
+    async fn handle_terminal_write(&self, request: &InternalToolRequest) -> crate::Result<String> {
+        let args = self.parse_tool_args(&request.arguments)?;
+        let terminal_id = args.get("terminal_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| crate::AgentError::ToolExecution("Missing 'terminal_id' argument".to_string()))?;
+        let command = args.get("command")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| crate::AgentError::ToolExecution("Missing 'command' argument".to_string()))?;
+
+        // Validate command security
+        self.validate_command(command)?;
+
+        // Check if this is a directory change command
+        if command.trim().starts_with("cd ") {
+            let path = command.trim().strip_prefix("cd ").unwrap_or("").trim();
+            let result = self.terminal_manager.change_directory(terminal_id, path).await?;
+            return Ok(result);
+        }
+
+        // Execute the command
+        let result = self.terminal_manager.execute_command(terminal_id, command).await?;
+        Ok(result)
     }
 }
 
@@ -198,6 +423,13 @@ impl ToolCallHandler {
             ));
         }
 
+        // Check for null bytes
+        if path.to_string_lossy().contains('\0') {
+            return Err(crate::AgentError::ToolExecution(
+                "Null bytes in path not allowed".to_string(),
+            ));
+        }
+
         // Check for absolute paths outside allowed directories
         if path.is_absolute() {
             let path_str = path.to_string_lossy();
@@ -210,6 +442,73 @@ impl ToolCallHandler {
                     )));
                 }
             }
+
+            // Additional forbidden system directories
+            let forbidden_prefixes = ["/etc", "/usr", "/bin", "/sys", "/proc", "/dev"];
+            for prefix in &forbidden_prefixes {
+                if path_str.starts_with(prefix) {
+                    return Err(crate::AgentError::ToolExecution(
+                        format!("Access to {} is forbidden", prefix)
+                    ));
+                }
+            }
+        }
+
+        // Check file extension restrictions for write operations
+        if let Some(ext) = path.extension() {
+            let dangerous_extensions = ["exe", "bat", "cmd", "scr", "com", "pif"];
+            if dangerous_extensions.contains(&ext.to_string_lossy().as_ref()) {
+                return Err(crate::AgentError::ToolExecution(
+                    format!("File extension .{} is not allowed", ext.to_string_lossy())
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate command for security violations
+    fn validate_command(&self, command: &str) -> crate::Result<()> {
+        let trimmed = command.trim();
+
+        // Check for empty commands
+        if trimmed.is_empty() {
+            return Err(crate::AgentError::ToolExecution("Empty command not allowed".to_string()));
+        }
+
+        // Check for dangerous command patterns
+        let dangerous_patterns = [
+            "rm -rf /",
+            "format",
+            "fdisk",
+            "mkfs",
+            "dd if=",
+            "shutdown",
+            "reboot",
+            "halt",
+            "poweroff",
+            "kill -9 1",
+            "init 0",
+            "init 6",
+        ];
+
+        let command_lower = trimmed.to_lowercase();
+        for pattern in &dangerous_patterns {
+            if command_lower.contains(pattern) {
+                return Err(crate::AgentError::ToolExecution(
+                    format!("Dangerous command pattern '{}' not allowed", pattern)
+                ));
+            }
+        }
+
+        // Check command length
+        if trimmed.len() > 1000 {
+            return Err(crate::AgentError::ToolExecution("Command too long".to_string()));
+        }
+
+        // Check for null bytes
+        if trimmed.contains('\0') {
+            return Err(crate::AgentError::ToolExecution("Null bytes in command not allowed".to_string()));
         }
 
         Ok(())
@@ -477,5 +776,280 @@ mod tests {
             .description
             .contains("Write to file: /test/file.txt"));
         assert_eq!(perm_req.arguments, request.arguments);
+    }
+
+    #[tokio::test]
+    async fn test_fs_write_and_read_integration() {
+        use tempfile::TempDir;
+        
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test_file.txt");
+        let file_path_str = file_path.to_string_lossy();
+
+        let permissions = ToolPermissions {
+            require_permission_for: vec![],
+            auto_approved: vec!["fs_write".to_string(), "fs_read".to_string()],
+            forbidden_paths: vec![],
+        };
+        let handler = ToolCallHandler::new(permissions);
+
+        // Test write
+        let write_request = InternalToolRequest {
+            id: "write-test".to_string(),
+            name: "fs_write".to_string(),
+            arguments: json!({
+                "path": file_path_str,
+                "content": "Hello, World! This is a test."
+            }),
+        };
+
+        let write_result = handler.handle_tool_request(write_request).await.unwrap();
+        match write_result {
+            ToolCallResult::Success(msg) => {
+                assert!(msg.contains("Successfully wrote"));
+                assert!(msg.contains("bytes"));
+            }
+            _ => panic!("Write should succeed"),
+        }
+
+        // Test read
+        let read_request = InternalToolRequest {
+            id: "read-test".to_string(),
+            name: "fs_read".to_string(),
+            arguments: json!({
+                "path": file_path_str
+            }),
+        };
+
+        let read_result = handler.handle_tool_request(read_request).await.unwrap();
+        match read_result {
+            ToolCallResult::Success(content) => {
+                assert_eq!(content, "Hello, World! This is a test.");
+            }
+            _ => panic!("Read should succeed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fs_list() {
+        use tempfile::TempDir;
+        
+        let temp_dir = TempDir::new().unwrap();
+        
+        // Create some test files
+        let file1 = temp_dir.path().join("file1.txt");
+        let file2 = temp_dir.path().join("file2.txt");
+        tokio::fs::write(&file1, "content1").await.unwrap();
+        tokio::fs::write(&file2, "content2").await.unwrap();
+
+        let permissions = ToolPermissions {
+            require_permission_for: vec![],
+            auto_approved: vec!["fs_list".to_string()],
+            forbidden_paths: vec![],
+        };
+        let handler = ToolCallHandler::new(permissions);
+
+        let list_request = InternalToolRequest {
+            id: "list-test".to_string(),
+            name: "fs_list".to_string(),
+            arguments: json!({
+                "path": temp_dir.path().to_string_lossy()
+            }),
+        };
+
+        let list_result = handler.handle_tool_request(list_request).await.unwrap();
+        match list_result {
+            ToolCallResult::Success(content) => {
+                assert!(content.contains("Contents of"));
+                assert!(content.contains("file1.txt"));
+                assert!(content.contains("file2.txt"));
+                assert!(content.contains("file"));
+                assert!(content.contains("bytes"));
+            }
+            _ => panic!("List should succeed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_terminal_create_and_write() {
+        let permissions = ToolPermissions {
+            require_permission_for: vec![],
+            auto_approved: vec!["terminal_create".to_string(), "terminal_write".to_string()],
+            forbidden_paths: vec![],
+        };
+        let handler = ToolCallHandler::new(permissions);
+
+        // Create terminal
+        let create_request = InternalToolRequest {
+            id: "create-test".to_string(),
+            name: "terminal_create".to_string(),
+            arguments: json!({}),
+        };
+
+        let create_result = handler.handle_tool_request(create_request).await.unwrap();
+        let terminal_id = match create_result {
+            ToolCallResult::Success(msg) => {
+                assert!(msg.contains("Created terminal session:"));
+                // Extract terminal ID from the response
+                msg.split_whitespace().last().unwrap().to_string()
+            }
+            _ => panic!("Terminal creation should succeed"),
+        };
+
+        // Execute a simple command
+        let write_request = InternalToolRequest {
+            id: "write-test".to_string(),
+            name: "terminal_write".to_string(),
+            arguments: json!({
+                "terminal_id": terminal_id,
+                "command": "echo 'Hello from terminal'"
+            }),
+        };
+
+        let write_result = handler.handle_tool_request(write_request).await.unwrap();
+        match write_result {
+            ToolCallResult::Success(output) => {
+                assert!(output.contains("Command output:") || output.contains("Hello from terminal"));
+            }
+            _ => panic!("Command execution should succeed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_terminal_cd_operation() {
+        use tempfile::TempDir;
+        
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path().to_string_lossy();
+
+        let permissions = ToolPermissions {
+            require_permission_for: vec![],
+            auto_approved: vec!["terminal_create".to_string(), "terminal_write".to_string()],
+            forbidden_paths: vec![],
+        };
+        let handler = ToolCallHandler::new(permissions);
+
+        // Create terminal
+        let create_request = InternalToolRequest {
+            id: "create-test".to_string(),
+            name: "terminal_create".to_string(),
+            arguments: json!({}),
+        };
+
+        let create_result = handler.handle_tool_request(create_request).await.unwrap();
+        let terminal_id = match create_result {
+            ToolCallResult::Success(msg) => {
+                msg.split_whitespace().last().unwrap().to_string()
+            }
+            _ => panic!("Terminal creation should succeed"),
+        };
+
+        // Test cd command
+        let cd_request = InternalToolRequest {
+            id: "cd-test".to_string(),
+            name: "terminal_write".to_string(),
+            arguments: json!({
+                "terminal_id": terminal_id,
+                "command": format!("cd {}", temp_path)
+            }),
+        };
+
+        let cd_result = handler.handle_tool_request(cd_request).await.unwrap();
+        match cd_result {
+            ToolCallResult::Success(output) => {
+                assert!(output.contains("Changed directory to:"));
+            }
+            _ => panic!("CD operation should succeed"),
+        }
+    }
+
+    #[test]
+    fn test_command_validation_dangerous_patterns() {
+        let handler = create_test_handler();
+
+        let dangerous_commands = vec![
+            "rm -rf /",
+            "shutdown now",
+            "reboot",
+            "halt",
+            "poweroff",
+            "init 0",
+            "dd if=/dev/zero of=/dev/sda",
+            "mkfs.ext4 /dev/sda1",
+        ];
+
+        for cmd in dangerous_commands {
+            assert!(
+                handler.validate_command(cmd).is_err(),
+                "Command should be blocked: {}",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn test_command_validation_safe_commands() {
+        let handler = create_test_handler();
+
+        let safe_commands = vec![
+            "ls -la",
+            "pwd",
+            "echo 'hello'",
+            "cat README.md",
+            "grep 'pattern' file.txt",
+            "find . -name '*.rs'",
+            "git status",
+            "cargo build",
+        ];
+
+        for cmd in safe_commands {
+            assert!(
+                handler.validate_command(cmd).is_ok(),
+                "Command should be allowed: {}",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn test_enhanced_file_path_validation() {
+        let handler = create_test_handler();
+
+        // Test null byte injection
+        assert!(handler.validate_file_path("file\0.txt").is_err());
+        
+        // Test dangerous extensions
+        let dangerous_files = vec![
+            "malware.exe",
+            "script.bat",
+            "command.cmd",
+            "screensaver.scr",
+        ];
+
+        for file in dangerous_files {
+            assert!(
+                handler.validate_file_path(file).is_err(),
+                "File should be blocked: {}",
+                file
+            );
+        }
+
+        // Test additional system paths
+        let forbidden_paths = vec![
+            "/etc/passwd",
+            "/usr/bin/sudo",
+            "/bin/sh",
+            "/sys/kernel/config",
+            "/proc/sys/kernel",
+            "/dev/sda",
+        ];
+
+        for path in forbidden_paths {
+            assert!(
+                handler.validate_file_path(path).is_err(),
+                "Path should be blocked: {}",
+                path
+            );
+        }
     }
 }

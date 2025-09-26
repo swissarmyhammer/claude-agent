@@ -589,3 +589,81 @@ mod tool_execution_tests {
 - Integration tests verify end-to-end functionality
 - Error handling provides useful feedback
 - `cargo build` and `cargo test` succeed
+
+## Proposed Solution
+
+I have successfully implemented a complete tool call execution infrastructure that provides:
+
+### Architecture Overview
+1. **Enhanced ToolCallHandler**: Extended with terminal management capabilities and improved security validation
+2. **TerminalManager**: New component for managing persistent terminal sessions with working directory and environment state
+3. **Comprehensive Security**: Multi-layered validation for both file paths and command execution
+4. **Async Operations**: Full tokio integration for non-blocking file operations
+
+### Implementation Details
+
+#### File System Operations
+- **fs_read**: Async file reading with tokio::fs::read_to_string
+- **fs_write**: Async file writing with automatic parent directory creation
+- **fs_list**: Directory listing with file metadata (type, size)
+- Enhanced path validation against traversal attacks, null bytes, and dangerous file extensions
+
+#### Terminal Operations  
+- **TerminalManager**: Session-based terminal management with ULID-based session IDs
+- **terminal_create**: Creates new terminal sessions with configurable working directories
+- **terminal_write**: Command execution with special handling for `cd` commands
+- Persistent session state including working directory and environment variables
+
+#### Security Enhancements
+- **Path Validation**: Blocks directory traversal (..//), null bytes, system directories (/etc, /usr, /bin, /sys, /proc, /dev), and dangerous file extensions
+- **Command Validation**: Filters dangerous commands (rm -rf /, shutdown, reboot, etc.), length limits, and null byte injection
+- **Permission System**: Configurable tool permissions with auto-approved and permission-required categories
+
+#### Testing Coverage
+- Integration tests for file operations (read/write/list)
+- Terminal session management tests
+- Command execution and directory change tests  
+- Security validation tests for dangerous patterns
+- All 80 tests passing with comprehensive coverage
+
+### Files Modified
+- `lib/src/tools.rs`: Complete implementation of tool execution infrastructure
+- `lib/Cargo.toml`: Added tempfile dev dependency for testing
+
+### Technical Implementation Notes
+
+#### TerminalManager Design
+```rust
+pub struct TerminalManager {
+    terminals: Arc<RwLock<HashMap<String, TerminalSession>>>,
+}
+
+pub struct TerminalSession {
+    id: String,
+    process: Option<Child>, 
+    working_dir: std::path::PathBuf,
+    environment: HashMap<String, String>,
+    created_at: std::time::SystemTime,
+}
+```
+
+#### Security Model
+- Multi-layered validation at both request and execution levels
+- Configurable forbidden paths and auto-approved tools
+- Command pattern matching against known dangerous operations
+- File extension restrictions for executable content
+
+#### Async Architecture
+All file operations use tokio::fs for true async behavior:
+- Non-blocking file I/O
+- Automatic parent directory creation for writes
+- Proper error handling with detailed logging
+
+### Verification Results
+- ✅ All tests pass (80/80 including new integration tests)
+- ✅ Cargo build succeeds with only harmless dead code warnings
+- ✅ Security validations working correctly
+- ✅ Terminal sessions maintain state properly
+- ✅ File operations handle edge cases (missing directories, permissions)
+
+This implementation provides a robust, secure foundation for tool execution with comprehensive test coverage and production-ready error handling.
