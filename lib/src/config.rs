@@ -150,7 +150,7 @@ impl StdioTransport {
                 self.name
             )));
         }
-        
+
         // Validate environment variables
         for env_var in &self.env {
             if env_var.name.is_empty() {
@@ -160,7 +160,7 @@ impl StdioTransport {
                 )));
             }
         }
-        
+
         Ok(())
     }
 }
@@ -179,7 +179,7 @@ impl HttpTransport {
                 self.name
             )));
         }
-        
+
         // Validate URL format
         if !self.url.starts_with("http://") && !self.url.starts_with("https://") {
             return Err(crate::error::AgentError::Config(format!(
@@ -187,7 +187,7 @@ impl HttpTransport {
                 self.name
             )));
         }
-        
+
         // Validate HTTP headers
         for header in &self.headers {
             if header.name.is_empty() {
@@ -197,7 +197,7 @@ impl HttpTransport {
                 )));
             }
         }
-        
+
         Ok(())
     }
 }
@@ -216,7 +216,7 @@ impl SseTransport {
                 self.name
             )));
         }
-        
+
         // Validate URL format
         if !self.url.starts_with("http://") && !self.url.starts_with("https://") {
             return Err(crate::error::AgentError::Config(format!(
@@ -224,7 +224,7 @@ impl SseTransport {
                 self.name
             )));
         }
-        
+
         // Validate HTTP headers
         for header in &self.headers {
             if header.name.is_empty() {
@@ -234,7 +234,7 @@ impl SseTransport {
                 )));
             }
         }
-        
+
         Ok(())
     }
 }
@@ -415,12 +415,14 @@ mod tests {
     #[test]
     fn test_config_validation_empty_mcp_server_name() {
         let mut config = AgentConfig::default();
-        config.mcp_servers.push(McpServerConfig::Stdio(StdioTransport {
-            name: String::new(),
-            command: "test".to_string(),
-            args: vec![],
-            env: vec![],
-        }));
+        config
+            .mcp_servers
+            .push(McpServerConfig::Stdio(StdioTransport {
+                name: String::new(),
+                command: "test".to_string(),
+                args: vec![],
+                env: vec![],
+            }));
 
         let result = config.validate();
         assert!(result.is_err());
@@ -433,12 +435,14 @@ mod tests {
     #[test]
     fn test_config_validation_empty_mcp_server_command() {
         let mut config = AgentConfig::default();
-        config.mcp_servers.push(McpServerConfig::Stdio(StdioTransport {
-            name: "test".to_string(),
-            command: String::new(),
-            args: vec![],
-            env: vec![],
-        }));
+        config
+            .mcp_servers
+            .push(McpServerConfig::Stdio(StdioTransport {
+                name: "test".to_string(),
+                command: String::new(),
+                args: vec![],
+                env: vec![],
+            }));
 
         let result = config.validate();
         assert!(result.is_err());

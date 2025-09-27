@@ -2,6 +2,7 @@
 mcp.log
 .swissarmyhammer/tmp
 .swissarmyhammer/search.db
+.swissarmyhammer/semantic.db
 .swissarmyhammer/todo/
 .swissarmyhammer/workflow-runs/
 

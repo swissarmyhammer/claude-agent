@@ -13,7 +13,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, RwLock};
 
-
 /// Transport-specific connection details
 #[derive(Debug)]
 pub enum TransportConnection {
@@ -98,12 +97,12 @@ impl McpServerManager {
                 // Start the MCP server process with environment variables
                 let mut command = Command::new(&stdio_config.command);
                 command.args(&stdio_config.args);
-                
+
                 // Set environment variables
                 for env_var in &stdio_config.env {
                     command.env(&env_var.name, &env_var.value);
                 }
-                
+
                 let mut child = command
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
@@ -118,10 +117,14 @@ impl McpServerManager {
 
                 // Get stdio handles
                 let stdin = child.stdin.take().ok_or_else(|| {
-                    crate::AgentError::ToolExecution("Failed to get stdin for MCP server".to_string())
+                    crate::AgentError::ToolExecution(
+                        "Failed to get stdin for MCP server".to_string(),
+                    )
                 })?;
                 let stdout = child.stdout.take().ok_or_else(|| {
-                    crate::AgentError::ToolExecution("Failed to get stdout for MCP server".to_string())
+                    crate::AgentError::ToolExecution(
+                        "Failed to get stdout for MCP server".to_string(),
+                    )
                 })?;
 
                 let mut stdin_writer = BufWriter::new(stdin);
@@ -129,7 +132,12 @@ impl McpServerManager {
 
                 // Initialize MCP protocol
                 let tools = self
-                    .initialize_mcp_connection(&mut stdin_writer, &mut stdout_reader, &stdio_config.name, stdio_config)
+                    .initialize_mcp_connection(
+                        &mut stdin_writer,
+                        &mut stdout_reader,
+                        &stdio_config.name,
+                        stdio_config,
+                    )
                     .await?;
 
                 let transport = TransportConnection::Stdio {
@@ -157,16 +165,16 @@ impl McpServerManager {
                 // Create HTTP client with headers
                 let client_builder = Client::builder();
                 let mut headers = reqwest::header::HeaderMap::new();
-                
+
                 for header in &http_config.headers {
                     if let (Ok(name), Ok(value)) = (
                         reqwest::header::HeaderName::from_bytes(header.name.as_bytes()),
-                        reqwest::header::HeaderValue::from_str(&header.value)
+                        reqwest::header::HeaderValue::from_str(&header.value),
                     ) {
                         headers.insert(name, value);
                     }
                 }
-                
+
                 let client = client_builder
                     .default_headers(headers)
                     .build()
@@ -178,7 +186,9 @@ impl McpServerManager {
                     })?;
 
                 // Initialize MCP connection via HTTP
-                let tools = self.initialize_http_mcp_connection(&client, http_config).await?;
+                let tools = self
+                    .initialize_http_mcp_connection(&client, http_config)
+                    .await?;
 
                 let transport = TransportConnection::Http {
                     client: Arc::new(client),
@@ -207,7 +217,9 @@ impl McpServerManager {
                 let (response_tx, response_rx) = mpsc::unbounded_channel();
 
                 // Initialize SSE connection
-                let tools = self.initialize_sse_mcp_connection(sse_config, response_tx).await?;
+                let tools = self
+                    .initialize_sse_mcp_connection(sse_config, response_tx)
+                    .await?;
 
                 let transport = TransportConnection::Sse {
                     url: sse_config.url.clone(),
@@ -490,7 +502,7 @@ impl McpServerManager {
             "SSE MCP server {} connection initialized but not fully implemented",
             config.name
         );
-        
+
         Ok(vec![])
     }
 
@@ -569,16 +581,24 @@ impl McpServerManager {
         );
 
         match &connection.transport {
-            TransportConnection::Stdio { stdin_writer, stdout_reader, .. } => {
+            TransportConnection::Stdio {
+                stdin_writer,
+                stdout_reader,
+                ..
+            } => {
                 // Get writer and reader
                 let mut writer_guard = stdin_writer.write().await;
                 let writer = writer_guard.as_mut().ok_or_else(|| {
-                    crate::AgentError::ToolExecution("MCP server stdin writer not available".to_string())
+                    crate::AgentError::ToolExecution(
+                        "MCP server stdin writer not available".to_string(),
+                    )
                 })?;
 
                 let mut reader_guard = stdout_reader.write().await;
                 let reader = reader_guard.as_mut().ok_or_else(|| {
-                    crate::AgentError::ToolExecution("MCP server stdout reader not available".to_string())
+                    crate::AgentError::ToolExecution(
+                        "MCP server stdout reader not available".to_string(),
+                    )
                 })?;
 
                 // Send request
@@ -712,7 +732,11 @@ impl McpServerManager {
             tracing::info!("Shutting down MCP server: {}", name);
 
             match &connection.transport {
-                TransportConnection::Stdio { process, stdin_writer, stdout_reader } => {
+                TransportConnection::Stdio {
+                    process,
+                    stdin_writer,
+                    stdout_reader,
+                } => {
                     // Close stdio handles first
                     {
                         let mut writer_guard = stdin_writer.write().await;
@@ -734,7 +758,11 @@ impl McpServerManager {
                     // HTTP connections don't need explicit cleanup
                     tracing::debug!("HTTP MCP server connection closed: {}", name);
                 }
-                TransportConnection::Sse { message_tx, response_rx, .. } => {
+                TransportConnection::Sse {
+                    message_tx,
+                    response_rx,
+                    ..
+                } => {
                     // Close SSE channels
                     {
                         let mut tx_guard = message_tx.write().await;
@@ -803,7 +831,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_name_extraction() {
-        let manager = McpServerManager::new();
+        let _manager = McpServerManager::new();
 
         let tool_call = InternalToolRequest {
             id: "test-123".to_string(),
@@ -969,7 +997,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_transport_configuration() {
-        let manager = McpServerManager::new();
+        let _manager = McpServerManager::new();
 
         let http_config = crate::config::HttpTransport {
             transport_type: "http".to_string(),
@@ -997,7 +1025,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sse_transport_configuration() {
-        let manager = McpServerManager::new();
+        let _manager = McpServerManager::new();
 
         let sse_config = crate::config::SseTransport {
             transport_type: "sse".to_string(),

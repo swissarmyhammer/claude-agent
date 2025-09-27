@@ -7,8 +7,8 @@ use agent_client_protocol::{
     Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
     ContentBlock, ExtNotification, ExtRequest, InitializeRequest, InitializeResponse,
     LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
-    PromptResponse, RawValue, SessionId, SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent,
+    PromptResponse, RawValue, SessionId, SessionNotification, SessionUpdate, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason, TextContent,
 };
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -127,7 +127,8 @@ impl ClaudeAgent {
         let session_manager = Arc::new(SessionManager::new());
         let claude_client = Arc::new(ClaudeClient::new_with_config(&config.claude)?);
 
-        let (notification_sender, notification_receiver) = NotificationSender::new(config.notification_buffer_size);
+        let (notification_sender, notification_receiver) =
+            NotificationSender::new(config.notification_buffer_size);
 
         // Create and initialize MCP manager
         let mut mcp_manager = crate::mcp::McpServerManager::new();
@@ -313,12 +314,12 @@ impl ClaudeAgent {
             if let Err(e) = self
                 .send_session_update(SessionNotification {
                     session_id: SessionId(session_id.to_string().into()),
-                    update: SessionUpdate::AgentMessageChunk { 
+                    update: SessionUpdate::AgentMessageChunk {
                         content: ContentBlock::Text(TextContent {
                             text: chunk.content.clone(),
                             annotations: None,
                             meta: None,
-                        })
+                        }),
                     },
                     meta: None,
                 })
@@ -459,9 +460,17 @@ impl Agent for ClaudeAgent {
 
         let response = InitializeResponse {
             agent_capabilities: self.capabilities.clone(),
-            // Claude Code is a local tool that does not require authentication.
-            // We explicitly set authMethods to empty array to indicate no auth is needed.
-            // This decision is intentional - do not add authentication methods.
+            // AUTHENTICATION ARCHITECTURE DECISION:
+            // Claude Code is a local development tool that runs entirely on the user's machine.
+            // It does not require authentication because:
+            // 1. It operates within the user's own development environment
+            // 2. It does not connect to external services requiring credentials
+            // 3. It has no multi-user access control requirements
+            // 4. All operations are performed with the user's existing local permissions
+            //
+            // Therefore, we intentionally declare NO authentication methods (empty array).
+            // This is an architectural decision - do not add authentication methods.
+            // If remote authentication is needed in the future, it should be a separate feature.
             auth_methods: vec![],
             protocol_version: Default::default(),
             meta: Some(serde_json::json!({
@@ -480,36 +489,17 @@ impl Agent for ClaudeAgent {
         request: AuthenticateRequest,
     ) -> Result<AuthenticateResponse, agent_client_protocol::Error> {
         self.log_request("authenticate", &request);
-        tracing::info!(
-            "Authentication requested with method: {:?}",
+
+        // AUTHENTICATION ARCHITECTURE DECISION:
+        // Claude Code declares NO authentication methods in initialize().
+        // According to ACP spec, clients should not call authenticate when no methods are declared.
+        // If they do call authenticate anyway, we reject it with a clear error.
+        tracing::warn!(
+            "Authentication attempt rejected - no auth methods declared: {:?}",
             request.method_id
         );
 
-        // For now, always succeed with authentication
-        let response = match request.method_id.0.as_ref() {
-            "none" => {
-                tracing::info!("No authentication required");
-                AuthenticateResponse {
-                    meta: Some(serde_json::json!({
-                        "success": true,
-                        "message": "No authentication required"
-                    })),
-                }
-            }
-            _ => {
-                // For any other method, we'll accept it for now
-                tracing::info!("Accepting authentication method: {:?}", request.method_id);
-                AuthenticateResponse {
-                    meta: Some(serde_json::json!({
-                        "success": true,
-                        "method": request.method_id.0
-                    })),
-                }
-            }
-        };
-
-        self.log_response("authenticate", &response);
-        Ok(response)
+        Err(agent_client_protocol::Error::method_not_found())
     }
 
     async fn new_session(
@@ -684,6 +674,29 @@ impl Agent for ClaudeAgent {
         Ok(())
     }
 
+    /// Handle extension method requests
+    ///
+    /// Extension methods allow clients to call custom methods not defined in the core
+    /// Agent Client Protocol specification. This implementation returns a placeholder
+    /// response indicating that extension methods are not currently supported.
+    ///
+    /// ## Design Decision
+    ///
+    /// Claude Agent currently does not require any extension methods beyond the standard
+    /// ACP specification. The core protocol provides sufficient capabilities for:
+    /// - Session management (new_session, load_session, set_session_mode)
+    /// - Authentication (handled via empty auth_methods)
+    /// - Tool execution (via prompt requests)
+    /// - Session updates and notifications
+    ///
+    /// If future requirements emerge for custom extension methods, this implementation
+    /// can be enhanced to dispatch to specific handlers based on the method name.
+    ///
+    /// ## Protocol Compliance
+    ///
+    /// This implementation satisfies the ACP requirement that agents must respond to
+    /// extension method calls, even if they don't implement any specific extensions.
+    /// Returning a structured response (rather than an error) maintains client compatibility.
     async fn ext_method(
         &self,
         request: ExtRequest,
@@ -691,7 +704,8 @@ impl Agent for ClaudeAgent {
         self.log_request("ext_method", &request);
         tracing::info!("Extension method called: {}", request.method);
 
-        // Return a placeholder response
+        // Return a structured response indicating no extensions are implemented
+        // This maintains ACP compliance while clearly communicating capability limitations
         let response = serde_json::json!({
             "method": request.method,
             "result": "Extension method not implemented"
@@ -757,13 +771,26 @@ mod tests {
     async fn test_authenticate() {
         let agent = create_test_agent().await;
 
+        // Test that authentication is properly rejected since we declare no auth methods
         let request = AuthenticateRequest {
             method_id: agent_client_protocol::AuthMethodId("none".to_string().into()),
             meta: None,
         };
 
-        let response = agent.authenticate(request).await.unwrap();
-        assert!(response.meta.is_some());
+        let result = agent.authenticate(request).await;
+        assert!(result.is_err(), "Authentication should be rejected");
+
+        // Test with a different method to ensure all methods are rejected
+        let request2 = AuthenticateRequest {
+            method_id: agent_client_protocol::AuthMethodId("basic".to_string().into()),
+            meta: None,
+        };
+
+        let result2 = agent.authenticate(request2).await;
+        assert!(
+            result2.is_err(),
+            "All authentication methods should be rejected"
+        );
     }
 
     #[tokio::test]
@@ -904,7 +931,7 @@ mod tests {
 
         let result = agent.ext_notification(notification.clone()).await;
         assert!(result.is_ok());
-        
+
         // Explicitly drop resources to ensure cleanup
         drop(notification);
         drop(agent);
@@ -1471,14 +1498,17 @@ mod tests {
         assert!(init_response.agent_capabilities.meta.is_some());
         assert!(init_response.auth_methods.is_empty());
 
-        // Test authenticate
+        // Test authenticate - should fail since we declare no auth methods
         let auth_request = AuthenticateRequest {
             method_id: agent_client_protocol::AuthMethodId("none".to_string().into()),
             meta: None,
         };
 
-        let auth_response = agent.authenticate(auth_request).await.unwrap();
-        assert!(auth_response.meta.is_some());
+        let auth_result = agent.authenticate(auth_request).await;
+        assert!(
+            auth_result.is_err(),
+            "Authentication should be rejected when no auth methods are declared"
+        );
 
         // Test session creation
         let session_request = NewSessionRequest {
@@ -1506,8 +1536,6 @@ mod tests {
         assert!(prompt_response.meta.is_some());
     }
 
-
-
     #[tokio::test]
     async fn test_protocol_error_handling() {
         let (agent, _) = create_test_agent_with_notifications().await;
@@ -1525,7 +1553,6 @@ mod tests {
 
         let result = agent.prompt(invalid_prompt).await;
         assert!(result.is_err());
-
 
         // };
         //
