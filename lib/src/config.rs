@@ -49,14 +49,194 @@ pub struct SecurityConfig {
     pub require_permission_for: Vec<String>,
 }
 
-/// Configuration for MCP server connections
+/// Environment variable for MCP server
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct EnvVariable {
+    pub name: String,
+    pub value: String,
+}
+
+/// HTTP header for MCP server
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct HttpHeader {
+    pub name: String,
+    pub value: String,
+}
+
+/// Stdio transport configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct McpServerConfig {
+pub struct StdioTransport {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
     #[serde(default)]
-    pub protocol: McpProtocolConfig,
+    pub env: Vec<EnvVariable>,
+}
+
+/// HTTP transport configuration
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HttpTransport {
+    #[serde(rename = "type")]
+    pub transport_type: String,
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub headers: Vec<HttpHeader>,
+}
+
+/// SSE transport configuration
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SseTransport {
+    #[serde(rename = "type")]
+    pub transport_type: String,
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub headers: Vec<HttpHeader>,
+}
+
+/// Configuration for MCP server connections supporting all ACP transport types
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum McpServerConfig {
+    /// Stdio transport (mandatory - all agents must support)
+    Stdio(StdioTransport),
+    /// HTTP transport (optional - only if mcpCapabilities.http: true)
+    Http(HttpTransport),
+    /// SSE transport (optional - deprecated but spec-compliant)
+    Sse(SseTransport),
+}
+
+impl McpServerConfig {
+    /// Get the name of this MCP server configuration
+    pub fn name(&self) -> &str {
+        match self {
+            McpServerConfig::Stdio(config) => &config.name,
+            McpServerConfig::Http(config) => &config.name,
+            McpServerConfig::Sse(config) => &config.name,
+        }
+    }
+
+    /// Get the transport type as a string
+    pub fn transport_type(&self) -> &str {
+        match self {
+            McpServerConfig::Stdio(_) => "stdio",
+            McpServerConfig::Http(_) => "http",
+            McpServerConfig::Sse(_) => "sse",
+        }
+    }
+
+    /// Validate this transport configuration
+    pub fn validate(&self) -> crate::error::Result<()> {
+        match self {
+            McpServerConfig::Stdio(config) => config.validate(),
+            McpServerConfig::Http(config) => config.validate(),
+            McpServerConfig::Sse(config) => config.validate(),
+        }
+    }
+}
+
+impl StdioTransport {
+    /// Validate stdio transport configuration
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.name.is_empty() {
+            return Err(crate::error::AgentError::Config(
+                "MCP server name cannot be empty".to_string(),
+            ));
+        }
+        if self.command.is_empty() {
+            return Err(crate::error::AgentError::Config(format!(
+                "MCP server '{}' command cannot be empty",
+                self.name
+            )));
+        }
+        
+        // Validate environment variables
+        for env_var in &self.env {
+            if env_var.name.is_empty() {
+                return Err(crate::error::AgentError::Config(format!(
+                    "MCP server '{}' environment variable name cannot be empty",
+                    self.name
+                )));
+            }
+        }
+        
+        Ok(())
+    }
+}
+
+impl HttpTransport {
+    /// Validate HTTP transport configuration
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.name.is_empty() {
+            return Err(crate::error::AgentError::Config(
+                "MCP server name cannot be empty".to_string(),
+            ));
+        }
+        if self.url.is_empty() {
+            return Err(crate::error::AgentError::Config(format!(
+                "MCP server '{}' URL cannot be empty",
+                self.name
+            )));
+        }
+        
+        // Validate URL format
+        if !self.url.starts_with("http://") && !self.url.starts_with("https://") {
+            return Err(crate::error::AgentError::Config(format!(
+                "MCP server '{}' URL must start with http:// or https://",
+                self.name
+            )));
+        }
+        
+        // Validate HTTP headers
+        for header in &self.headers {
+            if header.name.is_empty() {
+                return Err(crate::error::AgentError::Config(format!(
+                    "MCP server '{}' HTTP header name cannot be empty",
+                    self.name
+                )));
+            }
+        }
+        
+        Ok(())
+    }
+}
+
+impl SseTransport {
+    /// Validate SSE transport configuration
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.name.is_empty() {
+            return Err(crate::error::AgentError::Config(
+                "MCP server name cannot be empty".to_string(),
+            ));
+        }
+        if self.url.is_empty() {
+            return Err(crate::error::AgentError::Config(format!(
+                "MCP server '{}' URL cannot be empty",
+                self.name
+            )));
+        }
+        
+        // Validate URL format
+        if !self.url.starts_with("http://") && !self.url.starts_with("https://") {
+            return Err(crate::error::AgentError::Config(format!(
+                "MCP server '{}' URL must start with http:// or https://",
+                self.name
+            )));
+        }
+        
+        // Validate HTTP headers
+        for header in &self.headers {
+            if header.name.is_empty() {
+                return Err(crate::error::AgentError::Config(format!(
+                    "MCP server '{}' HTTP header name cannot be empty",
+                    self.name
+                )));
+            }
+        }
+        
+        Ok(())
+    }
 }
 
 /// MCP protocol configuration settings
@@ -149,17 +329,7 @@ impl AgentConfig {
 
         // Validate MCP server configurations
         for server in &self.mcp_servers {
-            if server.name.is_empty() {
-                return Err(crate::error::AgentError::Config(
-                    "MCP server name cannot be empty".to_string(),
-                ));
-            }
-            if server.command.is_empty() {
-                return Err(crate::error::AgentError::Config(format!(
-                    "MCP server '{}' command cannot be empty",
-                    server.name
-                )));
-            }
+            server.validate()?;
         }
 
         Ok(())
@@ -245,12 +415,12 @@ mod tests {
     #[test]
     fn test_config_validation_empty_mcp_server_name() {
         let mut config = AgentConfig::default();
-        config.mcp_servers.push(McpServerConfig {
+        config.mcp_servers.push(McpServerConfig::Stdio(StdioTransport {
             name: String::new(),
             command: "test".to_string(),
             args: vec![],
-            protocol: McpProtocolConfig::default(),
-        });
+            env: vec![],
+        }));
 
         let result = config.validate();
         assert!(result.is_err());
@@ -263,12 +433,12 @@ mod tests {
     #[test]
     fn test_config_validation_empty_mcp_server_command() {
         let mut config = AgentConfig::default();
-        config.mcp_servers.push(McpServerConfig {
+        config.mcp_servers.push(McpServerConfig::Stdio(StdioTransport {
             name: "test".to_string(),
             command: String::new(),
             args: vec![],
-            protocol: McpProtocolConfig::default(),
-        });
+            env: vec![],
+        }));
 
         let result = config.validate();
         assert!(result.is_err());
@@ -313,7 +483,13 @@ mod tests {
                 {
                     "name": "test-server",
                     "command": "test-command",
-                    "args": ["--test"]
+                    "args": ["--test"],
+                    "env": [
+                        {
+                            "name": "TEST_VAR",
+                            "value": "test_value"
+                        }
+                    ]
                 }
             ]
         }"#;
@@ -331,9 +507,17 @@ mod tests {
         assert_eq!(config.security.forbidden_paths, vec!["/tmp"]);
         assert_eq!(config.security.require_permission_for, vec!["test"]);
         assert_eq!(config.mcp_servers.len(), 1);
-        assert_eq!(config.mcp_servers[0].name, "test-server");
-        assert_eq!(config.mcp_servers[0].command, "test-command");
-        assert_eq!(config.mcp_servers[0].args, vec!["--test"]);
+        match &config.mcp_servers[0] {
+            McpServerConfig::Stdio(stdio_config) => {
+                assert_eq!(stdio_config.name, "test-server");
+                assert_eq!(stdio_config.command, "test-command");
+                assert_eq!(stdio_config.args, vec!["--test"]);
+                assert_eq!(stdio_config.env.len(), 1);
+                assert_eq!(stdio_config.env[0].name, "TEST_VAR");
+                assert_eq!(stdio_config.env[0].value, "test_value");
+            }
+            _ => panic!("Expected stdio transport configuration"),
+        }
         assert_eq!(config.max_prompt_length, 100_000); // Should use default value
     }
 
@@ -360,5 +544,198 @@ mod tests {
             deserialized.security.require_permission_for
         );
         assert_eq!(original.mcp_servers.len(), deserialized.mcp_servers.len());
+    }
+
+    #[test]
+    fn test_stdio_transport_validation() {
+        let stdio = StdioTransport {
+            name: "test-stdio".to_string(),
+            command: "/path/to/server".to_string(),
+            args: vec!["--stdio".to_string()],
+            env: vec![EnvVariable {
+                name: "API_KEY".to_string(),
+                value: "secret123".to_string(),
+            }],
+        };
+        assert!(stdio.validate().is_ok());
+
+        // Test empty name
+        let invalid_stdio = StdioTransport {
+            name: String::new(),
+            command: "/path/to/server".to_string(),
+            args: vec![],
+            env: vec![],
+        };
+        assert!(invalid_stdio.validate().is_err());
+
+        // Test empty command
+        let invalid_stdio = StdioTransport {
+            name: "test".to_string(),
+            command: String::new(),
+            args: vec![],
+            env: vec![],
+        };
+        assert!(invalid_stdio.validate().is_err());
+
+        // Test empty env var name
+        let invalid_stdio = StdioTransport {
+            name: "test".to_string(),
+            command: "/path/to/server".to_string(),
+            args: vec![],
+            env: vec![EnvVariable {
+                name: String::new(),
+                value: "value".to_string(),
+            }],
+        };
+        assert!(invalid_stdio.validate().is_err());
+    }
+
+    #[test]
+    fn test_http_transport_validation() {
+        let http = HttpTransport {
+            transport_type: "http".to_string(),
+            name: "test-http".to_string(),
+            url: "https://api.example.com/mcp".to_string(),
+            headers: vec![HttpHeader {
+                name: "Authorization".to_string(),
+                value: "Bearer token123".to_string(),
+            }],
+        };
+        assert!(http.validate().is_ok());
+
+        // Test empty name
+        let invalid_http = HttpTransport {
+            transport_type: "http".to_string(),
+            name: String::new(),
+            url: "https://example.com".to_string(),
+            headers: vec![],
+        };
+        assert!(invalid_http.validate().is_err());
+
+        // Test empty URL
+        let invalid_http = HttpTransport {
+            transport_type: "http".to_string(),
+            name: "test".to_string(),
+            url: String::new(),
+            headers: vec![],
+        };
+        assert!(invalid_http.validate().is_err());
+
+        // Test invalid URL format
+        let invalid_http = HttpTransport {
+            transport_type: "http".to_string(),
+            name: "test".to_string(),
+            url: "ftp://example.com".to_string(),
+            headers: vec![],
+        };
+        assert!(invalid_http.validate().is_err());
+
+        // Test empty header name
+        let invalid_http = HttpTransport {
+            transport_type: "http".to_string(),
+            name: "test".to_string(),
+            url: "https://example.com".to_string(),
+            headers: vec![HttpHeader {
+                name: String::new(),
+                value: "value".to_string(),
+            }],
+        };
+        assert!(invalid_http.validate().is_err());
+    }
+
+    #[test]
+    fn test_sse_transport_validation() {
+        let sse = SseTransport {
+            transport_type: "sse".to_string(),
+            name: "test-sse".to_string(),
+            url: "https://events.example.com/mcp".to_string(),
+            headers: vec![HttpHeader {
+                name: "X-API-Key".to_string(),
+                value: "apikey456".to_string(),
+            }],
+        };
+        assert!(sse.validate().is_ok());
+
+        // Test similar validations as HTTP transport
+        let invalid_sse = SseTransport {
+            transport_type: "sse".to_string(),
+            name: String::new(),
+            url: "https://example.com".to_string(),
+            headers: vec![],
+        };
+        assert!(invalid_sse.validate().is_err());
+    }
+
+    #[test]
+    fn test_mcp_server_config_methods() {
+        let stdio_config = McpServerConfig::Stdio(StdioTransport {
+            name: "stdio-server".to_string(),
+            command: "/path/to/server".to_string(),
+            args: vec![],
+            env: vec![],
+        });
+
+        let http_config = McpServerConfig::Http(HttpTransport {
+            transport_type: "http".to_string(),
+            name: "http-server".to_string(),
+            url: "https://example.com".to_string(),
+            headers: vec![],
+        });
+
+        let sse_config = McpServerConfig::Sse(SseTransport {
+            transport_type: "sse".to_string(),
+            name: "sse-server".to_string(),
+            url: "https://example.com".to_string(),
+            headers: vec![],
+        });
+
+        assert_eq!(stdio_config.name(), "stdio-server");
+        assert_eq!(stdio_config.transport_type(), "stdio");
+
+        assert_eq!(http_config.name(), "http-server");
+        assert_eq!(http_config.transport_type(), "http");
+
+        assert_eq!(sse_config.name(), "sse-server");
+        assert_eq!(sse_config.transport_type(), "sse");
+    }
+
+    #[test]
+    fn test_transport_json_serialization() {
+        // Test HTTP transport JSON
+        let http_json = r#"{
+            "type": "http",
+            "name": "api-server",
+            "url": "https://api.example.com/mcp",
+            "headers": [
+                {"name": "Authorization", "value": "Bearer token123"},
+                {"name": "Content-Type", "value": "application/json"}
+            ]
+        }"#;
+
+        let parsed: HttpTransport = serde_json::from_str(http_json).unwrap();
+        assert_eq!(parsed.transport_type, "http");
+        assert_eq!(parsed.name, "api-server");
+        assert_eq!(parsed.url, "https://api.example.com/mcp");
+        assert_eq!(parsed.headers.len(), 2);
+        assert_eq!(parsed.headers[0].name, "Authorization");
+        assert_eq!(parsed.headers[0].value, "Bearer token123");
+
+        // Test SSE transport JSON
+        let sse_json = r#"{
+            "type": "sse",
+            "name": "event-stream",
+            "url": "https://events.example.com/mcp",
+            "headers": [
+                {"name": "X-API-Key", "value": "apikey456"}
+            ]
+        }"#;
+
+        let parsed: SseTransport = serde_json::from_str(sse_json).unwrap();
+        assert_eq!(parsed.transport_type, "sse");
+        assert_eq!(parsed.name, "event-stream");
+        assert_eq!(parsed.url, "https://events.example.com/mcp");
+        assert_eq!(parsed.headers.len(), 1);
+        assert_eq!(parsed.headers[0].name, "X-API-Key");
+        assert_eq!(parsed.headers[0].value, "apikey456");
     }
 }

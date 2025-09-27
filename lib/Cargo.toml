@@ -21,6 +21,8 @@ thiserror = { workspace = true }
 ulid = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+reqwest = { workspace = true }
+tokio-tungstenite = { workspace = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

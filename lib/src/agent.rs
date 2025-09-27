@@ -902,7 +902,7 @@ mod tests {
             params: Arc::from(RawValue::from_string("{}".to_string()).unwrap()),
         };
 
-        let result = agent.ext_notification(notification).await;
+        let result = agent.ext_notification(notification.clone()).await;
         assert!(result.is_ok());
         
         // Explicitly drop resources to ensure cleanup

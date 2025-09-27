@@ -5,28 +5,50 @@
 //! the built-in file system and terminal operations.
 
 use crate::{config::McpServerConfig, tools::InternalToolRequest};
+use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, Command};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
+
+
+/// Transport-specific connection details
+#[derive(Debug)]
+pub enum TransportConnection {
+    /// Stdio transport using child process
+    Stdio {
+        process: Arc<RwLock<Option<Child>>>,
+        stdin_writer: Arc<RwLock<Option<BufWriter<tokio::process::ChildStdin>>>>,
+        stdout_reader: Arc<RwLock<Option<BufReader<tokio::process::ChildStdout>>>>,
+    },
+    /// HTTP transport using reqwest client
+    Http {
+        client: Arc<Client>,
+        url: String,
+        headers: Vec<crate::config::HttpHeader>,
+    },
+    /// SSE transport using WebSocket connection
+    Sse {
+        url: String,
+        headers: Vec<crate::config::HttpHeader>,
+        message_tx: Arc<RwLock<Option<mpsc::UnboundedSender<String>>>>,
+        response_rx: Arc<RwLock<Option<mpsc::UnboundedReceiver<String>>>>,
+    },
+}
 
 /// Represents a connection to an MCP server
 #[derive(Debug)]
 pub struct McpServerConnection {
     /// Name of the MCP server
     pub name: String,
-    /// Child process running the MCP server
-    pub process: Arc<RwLock<Option<Child>>>,
     /// List of tools available from this server
     pub tools: Vec<String>,
     /// Configuration used to create this connection
     pub config: McpServerConfig,
-    /// Writer for sending JSON-RPC requests to the server
-    pub stdin_writer: Arc<RwLock<Option<BufWriter<tokio::process::ChildStdin>>>>,
-    /// Reader for receiving JSON-RPC responses from the server
-    pub stdout_reader: Arc<RwLock<Option<BufReader<tokio::process::ChildStdout>>>>,
+    /// Transport-specific connection details
+    pub transport: TransportConnection,
 }
 
 /// Manages connections to multiple MCP servers
@@ -54,7 +76,7 @@ impl McpServerManager {
                     connections.insert(connection.name.clone(), connection);
                 }
                 Err(e) => {
-                    tracing::error!("Failed to connect to MCP server {}: {}", config.name, e);
+                    tracing::error!("Failed to connect to MCP server {}: {}", config.name(), e);
                     // Continue with other servers instead of failing completely
                 }
             }
@@ -64,52 +86,146 @@ impl McpServerManager {
 
     /// Connect to a single MCP server
     async fn connect_server(&self, config: McpServerConfig) -> crate::Result<McpServerConnection> {
-        tracing::info!(
-            "Connecting to MCP server: {} ({})",
-            config.name,
-            config.command
-        );
+        // Only stdio transport is currently implemented in the connection logic
+        match &config {
+            McpServerConfig::Stdio(stdio_config) => {
+                tracing::info!(
+                    "Connecting to MCP server: {} ({})",
+                    stdio_config.name,
+                    stdio_config.command
+                );
 
-        // Start the MCP server process
-        let mut child = Command::new(&config.command)
-            .args(&config.args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                crate::AgentError::ToolExecution(format!(
-                    "Failed to start MCP server {}: {}",
-                    config.name, e
-                ))
-            })?;
+                // Start the MCP server process with environment variables
+                let mut command = Command::new(&stdio_config.command);
+                command.args(&stdio_config.args);
+                
+                // Set environment variables
+                for env_var in &stdio_config.env {
+                    command.env(&env_var.name, &env_var.value);
+                }
+                
+                let mut child = command
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .map_err(|e| {
+                        crate::AgentError::ToolExecution(format!(
+                            "Failed to start MCP server {}: {}",
+                            stdio_config.name, e
+                        ))
+                    })?;
 
-        // Get stdio handles
-        let stdin = child.stdin.take().ok_or_else(|| {
-            crate::AgentError::ToolExecution("Failed to get stdin for MCP server".to_string())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            crate::AgentError::ToolExecution("Failed to get stdout for MCP server".to_string())
-        })?;
+                // Get stdio handles
+                let stdin = child.stdin.take().ok_or_else(|| {
+                    crate::AgentError::ToolExecution("Failed to get stdin for MCP server".to_string())
+                })?;
+                let stdout = child.stdout.take().ok_or_else(|| {
+                    crate::AgentError::ToolExecution("Failed to get stdout for MCP server".to_string())
+                })?;
 
-        let mut stdin_writer = BufWriter::new(stdin);
-        let mut stdout_reader = BufReader::new(stdout);
+                let mut stdin_writer = BufWriter::new(stdin);
+                let mut stdout_reader = BufReader::new(stdout);
 
-        // Initialize MCP protocol
-        let tools = self
-            .initialize_mcp_connection(&mut stdin_writer, &mut stdout_reader, &config.name, &config)
-            .await?;
+                // Initialize MCP protocol
+                let tools = self
+                    .initialize_mcp_connection(&mut stdin_writer, &mut stdout_reader, &stdio_config.name, stdio_config)
+                    .await?;
 
-        let connection = McpServerConnection {
-            name: config.name.clone(),
-            process: Arc::new(RwLock::new(Some(child))),
-            tools,
-            config,
-            stdin_writer: Arc::new(RwLock::new(Some(stdin_writer))),
-            stdout_reader: Arc::new(RwLock::new(Some(stdout_reader))),
-        };
+                let transport = TransportConnection::Stdio {
+                    process: Arc::new(RwLock::new(Some(child))),
+                    stdin_writer: Arc::new(RwLock::new(Some(stdin_writer))),
+                    stdout_reader: Arc::new(RwLock::new(Some(stdout_reader))),
+                };
 
-        Ok(connection)
+                let connection = McpServerConnection {
+                    name: stdio_config.name.clone(),
+                    tools,
+                    config,
+                    transport,
+                };
+
+                Ok(connection)
+            }
+            McpServerConfig::Http(http_config) => {
+                tracing::info!(
+                    "Connecting to HTTP MCP server: {} ({})",
+                    http_config.name,
+                    http_config.url
+                );
+
+                // Create HTTP client with headers
+                let client_builder = Client::builder();
+                let mut headers = reqwest::header::HeaderMap::new();
+                
+                for header in &http_config.headers {
+                    if let (Ok(name), Ok(value)) = (
+                        reqwest::header::HeaderName::from_bytes(header.name.as_bytes()),
+                        reqwest::header::HeaderValue::from_str(&header.value)
+                    ) {
+                        headers.insert(name, value);
+                    }
+                }
+                
+                let client = client_builder
+                    .default_headers(headers)
+                    .build()
+                    .map_err(|e| {
+                        crate::AgentError::ToolExecution(format!(
+                            "Failed to create HTTP client for MCP server {}: {}",
+                            http_config.name, e
+                        ))
+                    })?;
+
+                // Initialize MCP connection via HTTP
+                let tools = self.initialize_http_mcp_connection(&client, http_config).await?;
+
+                let transport = TransportConnection::Http {
+                    client: Arc::new(client),
+                    url: http_config.url.clone(),
+                    headers: http_config.headers.clone(),
+                };
+
+                let connection = McpServerConnection {
+                    name: http_config.name.clone(),
+                    tools,
+                    config,
+                    transport,
+                };
+
+                Ok(connection)
+            }
+            McpServerConfig::Sse(sse_config) => {
+                tracing::info!(
+                    "Connecting to SSE MCP server: {} ({})",
+                    sse_config.name,
+                    sse_config.url
+                );
+
+                // Create SSE connection channels
+                let (message_tx, _message_rx) = mpsc::unbounded_channel();
+                let (response_tx, response_rx) = mpsc::unbounded_channel();
+
+                // Initialize SSE connection
+                let tools = self.initialize_sse_mcp_connection(sse_config, response_tx).await?;
+
+                let transport = TransportConnection::Sse {
+                    url: sse_config.url.clone(),
+                    headers: sse_config.headers.clone(),
+                    message_tx: Arc::new(RwLock::new(Some(message_tx))),
+                    response_rx: Arc::new(RwLock::new(Some(response_rx))),
+                };
+
+                let connection = McpServerConnection {
+                    name: sse_config.name.clone(),
+                    tools,
+                    config,
+                    transport,
+                };
+
+                Ok(connection)
+            }
+        }
     }
 
     /// Initialize the MCP protocol connection
@@ -118,7 +234,7 @@ impl McpServerManager {
         writer: &mut BufWriter<tokio::process::ChildStdin>,
         reader: &mut BufReader<tokio::process::ChildStdout>,
         server_name: &str,
-        config: &crate::config::McpServerConfig,
+        _config: &crate::config::StdioTransport,
     ) -> crate::Result<Vec<String>> {
         // Send initialize request
         let initialize_request = json!({
@@ -126,7 +242,7 @@ impl McpServerManager {
             "id": 1,
             "method": "initialize",
             "params": {
-                "protocolVersion": config.protocol.version,
+                "protocolVersion": "2024-11-05",
                 "capabilities": {
                     "tools": {}
                 },
@@ -264,6 +380,120 @@ impl McpServerManager {
         Ok(final_tools)
     }
 
+    /// Initialize HTTP MCP connection
+    async fn initialize_http_mcp_connection(
+        &self,
+        client: &Client,
+        config: &crate::config::HttpTransport,
+    ) -> crate::Result<Vec<String>> {
+        // Send initialize request via HTTP POST
+        let initialize_request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {}
+                },
+                "clientInfo": {
+                    "name": "claude-agent",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }
+        });
+
+        let response = client
+            .post(&config.url)
+            .json(&initialize_request)
+            .send()
+            .await
+            .map_err(|e| {
+                crate::AgentError::ToolExecution(format!(
+                    "Failed to send initialize request to HTTP MCP server: {}",
+                    e
+                ))
+            })?;
+
+        let _response_json: Value = response.json().await.map_err(|e| {
+            crate::AgentError::ToolExecution(format!(
+                "Failed to parse initialize response from HTTP MCP server: {}",
+                e
+            ))
+        })?;
+
+        // Send initialized notification
+        let initialized_notification = json!({
+            "jsonrpc": "2.0",
+            "method": "initialized"
+        });
+
+        let _notify_response = client
+            .post(&config.url)
+            .json(&initialized_notification)
+            .send()
+            .await
+            .map_err(|e| {
+                crate::AgentError::ToolExecution(format!(
+                    "Failed to send initialized notification to HTTP MCP server: {}",
+                    e
+                ))
+            })?;
+
+        // Request list of available tools
+        let tools_list_request = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list"
+        });
+
+        let tools_response = client
+            .post(&config.url)
+            .json(&tools_list_request)
+            .send()
+            .await
+            .map_err(|e| {
+                crate::AgentError::ToolExecution(format!(
+                    "Failed to send tools/list request to HTTP MCP server: {}",
+                    e
+                ))
+            })?;
+
+        let tools_response_json: Value = tools_response.json().await.map_err(|e| {
+            crate::AgentError::ToolExecution(format!(
+                "Failed to parse tools/list response from HTTP MCP server: {}",
+                e
+            ))
+        })?;
+
+        let final_tools = self.extract_tools_from_list_response(&tools_response_json)?;
+
+        tracing::info!(
+            "HTTP MCP server {} provides {} tools: {:?}",
+            config.name,
+            final_tools.len(),
+            final_tools
+        );
+
+        Ok(final_tools)
+    }
+
+    /// Initialize SSE MCP connection
+    async fn initialize_sse_mcp_connection(
+        &self,
+        config: &crate::config::SseTransport,
+        _response_tx: mpsc::UnboundedSender<String>,
+    ) -> crate::Result<Vec<String>> {
+        // For now, return empty tools list as SSE implementation is complex
+        // This is a placeholder for the full SSE implementation
+        tracing::warn!(
+            "SSE MCP server {} connection initialized but not fully implemented",
+            config.name
+        );
+        
+        Ok(vec![])
+    }
+
     /// Extract tools from initialize response
     fn extract_tools_from_initialize_response(
         &self,
@@ -338,58 +568,91 @@ impl McpServerManager {
             tool_call.name
         );
 
-        // Get writer and reader
-        let mut writer_guard = connection.stdin_writer.write().await;
-        let writer = writer_guard.as_mut().ok_or_else(|| {
-            crate::AgentError::ToolExecution("MCP server stdin writer not available".to_string())
-        })?;
+        match &connection.transport {
+            TransportConnection::Stdio { stdin_writer, stdout_reader, .. } => {
+                // Get writer and reader
+                let mut writer_guard = stdin_writer.write().await;
+                let writer = writer_guard.as_mut().ok_or_else(|| {
+                    crate::AgentError::ToolExecution("MCP server stdin writer not available".to_string())
+                })?;
 
-        let mut reader_guard = connection.stdout_reader.write().await;
-        let reader = reader_guard.as_mut().ok_or_else(|| {
-            crate::AgentError::ToolExecution("MCP server stdout reader not available".to_string())
-        })?;
+                let mut reader_guard = stdout_reader.write().await;
+                let reader = reader_guard.as_mut().ok_or_else(|| {
+                    crate::AgentError::ToolExecution("MCP server stdout reader not available".to_string())
+                })?;
 
-        // Send request
-        let request_line = format!("{}\n", mcp_request);
-        writer
-            .write_all(request_line.as_bytes())
-            .await
-            .map_err(|e| {
-                crate::AgentError::ToolExecution(format!(
-                    "Failed to write tool call request to MCP server: {}",
-                    e
+                // Send request
+                let request_line = format!("{}\n", mcp_request);
+                writer
+                    .write_all(request_line.as_bytes())
+                    .await
+                    .map_err(|e| {
+                        crate::AgentError::ToolExecution(format!(
+                            "Failed to write tool call request to MCP server: {}",
+                            e
+                        ))
+                    })?;
+                writer.flush().await.map_err(|e| {
+                    crate::AgentError::ToolExecution(format!(
+                        "Failed to flush tool call request to MCP server: {}",
+                        e
+                    ))
+                })?;
+
+                // Read response
+                let mut response_line = String::new();
+                let bytes_read = reader.read_line(&mut response_line).await.map_err(|e| {
+                    crate::AgentError::ToolExecution(format!(
+                        "Failed to read tool call response from MCP server: {}",
+                        e
+                    ))
+                })?;
+
+                if bytes_read == 0 {
+                    return Err(crate::AgentError::ToolExecution(
+                        "MCP server closed connection during tool call".to_string(),
+                    ));
+                }
+
+                let response: Value = serde_json::from_str(response_line.trim()).map_err(|e| {
+                    crate::AgentError::ToolExecution(format!(
+                        "Invalid JSON from MCP server tool call response: {}",
+                        e
+                    ))
+                })?;
+
+                Ok(response)
+            }
+            TransportConnection::Http { client, url, .. } => {
+                // Send HTTP request
+                let response = client
+                    .post(url)
+                    .json(&mcp_request)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        crate::AgentError::ToolExecution(format!(
+                            "Failed to send HTTP tool call request to MCP server: {}",
+                            e
+                        ))
+                    })?;
+
+                let response_json: Value = response.json().await.map_err(|e| {
+                    crate::AgentError::ToolExecution(format!(
+                        "Failed to parse HTTP tool call response from MCP server: {}",
+                        e
+                    ))
+                })?;
+
+                Ok(response_json)
+            }
+            TransportConnection::Sse { .. } => {
+                // SSE transport not fully implemented yet
+                Err(crate::AgentError::ToolExecution(
+                    "SSE transport tool calls not yet implemented".to_string(),
                 ))
-            })?;
-        writer.flush().await.map_err(|e| {
-            crate::AgentError::ToolExecution(format!(
-                "Failed to flush tool call request to MCP server: {}",
-                e
-            ))
-        })?;
-
-        // Read response
-        let mut response_line = String::new();
-        let bytes_read = reader.read_line(&mut response_line).await.map_err(|e| {
-            crate::AgentError::ToolExecution(format!(
-                "Failed to read tool call response from MCP server: {}",
-                e
-            ))
-        })?;
-
-        if bytes_read == 0 {
-            return Err(crate::AgentError::ToolExecution(
-                "MCP server closed connection during tool call".to_string(),
-            ));
+            }
         }
-
-        let response: Value = serde_json::from_str(response_line.trim()).map_err(|e| {
-            crate::AgentError::ToolExecution(format!(
-                "Invalid JSON from MCP server tool call response: {}",
-                e
-            ))
-        })?;
-
-        Ok(response)
     }
 
     /// Process MCP tool call response into string result
@@ -448,21 +711,41 @@ impl McpServerManager {
         for (name, connection) in connections.iter_mut() {
             tracing::info!("Shutting down MCP server: {}", name);
 
-            // Close stdio handles first
-            {
-                let mut writer_guard = connection.stdin_writer.write().await;
-                *writer_guard = None;
-            }
-            {
-                let mut reader_guard = connection.stdout_reader.write().await;
-                *reader_guard = None;
-            }
+            match &connection.transport {
+                TransportConnection::Stdio { process, stdin_writer, stdout_reader } => {
+                    // Close stdio handles first
+                    {
+                        let mut writer_guard = stdin_writer.write().await;
+                        *writer_guard = None;
+                    }
+                    {
+                        let mut reader_guard = stdout_reader.write().await;
+                        *reader_guard = None;
+                    }
 
-            // Kill and wait for the process
-            let mut process_guard = connection.process.write().await;
-            if let Some(mut process) = process_guard.take() {
-                let _ = process.kill().await;
-                let _ = process.wait().await;
+                    // Kill and wait for the process
+                    let mut process_guard = process.write().await;
+                    if let Some(mut proc) = process_guard.take() {
+                        let _ = proc.kill().await;
+                        let _ = proc.wait().await;
+                    }
+                }
+                TransportConnection::Http { .. } => {
+                    // HTTP connections don't need explicit cleanup
+                    tracing::debug!("HTTP MCP server connection closed: {}", name);
+                }
+                TransportConnection::Sse { message_tx, response_rx, .. } => {
+                    // Close SSE channels
+                    {
+                        let mut tx_guard = message_tx.write().await;
+                        *tx_guard = None;
+                    }
+                    {
+                        let mut rx_guard = response_rx.write().await;
+                        *rx_guard = None;
+                    }
+                    tracing::debug!("SSE MCP server connection closed: {}", name);
+                }
             }
         }
 
@@ -502,12 +785,12 @@ mod tests {
     async fn test_mcp_manager_connect_invalid_server() {
         let mut manager = McpServerManager::new();
 
-        let invalid_config = McpServerConfig {
+        let invalid_config = McpServerConfig::Stdio(crate::config::StdioTransport {
             name: "invalid_server".to_string(),
             command: "nonexistent_command_12345".to_string(),
             args: vec![],
-            protocol: crate::config::McpProtocolConfig::default(),
-        };
+            env: vec![],
+        });
 
         // Should succeed but log errors for individual server failures
         let result = manager.connect_servers(vec![invalid_config]).await;
@@ -520,7 +803,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_name_extraction() {
-        let _manager = McpServerManager::new();
+        let manager = McpServerManager::new();
 
         let tool_call = InternalToolRequest {
             id: "test-123".to_string(),
@@ -659,5 +942,225 @@ mod tests {
         // Test shutdown with no connections
         let result = manager.shutdown().await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_stdio_transport_connection_invalid_command() {
+        let mut manager = McpServerManager::new();
+
+        let stdio_config = McpServerConfig::Stdio(crate::config::StdioTransport {
+            name: "invalid_server".to_string(),
+            command: "nonexistent_command_12345".to_string(),
+            args: vec!["--stdio".to_string()],
+            env: vec![crate::config::EnvVariable {
+                name: "TEST_VAR".to_string(),
+                value: "test_value".to_string(),
+            }],
+        });
+
+        // Should fail gracefully and log errors
+        let result = manager.connect_servers(vec![stdio_config]).await;
+        assert!(result.is_ok()); // Manager should continue despite individual failures
+
+        // No tools should be available since server failed to start
+        let tools = manager.list_available_tools().await;
+        assert!(tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_http_transport_configuration() {
+        let manager = McpServerManager::new();
+
+        let http_config = crate::config::HttpTransport {
+            transport_type: "http".to_string(),
+            name: "test-http-server".to_string(),
+            url: "https://api.example.com/mcp".to_string(),
+            headers: vec![
+                crate::config::HttpHeader {
+                    name: "Authorization".to_string(),
+                    value: "Bearer token123".to_string(),
+                },
+                crate::config::HttpHeader {
+                    name: "Content-Type".to_string(),
+                    value: "application/json".to_string(),
+                },
+            ],
+        };
+
+        // Test validation
+        assert!(http_config.validate().is_ok());
+
+        let mcp_config = McpServerConfig::Http(http_config);
+        assert_eq!(mcp_config.name(), "test-http-server");
+        assert_eq!(mcp_config.transport_type(), "http");
+    }
+
+    #[tokio::test]
+    async fn test_sse_transport_configuration() {
+        let manager = McpServerManager::new();
+
+        let sse_config = crate::config::SseTransport {
+            transport_type: "sse".to_string(),
+            name: "test-sse-server".to_string(),
+            url: "https://events.example.com/mcp".to_string(),
+            headers: vec![crate::config::HttpHeader {
+                name: "X-API-Key".to_string(),
+                value: "apikey456".to_string(),
+            }],
+        };
+
+        // Test validation
+        assert!(sse_config.validate().is_ok());
+
+        let mcp_config = McpServerConfig::Sse(sse_config);
+        assert_eq!(mcp_config.name(), "test-sse-server");
+        assert_eq!(mcp_config.transport_type(), "sse");
+    }
+
+    #[test]
+    fn test_transport_type_detection() {
+        let stdio_config = McpServerConfig::Stdio(crate::config::StdioTransport {
+            name: "stdio-test".to_string(),
+            command: "/bin/echo".to_string(),
+            args: vec!["hello".to_string()],
+            env: vec![],
+        });
+
+        let http_config = McpServerConfig::Http(crate::config::HttpTransport {
+            transport_type: "http".to_string(),
+            name: "http-test".to_string(),
+            url: "https://example.com".to_string(),
+            headers: vec![],
+        });
+
+        let sse_config = McpServerConfig::Sse(crate::config::SseTransport {
+            transport_type: "sse".to_string(),
+            name: "sse-test".to_string(),
+            url: "https://example.com".to_string(),
+            headers: vec![],
+        });
+
+        assert_eq!(stdio_config.transport_type(), "stdio");
+        assert_eq!(http_config.transport_type(), "http");
+        assert_eq!(sse_config.transport_type(), "sse");
+
+        assert_eq!(stdio_config.name(), "stdio-test");
+        assert_eq!(http_config.name(), "http-test");
+        assert_eq!(sse_config.name(), "sse-test");
+    }
+
+    #[test]
+    fn test_transport_validation_error_cases() {
+        // Test stdio with empty command
+        let invalid_stdio = crate::config::StdioTransport {
+            name: "test".to_string(),
+            command: String::new(),
+            args: vec![],
+            env: vec![],
+        };
+        assert!(invalid_stdio.validate().is_err());
+
+        // Test HTTP with invalid URL
+        let invalid_http = crate::config::HttpTransport {
+            transport_type: "http".to_string(),
+            name: "test".to_string(),
+            url: "ftp://invalid-protocol.com".to_string(),
+            headers: vec![],
+        };
+        assert!(invalid_http.validate().is_err());
+
+        // Test SSE with empty name
+        let invalid_sse = crate::config::SseTransport {
+            transport_type: "sse".to_string(),
+            name: String::new(),
+            url: "https://example.com".to_string(),
+            headers: vec![],
+        };
+        assert!(invalid_sse.validate().is_err());
+
+        // Test env var with empty name
+        let invalid_stdio_env = crate::config::StdioTransport {
+            name: "test".to_string(),
+            command: "/bin/echo".to_string(),
+            args: vec![],
+            env: vec![crate::config::EnvVariable {
+                name: String::new(),
+                value: "value".to_string(),
+            }],
+        };
+        assert!(invalid_stdio_env.validate().is_err());
+
+        // Test HTTP header with empty name
+        let invalid_http_header = crate::config::HttpTransport {
+            transport_type: "http".to_string(),
+            name: "test".to_string(),
+            url: "https://example.com".to_string(),
+            headers: vec![crate::config::HttpHeader {
+                name: String::new(),
+                value: "value".to_string(),
+            }],
+        };
+        assert!(invalid_http_header.validate().is_err());
+    }
+
+    #[test]
+    fn test_env_variable_and_http_header_equality() {
+        let env1 = crate::config::EnvVariable {
+            name: "API_KEY".to_string(),
+            value: "secret123".to_string(),
+        };
+        let env2 = crate::config::EnvVariable {
+            name: "API_KEY".to_string(),
+            value: "secret123".to_string(),
+        };
+        let env3 = crate::config::EnvVariable {
+            name: "API_KEY".to_string(),
+            value: "different_secret".to_string(),
+        };
+
+        assert_eq!(env1, env2);
+        assert_ne!(env1, env3);
+
+        let header1 = crate::config::HttpHeader {
+            name: "Authorization".to_string(),
+            value: "Bearer token".to_string(),
+        };
+        let header2 = crate::config::HttpHeader {
+            name: "Authorization".to_string(),
+            value: "Bearer token".to_string(),
+        };
+        let header3 = crate::config::HttpHeader {
+            name: "Authorization".to_string(),
+            value: "Bearer different_token".to_string(),
+        };
+
+        assert_eq!(header1, header2);
+        assert_ne!(header1, header3);
+    }
+
+    #[tokio::test]
+    async fn test_mixed_transport_configurations() {
+        let mut manager = McpServerManager::new();
+
+        let configs = vec![
+            McpServerConfig::Stdio(crate::config::StdioTransport {
+                name: "stdio-server".to_string(),
+                command: "/bin/echo".to_string(),
+                args: vec!["stdio".to_string()],
+                env: vec![crate::config::EnvVariable {
+                    name: "TRANSPORT".to_string(),
+                    value: "stdio".to_string(),
+                }],
+            }),
+            // Note: HTTP and SSE will likely fail to connect in tests
+            // but the manager should handle this gracefully
+        ];
+
+        let result = manager.connect_servers(configs).await;
+        assert!(result.is_ok());
+
+        // Should be able to shutdown cleanly regardless of connection failures
+        let shutdown_result = manager.shutdown().await;
+        assert!(shutdown_result.is_ok());
     }
 }
