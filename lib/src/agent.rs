@@ -148,13 +148,15 @@ impl ClaudeAgent {
         let capabilities = AgentCapabilities {
             load_session: true,
             prompt_capabilities: agent_client_protocol::PromptCapabilities {
-                audio: false,
-                embedded_context: false,
-                image: false,
+                audio: true,
+                embedded_context: true,
+                image: true,
                 meta: Some(serde_json::json!({"streaming": true})),
             },
+            // We only support HTTP MCP connections, not SSE (which is deprecated in MCP spec).
+            // This is an architectural decision for simplicity and modern standards.
             mcp_capabilities: agent_client_protocol::McpCapabilities {
-                http: false,
+                http: true,
                 sse: false,
                 meta: None,
             },
@@ -457,12 +459,10 @@ impl Agent for ClaudeAgent {
 
         let response = InitializeResponse {
             agent_capabilities: self.capabilities.clone(),
-            auth_methods: vec![agent_client_protocol::AuthMethod {
-                id: agent_client_protocol::AuthMethodId("none".to_string().into()),
-                name: "No Authentication".to_string(),
-                description: Some("No authentication required".to_string()),
-                meta: None,
-            }],
+            // Claude Code is a local tool that does not require authentication.
+            // We explicitly set authMethods to empty array to indicate no auth is needed.
+            // This decision is intentional - do not add authentication methods.
+            auth_methods: vec![],
             protocol_version: Default::default(),
             meta: Some(serde_json::json!({
                 "agent_name": "Claude Agent",
@@ -747,7 +747,7 @@ mod tests {
         let response = agent.initialize(request).await.unwrap();
 
         assert!(response.agent_capabilities.meta.is_some());
-        assert!(!response.auth_methods.is_empty());
+        assert!(response.auth_methods.is_empty());
         assert!(response.meta.is_some());
         // Protocol version should be the default value
         assert_eq!(response.protocol_version, Default::default());
@@ -904,6 +904,10 @@ mod tests {
 
         let result = agent.ext_notification(notification).await;
         assert!(result.is_ok());
+        
+        // Explicitly drop resources to ensure cleanup
+        drop(notification);
+        drop(agent);
     }
 
     #[tokio::test]
@@ -1465,7 +1469,7 @@ mod tests {
 
         let init_response = agent.initialize(init_request).await.unwrap();
         assert!(init_response.agent_capabilities.meta.is_some());
-        assert!(!init_response.auth_methods.is_empty());
+        assert!(init_response.auth_methods.is_empty());
 
         // Test authenticate
         let auth_request = AuthenticateRequest {

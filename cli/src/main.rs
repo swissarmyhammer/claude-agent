@@ -489,6 +489,9 @@ mod tests {
 
         let result = validate_config_file(config_path).await;
         assert!(result.is_err());
+        
+        // Explicitly drop temp_dir to ensure cleanup
+        drop(temp_dir);
     }
 
     #[test]
