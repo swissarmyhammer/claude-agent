@@ -10,8 +10,10 @@ use agent_client_protocol::{
     PromptResponse, RawValue, SessionId, SessionNotification, SessionUpdate, SetSessionModeRequest,
     SetSessionModeResponse, StopReason, TextContent,
 };
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use std::time::SystemTime;
+use tokio::sync::{broadcast, RwLock};
 use tokio_stream::StreamExt;
 
 // SessionUpdateNotification has been replaced with agent_client_protocol::SessionNotification
@@ -20,6 +22,134 @@ use tokio_stream::StreamExt;
 // ToolCallContent and MessageChunk have been replaced with agent_client_protocol types:
 // - ToolCallContent -> Use SessionUpdate enum variants directly
 // - MessageChunk -> Use ContentBlock directly
+
+/// Cancellation state for a session
+///
+/// Tracks the cancellation status and metadata for operations within a session.
+/// This allows immediate cancellation response and proper cleanup coordination.
+#[derive(Debug, Clone)]
+pub struct CancellationState {
+    /// Whether the session is cancelled
+    pub cancelled: bool,
+    /// When the cancellation occurred
+    pub cancellation_time: SystemTime,
+    /// Set of operation IDs that have been cancelled
+    pub cancelled_operations: HashSet<String>,
+    /// Reason for cancellation (for debugging)
+    pub cancellation_reason: String,
+}
+
+impl CancellationState {
+    /// Create a new active (non-cancelled) state
+    pub fn active() -> Self {
+        Self {
+            cancelled: false,
+            cancellation_time: SystemTime::now(),
+            cancelled_operations: HashSet::new(),
+            cancellation_reason: String::new(),
+        }
+    }
+
+    /// Mark as cancelled with reason
+    pub fn cancel(&mut self, reason: &str) {
+        self.cancelled = true;
+        self.cancellation_time = SystemTime::now();
+        self.cancellation_reason = reason.to_string();
+    }
+
+    /// Add a cancelled operation ID
+    pub fn add_cancelled_operation(&mut self, operation_id: String) {
+        self.cancelled_operations.insert(operation_id);
+    }
+
+    /// Check if operation is cancelled
+    pub fn is_operation_cancelled(&self, operation_id: &str) -> bool {
+        self.cancelled || self.cancelled_operations.contains(operation_id)
+    }
+}
+
+/// Manager for session cancellation state
+///
+/// Provides thread-safe cancellation coordination across all session operations.
+/// Supports immediate cancellation notification and proper cleanup coordination.
+pub struct CancellationManager {
+    /// Session ID -> CancellationState mapping
+    cancellation_states: Arc<RwLock<HashMap<String, CancellationState>>>,
+    /// Broadcast sender for immediate cancellation notifications
+    cancellation_sender: broadcast::Sender<String>,
+}
+
+impl CancellationManager {
+    /// Create a new cancellation manager
+    pub fn new() -> (Self, broadcast::Receiver<String>) {
+        let (sender, receiver) = broadcast::channel(100);
+        (
+            Self {
+                cancellation_states: Arc::new(RwLock::new(HashMap::new())),
+                cancellation_sender: sender,
+            },
+            receiver,
+        )
+    }
+
+    /// Check if a session is cancelled
+    pub async fn is_cancelled(&self, session_id: &str) -> bool {
+        let states = self.cancellation_states.read().await;
+        states
+            .get(session_id)
+            .map(|state| state.cancelled)
+            .unwrap_or(false)
+    }
+
+    /// Mark a session as cancelled
+    pub async fn mark_cancelled(&self, session_id: &str, reason: &str) -> crate::Result<()> {
+        {
+            let mut states = self.cancellation_states.write().await;
+            let state = states
+                .entry(session_id.to_string())
+                .or_insert_with(CancellationState::active);
+            state.cancel(reason);
+        }
+
+        // Broadcast cancellation immediately
+        if let Err(e) = self.cancellation_sender.send(session_id.to_string()) {
+            tracing::warn!(
+                "Failed to broadcast cancellation for session {}: {}",
+                session_id,
+                e
+            );
+        }
+
+        tracing::info!("Session {} marked as cancelled: {}", session_id, reason);
+        Ok(())
+    }
+
+    /// Add a cancelled operation to a session
+    pub async fn add_cancelled_operation(&self, session_id: &str, operation_id: String) {
+        let mut states = self.cancellation_states.write().await;
+        let state = states
+            .entry(session_id.to_string())
+            .or_insert_with(CancellationState::active);
+        state.add_cancelled_operation(operation_id);
+    }
+
+    /// Get cancellation state for debugging
+    pub async fn get_cancellation_state(&self, session_id: &str) -> Option<CancellationState> {
+        let states = self.cancellation_states.read().await;
+        states.get(session_id).cloned()
+    }
+
+    /// Clean up cancellation state for a session (called when session ends)
+    pub async fn cleanup_session(&self, session_id: &str) {
+        let mut states = self.cancellation_states.write().await;
+        states.remove(session_id);
+    }
+
+    /// Subscribe to cancellation notifications
+    pub fn subscribe(&self) -> broadcast::Receiver<String> {
+        self.cancellation_sender.subscribe()
+    }
+}
 
 /// Notification sender for streaming updates
 ///
@@ -94,6 +224,7 @@ pub struct ClaudeAgent {
     config: AgentConfig,
     capabilities: AgentCapabilities,
     notification_sender: Arc<NotificationSender>,
+    cancellation_manager: Arc<CancellationManager>,
 }
 
 impl ClaudeAgent {
@@ -167,6 +298,9 @@ impl ClaudeAgent {
             })),
         };
 
+        // Create cancellation manager for session cancellation support
+        let (cancellation_manager, _cancellation_receiver) = CancellationManager::new();
+
         let agent = Self {
             session_manager,
             claude_client,
@@ -175,6 +309,7 @@ impl ClaudeAgent {
             config,
             capabilities,
             notification_sender: Arc::new(notification_sender),
+            cancellation_manager: Arc::new(cancellation_manager),
         };
 
         Ok((agent, notification_receiver))
@@ -216,10 +351,8 @@ impl ClaudeAgent {
     }
 
     /// Supported protocol versions by this agent
-    const SUPPORTED_PROTOCOL_VERSIONS: &'static [agent_client_protocol::ProtocolVersion] = &[
-        agent_client_protocol::V0,
-        agent_client_protocol::V1,
-    ];
+    const SUPPORTED_PROTOCOL_VERSIONS: &'static [agent_client_protocol::ProtocolVersion] =
+        &[agent_client_protocol::V0, agent_client_protocol::V1];
 
     /// Validate protocol version compatibility with comprehensive error responses
     fn validate_protocol_version(
@@ -296,7 +429,11 @@ impl ClaudeAgent {
         meta: &serde_json::Value,
     ) -> Result<(), agent_client_protocol::Error> {
         let supported_meta_keys = ["streaming", "notifications", "progress"];
-        let unknown_capabilities = ["customExtension", "experimentalFeature", "unsupportedOption"];
+        let unknown_capabilities = [
+            "customExtension",
+            "experimentalFeature",
+            "unsupportedOption",
+        ];
 
         if let Some(meta_obj) = meta.as_object() {
             for (key, value) in meta_obj {
@@ -362,7 +499,8 @@ impl ClaudeAgent {
         // Validate meta field if present
         if let Some(fs_meta) = &fs_capabilities.meta {
             let supported_fs_features = ["encoding", "permissions", "symbolic_links"];
-            let unsupported_fs_features = ["unknown_feature", "experimental_access", "direct_memory"];
+            let unsupported_fs_features =
+                ["unknown_feature", "experimental_access", "direct_memory"];
 
             if let Some(meta_obj) = fs_meta.as_object() {
                 for (key, value) in meta_obj {
@@ -494,7 +632,8 @@ impl ClaudeAgent {
         if meta.is_number() {
             return Err(agent_client_protocol::Error {
                 code: -32600, // Invalid Request
-                message: "Invalid initialize request: meta field must be an object, not a number.".to_string(),
+                message: "Invalid initialize request: meta field must be an object, not a number."
+                    .to_string(),
                 data: Some(serde_json::json!({
                     "errorType": "invalid_field_type",
                     "invalidField": "meta",
@@ -508,9 +647,10 @@ impl ClaudeAgent {
         if meta.is_boolean() {
             return Err(agent_client_protocol::Error {
                 code: -32600, // Invalid Request
-                message: "Invalid initialize request: meta field must be an object, not a boolean.".to_string(),
+                message: "Invalid initialize request: meta field must be an object, not a boolean."
+                    .to_string(),
                 data: Some(serde_json::json!({
-                    "errorType": "invalid_field_type", 
+                    "errorType": "invalid_field_type",
                     "invalidField": "meta",
                     "expectedType": "object",
                     "receivedType": "boolean",
@@ -522,10 +662,11 @@ impl ClaudeAgent {
         if meta.is_array() {
             return Err(agent_client_protocol::Error {
                 code: -32600, // Invalid Request
-                message: "Invalid initialize request: meta field must be an object, not an array.".to_string(),
+                message: "Invalid initialize request: meta field must be an object, not an array."
+                    .to_string(),
                 data: Some(serde_json::json!({
                     "errorType": "invalid_field_type",
-                    "invalidField": "meta", 
+                    "invalidField": "meta",
                     "expectedType": "object",
                     "receivedType": "array",
                     "recoverySuggestion": "Convert the array to a JSON object with named properties"
@@ -542,7 +683,10 @@ impl ClaudeAgent {
 
             // Check for excessively large meta objects (performance concern)
             if meta_obj.len() > 50 {
-                tracing::warn!("Initialization meta field contains {} entries, which may impact performance", meta_obj.len());
+                tracing::warn!(
+                    "Initialization meta field contains {} entries, which may impact performance",
+                    meta_obj.len()
+                );
             }
         }
 
@@ -555,7 +699,10 @@ impl ClaudeAgent {
         request: &InitializeRequest,
     ) -> Result<(), agent_client_protocol::Error> {
         // Protocol version is always present due to type system, but we can validate its format
-        tracing::debug!("Validating initialization request with protocol version: {:?}", request.protocol_version);
+        tracing::debug!(
+            "Validating initialization request with protocol version: {:?}",
+            request.protocol_version
+        );
 
         // Client capabilities is always present due to type system
         // But we can check for basic structural sanity
@@ -571,7 +718,9 @@ impl ClaudeAgent {
     ) -> Result<(), agent_client_protocol::Error> {
         // Check that filesystem capabilities are reasonable
         if !capabilities.fs.read_text_file && !capabilities.fs.write_text_file {
-            tracing::info!("Client declares no file system capabilities (both read and write are false)");
+            tracing::info!(
+                "Client declares no file system capabilities (both read and write are false)"
+            );
         }
 
         // Terminal capability is just a boolean, so not much to validate structurally
@@ -593,36 +742,54 @@ impl ClaudeAgent {
 
         // Log additional context for debugging
         if let Some(data) = &error.data {
-            tracing::debug!("Error details: {}", serde_json::to_string_pretty(data).unwrap_or_else(|_| data.to_string()));
+            tracing::debug!(
+                "Error details: {}",
+                serde_json::to_string_pretty(data).unwrap_or_else(|_| data.to_string())
+            );
         }
 
         // Perform connection-related cleanup tasks
         let cleanup_result = self.perform_initialization_cleanup().await;
         let cleanup_successful = cleanup_result.is_ok();
-        
+
         if let Err(cleanup_error) = cleanup_result {
-            tracing::warn!("Initialization cleanup encountered issues: {}", cleanup_error);
+            tracing::warn!(
+                "Initialization cleanup encountered issues: {}",
+                cleanup_error
+            );
         }
 
         // Create enhanced error response with cleanup information
         let mut enhanced_error = error.clone();
-        
+
         // Add cleanup status to error data
         if let Some(existing_data) = enhanced_error.data.as_mut() {
             if let Some(data_obj) = existing_data.as_object_mut() {
-                data_obj.insert("cleanupPerformed".to_string(), serde_json::Value::Bool(cleanup_successful));
-                data_obj.insert("timestamp".to_string(), serde_json::Value::String(
-                    chrono::Utc::now().to_rfc3339()
-                ));
-                data_obj.insert("severity".to_string(), serde_json::Value::String("fatal".to_string()));
-                
+                data_obj.insert(
+                    "cleanupPerformed".to_string(),
+                    serde_json::Value::Bool(cleanup_successful),
+                );
+                data_obj.insert(
+                    "timestamp".to_string(),
+                    serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+                );
+                data_obj.insert(
+                    "severity".to_string(),
+                    serde_json::Value::String("fatal".to_string()),
+                );
+
                 // Add connection guidance based on error type
                 let connection_guidance = match error.code {
-                    -32600 => "Client should close connection and retry with corrected request format",
-                    -32602 => "Client should adjust capabilities and retry initialization", 
-                    _ => "Client should close connection and check agent compatibility"
+                    -32600 => {
+                        "Client should close connection and retry with corrected request format"
+                    }
+                    -32602 => "Client should adjust capabilities and retry initialization",
+                    _ => "Client should close connection and check agent compatibility",
                 };
-                data_obj.insert("connectionGuidance".to_string(), serde_json::Value::String(connection_guidance.to_string()));
+                data_obj.insert(
+                    "connectionGuidance".to_string(),
+                    serde_json::Value::String(connection_guidance.to_string()),
+                );
             }
         } else {
             // Create new data object if none exists
@@ -665,7 +832,10 @@ impl ClaudeAgent {
 
         // Task 3: Log cleanup completion
         cleanup_tasks.push("logging_cleanup");
-        tracing::info!("Initialization cleanup completed successfully - {} tasks performed", cleanup_tasks.len());
+        tracing::info!(
+            "Initialization cleanup completed successfully - {} tasks performed",
+            cleanup_tasks.len()
+        );
 
         // Future enhancement: Add more specific cleanup based on error type
         Ok(())
@@ -761,15 +931,37 @@ impl ClaudeAgent {
 
         let mut full_response = String::new();
         let mut chunk_count = 0;
+        let session_id_str = session_id.to_string();
 
         while let Some(chunk) = stream.next().await {
+            // Check for cancellation before processing each chunk
+            if self
+                .cancellation_manager
+                .is_cancelled(&session_id_str)
+                .await
+            {
+                tracing::info!(
+                    "Streaming cancelled for session {} after {} chunks",
+                    session_id,
+                    chunk_count
+                );
+                return Ok(PromptResponse {
+                    stop_reason: StopReason::Cancelled,
+                    meta: Some(serde_json::json!({
+                        "cancelled_during_streaming": true,
+                        "chunks_processed": chunk_count,
+                        "partial_response_length": full_response.len()
+                    })),
+                });
+            }
+
             chunk_count += 1;
             full_response.push_str(&chunk.content);
 
             // Send real-time update via session/update notification
             if let Err(e) = self
                 .send_session_update(SessionNotification {
-                    session_id: SessionId(session_id.to_string().into()),
+                    session_id: SessionId(session_id_str.clone().into()),
                     update: SessionUpdate::AgentMessageChunk {
                         content: ContentBlock::Text(TextContent {
                             text: chunk.content.clone(),
@@ -790,6 +982,26 @@ impl ClaudeAgent {
                 // Note: We continue processing despite notification failure
                 // to avoid interrupting the main streaming flow
             }
+        }
+
+        // Final cancellation check before storing response
+        if self
+            .cancellation_manager
+            .is_cancelled(&session_id_str)
+            .await
+        {
+            tracing::info!(
+                "Session {} cancelled after streaming completed, not storing response",
+                session_id
+            );
+            return Ok(PromptResponse {
+                stop_reason: StopReason::Cancelled,
+                meta: Some(serde_json::json!({
+                    "cancelled_after_streaming": true,
+                    "chunks_processed": chunk_count,
+                    "full_response_length": full_response.len()
+                })),
+            });
         }
 
         tracing::info!("Completed streaming response with {} chunks", chunk_count);
@@ -841,11 +1053,47 @@ impl ClaudeAgent {
         }
 
         let context: crate::claude::SessionContext = session.into();
+        let session_id_str = session_id.to_string();
+
+        // Check for cancellation before making Claude API request
+        if self
+            .cancellation_manager
+            .is_cancelled(&session_id_str)
+            .await
+        {
+            tracing::info!("Session {} cancelled before Claude API request", session_id);
+            return Ok(PromptResponse {
+                stop_reason: StopReason::Cancelled,
+                meta: Some(serde_json::json!({
+                    "cancelled_before_api_request": true
+                })),
+            });
+        }
+
         let response_content = self
             .claude_client
             .query_with_context(&prompt_text, &context)
             .await
             .map_err(|_| agent_client_protocol::Error::internal_error())?;
+
+        // Check for cancellation after Claude API request but before storing
+        if self
+            .cancellation_manager
+            .is_cancelled(&session_id_str)
+            .await
+        {
+            tracing::info!(
+                "Session {} cancelled after Claude API response, not storing",
+                session_id
+            );
+            return Ok(PromptResponse {
+                stop_reason: StopReason::Cancelled,
+                meta: Some(serde_json::json!({
+                    "cancelled_after_api_response": true,
+                    "response_length": response_content.len()
+                })),
+            });
+        }
 
         // Store assistant response in session
         let assistant_message = crate::session::Message {
@@ -874,6 +1122,115 @@ impl ClaudeAgent {
     /// Send session update notification
     async fn send_session_update(&self, notification: SessionNotification) -> crate::Result<()> {
         self.notification_sender.send_update(notification).await
+    }
+
+    /// Cancel ongoing Claude API requests for a session
+    async fn cancel_claude_requests(&self, session_id: &str) {
+        tracing::debug!("Cancelling Claude API requests for session: {}", session_id);
+
+        // Currently the ClaudeClient doesn't track individual requests
+        // In a future enhancement, we would:
+        // 1. Track ongoing requests by session ID
+        // 2. Cancel HTTP requests using cancellation tokens
+        // 3. Handle partial responses appropriately
+        //
+        // For now, we mark the cancellation and let the prompt method
+        // detect cancellation state before making new requests
+
+        tracing::debug!(
+            "Claude API request cancellation completed for session: {}",
+            session_id
+        );
+    }
+
+    /// Cancel ongoing tool executions for a session  
+    async fn cancel_tool_executions(&self, session_id: &str) {
+        tracing::debug!("Cancelling tool executions for session: {}", session_id);
+
+        // Currently the ToolCallHandler doesn't track requests by session
+        // In a future enhancement, we would:
+        // 1. Track tool executions by session ID
+        // 2. Cancel background processes and operations
+        // 3. Send tool_call_update notifications with cancelled status
+        //
+        // For now, we add cancelled operations to the cancellation manager
+        // so future tool calls can be prevented
+
+        self.cancellation_manager
+            .add_cancelled_operation(session_id, "all_tool_executions".to_string())
+            .await;
+
+        tracing::debug!(
+            "Tool execution cancellation completed for session: {}",
+            session_id
+        );
+    }
+
+    /// Cancel pending permission requests for a session
+    async fn cancel_permission_requests(&self, session_id: &str) {
+        tracing::debug!("Cancelling permission requests for session: {}", session_id);
+
+        // Currently we don't track permission requests by session
+        // In a future enhancement, we would:
+        // 1. Track pending permission requests by session ID
+        // 2. Respond to pending requests with 'cancelled' outcome
+        // 3. Clean up permission request state
+        //
+        // For now, we mark permission requests as cancelled
+
+        self.cancellation_manager
+            .add_cancelled_operation(session_id, "all_permission_requests".to_string())
+            .await;
+
+        tracing::debug!(
+            "Permission request cancellation completed for session: {}",
+            session_id
+        );
+    }
+
+    /// Send final status updates before cancellation response
+    async fn send_final_cancellation_updates(&self, session_id: &str) -> crate::Result<()> {
+        tracing::debug!(
+            "Sending final cancellation updates for session: {}",
+            session_id
+        );
+
+        // Send a final text message to notify about cancellation
+        // Using AgentMessageChunk since it's a known working variant
+        let cancellation_notification = SessionNotification {
+            session_id: SessionId(session_id.into()),
+            update: SessionUpdate::AgentMessageChunk {
+                content: ContentBlock::Text(TextContent {
+                    text: "[Session cancelled by client request]".to_string(),
+                    annotations: None,
+                    meta: Some(serde_json::json!({
+                        "cancelled_at": SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default().as_secs(),
+                        "reason": "client_cancellation",
+                        "session_id": session_id
+                    })),
+                }),
+            },
+            meta: Some(serde_json::json!({
+                "final_update": true,
+                "cancellation": true
+            })),
+        };
+
+        if let Err(e) = self.send_session_update(cancellation_notification).await {
+            tracing::warn!(
+                "Failed to send cancellation notification for session {}: {}",
+                session_id,
+                e
+            );
+            // Don't propagate the error as cancellation should still proceed
+        }
+
+        tracing::debug!(
+            "Final cancellation updates sent for session: {}",
+            session_id
+        );
+        Ok(())
     }
 
     /// Shutdown active sessions gracefully
@@ -1095,6 +1452,25 @@ impl Agent for ClaudeAgent {
         // Parse session ID
         let session_id = self.parse_session_id(&request.session_id)?;
 
+        // Check if session is already cancelled before processing
+        if self
+            .cancellation_manager
+            .is_cancelled(&session_id.to_string())
+            .await
+        {
+            tracing::info!(
+                "Session {} is cancelled, returning cancelled response",
+                session_id
+            );
+            return Ok(PromptResponse {
+                stop_reason: StopReason::Cancelled,
+                meta: Some(serde_json::json!({
+                    "cancelled_before_processing": true,
+                    "session_id": session_id.to_string()
+                })),
+            });
+        }
+
         // Extract text content from the prompt
         let mut prompt_text = String::new();
         for content_block in &request.prompt {
@@ -1154,9 +1530,54 @@ impl Agent for ClaudeAgent {
         notification: CancelNotification,
     ) -> Result<(), agent_client_protocol::Error> {
         self.log_request("cancel", &notification);
-        tracing::info!("Cancel notification received");
+        let session_id = &notification.session_id.0;
 
-        // Handle cancellation logic here
+        tracing::info!("Processing cancellation for session: {}", session_id);
+
+        // ACP requires immediate and comprehensive cancellation handling:
+        // 1. Process session/cancel notifications immediately
+        // 2. Cancel ALL ongoing operations (LM, tools, permissions)
+        // 3. Send final status updates before responding
+        // 4. Respond to original session/prompt with cancelled stop reason
+        // 5. Clean up all resources and prevent orphaned operations
+        //
+        // Cancellation must be fast and reliable to maintain responsiveness.
+
+        // 1. Immediately mark session as cancelled
+        if let Err(e) = self
+            .cancellation_manager
+            .mark_cancelled(session_id, "Client sent session/cancel notification")
+            .await
+        {
+            tracing::error!("Failed to mark session {} as cancelled: {}", session_id, e);
+            // Continue with cancellation despite state update failure
+        }
+
+        // 2. Cancel all ongoing operations for this session
+        tokio::join!(
+            self.cancel_claude_requests(session_id),
+            self.cancel_tool_executions(session_id),
+            self.cancel_permission_requests(session_id)
+        );
+
+        // 3. Send final status updates for any pending operations
+        if let Err(e) = self.send_final_cancellation_updates(session_id).await {
+            tracing::warn!(
+                "Failed to send final cancellation updates for session {}: {}",
+                session_id,
+                e
+            );
+            // Don't fail cancellation due to notification issues
+        }
+
+        // 4. The original session/prompt will respond with cancelled stop reason
+        // when it detects the cancellation state - this happens automatically
+        // in the prompt method implementation
+
+        tracing::info!(
+            "Cancellation processing completed for session: {}",
+            session_id
+        );
         Ok(())
     }
 
@@ -2162,7 +2583,7 @@ mod tests {
         let error = result.unwrap_err();
         assert_eq!(error.code, -32600);
         assert!(error.message.contains("Invalid initialize request"));
-        
+
         // Verify error data structure
         assert!(error.data.is_some(), "Error data should be provided");
         let data = error.data.unwrap();
@@ -2197,8 +2618,10 @@ mod tests {
 
         let error = result.unwrap_err();
         assert_eq!(error.code, -32602, "Should be Invalid params error");
-        assert!(error.message.contains("unknown capability 'customExtension'"));
-        
+        assert!(error
+            .message
+            .contains("unknown capability 'customExtension'"));
+
         // Verify structured error data
         assert!(error.data.is_some());
         let data = error.data.unwrap();
@@ -2228,12 +2651,15 @@ mod tests {
         };
 
         let result = agent.initialize(request).await;
-        assert!(result.is_err(), "Unknown filesystem capability should be rejected");
+        assert!(
+            result.is_err(),
+            "Unknown filesystem capability should be rejected"
+        );
 
         let error = result.unwrap_err();
         assert_eq!(error.code, -32602, "Should be Invalid params error");
         assert!(error.message.contains("unknown file system feature"));
-        
+
         // Verify structured error data
         assert!(error.data.is_some());
         let data = error.data.unwrap();
@@ -2280,19 +2706,19 @@ mod tests {
         let v1_result = agent.initialize(v1_request).await;
         assert!(v1_result.is_ok(), "V1 should be supported");
 
-        // Test the version validation logic directly  
+        // Test the version validation logic directly
         let _unsupported_version = agent_client_protocol::ProtocolVersion::default();
-        
+
         // Temporarily modify SUPPORTED_PROTOCOL_VERSIONS to exclude default version
         // This tests the error handling path by calling validate_protocol_version
         // with a version that's not in our supported list
-        
+
         // Since we can't easily create an unsupported version enum variant,
         // let's test by calling the validation method directly on the agent
         // with a version we know should trigger different error handling paths
-        
+
         // NOTE: This test verifies that our error structure is correct
-        // The actual version negotiation error would be triggered if we had 
+        // The actual version negotiation error would be triggered if we had
         // V2 or another unsupported version in the protocol definition
     }
 }
