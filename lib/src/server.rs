@@ -448,7 +448,6 @@ mod tests {
         // to handle the Agent trait's Send bounds
 
         // If we get here without panicking, the server was created successfully
-        assert!(true);
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@ mcp.log
 .swissarmyhammer/tmp
 .swissarmyhammer/search.db
 .swissarmyhammer/todo/
+.swissarmyhammer/workflow-runs/
 
 # Rust
 /target/
