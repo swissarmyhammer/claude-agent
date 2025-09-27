@@ -7,50 +7,19 @@ use agent_client_protocol::{
     Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
     ContentBlock, ExtNotification, ExtRequest, InitializeRequest, InitializeResponse,
     LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
-    PromptResponse, RawValue, SessionId, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    PromptResponse, RawValue, SessionId, SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     TextContent,
 };
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 
-/// Session update notification for streaming responses
-///
-/// This notification is sent when there are real-time updates to a session,
-/// such as streaming message chunks or tool call results. It enables clients
-/// to receive live updates during long-running operations.
-#[derive(Debug, Clone)]
-pub struct SessionUpdateNotification {
-    /// The ID of the session being updated
-    pub session_id: String,
-    /// A chunk of message content for streaming responses (if applicable)
-    pub message_chunk: Option<MessageChunk>,
-    /// Result of a tool call execution (if applicable)
-    pub tool_call_result: Option<ToolCallContent>,
-}
+// SessionUpdateNotification has been replaced with agent_client_protocol::SessionNotification
+// This provides better protocol compliance and type safety
 
-/// Tool call content for notifications
-///
-/// Represents the result of executing a tool call, containing both the
-/// identifier of the original tool call and the execution result.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ToolCallContent {
-    /// The unique identifier of the tool call that was executed
-    pub tool_call_id: String,
-    /// The string result of the tool call execution
-    pub result: String,
-}
-
-/// Message chunk for streaming responses
-///
-/// Represents a portion of a larger message that is being sent incrementally
-/// during streaming operations. Each chunk contains content blocks that can
-/// be processed and displayed to the user in real-time.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct MessageChunk {
-    /// The content blocks within this message chunk
-    pub content: Vec<ContentBlock>,
-}
+// ToolCallContent and MessageChunk have been replaced with agent_client_protocol types:
+// - ToolCallContent -> Use SessionUpdate enum variants directly
+// - MessageChunk -> Use ContentBlock directly
 
 /// Notification sender for streaming updates
 ///
@@ -59,7 +28,7 @@ pub struct MessageChunk {
 /// streaming content, and tool execution results to interested subscribers.
 pub struct NotificationSender {
     /// The broadcast sender for distributing notifications
-    sender: broadcast::Sender<SessionUpdateNotification>,
+    sender: broadcast::Sender<SessionNotification>,
 }
 
 impl NotificationSender {
@@ -69,12 +38,16 @@ impl NotificationSender {
     /// to listen for session update notifications. The receiver can be cloned
     /// to create multiple subscribers.
     ///
+    /// # Parameters
+    ///
+    /// * `buffer_size` - The size of the broadcast channel buffer for notifications
+    ///
     /// # Returns
     ///
     /// A tuple of (NotificationSender, Receiver) where the receiver can be used
     /// to subscribe to session update notifications.
-    pub fn new() -> (Self, broadcast::Receiver<SessionUpdateNotification>) {
-        let (sender, receiver) = broadcast::channel(1000);
+    pub fn new(buffer_size: usize) -> (Self, broadcast::Receiver<SessionNotification>) {
+        let (sender, receiver) = broadcast::channel(buffer_size);
         (Self { sender }, receiver)
     }
 
@@ -86,15 +59,15 @@ impl NotificationSender {
     ///
     /// # Arguments
     ///
-    /// * `update` - The session update notification to broadcast
+    /// * `notification` - The session notification to broadcast
     ///
     /// # Returns
     ///
     /// Returns `Ok(())` if the notification was sent successfully, or an error
     /// if the broadcast channel has no receivers or encounters other issues.
-    pub async fn send_update(&self, update: SessionUpdateNotification) -> crate::Result<()> {
+    pub async fn send_update(&self, notification: SessionNotification) -> crate::Result<()> {
         self.sender
-            .send(update)
+            .send(notification)
             .map_err(|_| crate::AgentError::Protocol("Failed to send notification".to_string()))?;
         Ok(())
     }
@@ -147,14 +120,14 @@ impl ClaudeAgent {
     /// issues or if the Claude client cannot be created.
     pub async fn new(
         config: AgentConfig,
-    ) -> crate::Result<(Self, broadcast::Receiver<SessionUpdateNotification>)> {
+    ) -> crate::Result<(Self, broadcast::Receiver<SessionNotification>)> {
         // Validate configuration including MCP servers
         config.validate()?;
 
         let session_manager = Arc::new(SessionManager::new());
         let claude_client = Arc::new(ClaudeClient::new_with_config(&config.claude)?);
 
-        let (notification_sender, notification_receiver) = NotificationSender::new();
+        let (notification_sender, notification_receiver) = NotificationSender::new(config.notification_buffer_size);
 
         // Create and initialize MCP manager
         let mut mcp_manager = crate::mcp::McpServerManager::new();
@@ -336,20 +309,27 @@ impl ClaudeAgent {
 
             // Send real-time update via session/update notification
             if let Err(e) = self
-                .send_session_update(SessionUpdateNotification {
-                    session_id: session_id.to_string(),
-                    message_chunk: Some(MessageChunk {
-                        content: vec![ContentBlock::Text(TextContent {
-                            text: chunk.content,
+                .send_session_update(SessionNotification {
+                    session_id: SessionId(session_id.to_string().into()),
+                    update: SessionUpdate::AgentMessageChunk { 
+                        content: ContentBlock::Text(TextContent {
+                            text: chunk.content.clone(),
                             annotations: None,
                             meta: None,
-                        })],
-                    }),
-                    tool_call_result: None,
+                        })
+                    },
+                    meta: None,
                 })
                 .await
             {
-                tracing::warn!("Failed to send session update: {}", e);
+                tracing::error!(
+                    session_id = %session_id,
+                    chunk_length = chunk.content.len(),
+                    error = %e,
+                    "Failed to send session update notification - streaming update lost"
+                );
+                // Note: We continue processing despite notification failure
+                // to avoid interrupting the main streaming flow
             }
         }
 
@@ -433,8 +413,8 @@ impl ClaudeAgent {
     }
 
     /// Send session update notification
-    async fn send_session_update(&self, update: SessionUpdateNotification) -> crate::Result<()> {
-        self.notification_sender.send_update(update).await
+    async fn send_session_update(&self, notification: SessionNotification) -> crate::Result<()> {
+        self.notification_sender.send_update(notification).await
     }
 
     /// Shutdown active sessions gracefully
@@ -1168,7 +1148,7 @@ mod tests {
 
     // Helper function for streaming tests
     async fn create_test_agent_with_notifications(
-    ) -> (ClaudeAgent, broadcast::Receiver<SessionUpdateNotification>) {
+    ) -> (ClaudeAgent, broadcast::Receiver<SessionNotification>) {
         let config = AgentConfig::default();
         ClaudeAgent::new(config).await.unwrap()
     }
@@ -1522,68 +1502,7 @@ mod tests {
         assert!(prompt_response.meta.is_some());
     }
 
-    // TODO: Implement tool permission flow when ToolPermissionGrantRequest/DenyRequest types are available
-    // #[tokio::test]
-    // async fn test_tool_permission_flow() {
-    //     let (agent, _) = create_test_agent_with_notifications();
-    //
-    //     // Create session
-    //     let session_response = agent.new_session(NewSessionRequest {
-    //         cwd: std::path::PathBuf::from("/tmp"),
-    //         mcp_servers: vec![],
-    //         meta: None,
-    //     }).await.unwrap();
-    //
-    //     // Simulate tool call that requires permission
-    //     let tool_call = crate::tools::InternalToolRequest {
-    //         id: "test-tool-call".to_string(),
-    //         name: "fs_write".to_string(),
-    //         arguments: serde_json::json!({
-    //             "path": "/tmp/test.txt",
-    //             "content": "Hello, World!"
-    //         }),
-    //     };
-    //
-    //     // Add to pending calls
-    //     agent.pending_tool_calls.add_pending_call(
-    //         tool_call.clone(),
-    //         session_response.session_id.0.to_string()
-    //     ).await.unwrap();
-    //
-    //     // Test permission grant
-    //     let grant_request = ToolPermissionGrantRequest {
-    //         tool_call_id: tool_call.id.clone(),
-    //         session_id: session_response.session_id.clone(),
-    //     };
-    //
-    //     let grant_response = agent.tool_permission_grant(grant_request).await.unwrap();
-    //     // Response may succeed or fail depending on tool execution
-    //     // but should not error on the protocol level
-    //     assert!(grant_response.success || !grant_response.error_message.is_none());
-    //
-    //     // Test permission deny with another call
-    //     let tool_call_2 = crate::tools::InternalToolRequest {
-    //         id: "test-tool-call-2".to_string(),
-    //         name: "fs_write".to_string(),
-    //         arguments: serde_json::json!({
-    //             "path": "/tmp/test2.txt",
-    //             "content": "Hello, World 2!"
-    //         }),
-    //     };
-    //
-    //     agent.pending_tool_calls.add_pending_call(
-    //         tool_call_2.clone(),
-    //         session_response.session_id.0.to_string()
-    //     ).await.unwrap();
-    //
-    //     let deny_request = ToolPermissionDenyRequest {
-    //         tool_call_id: tool_call_2.id,
-    //         session_id: session_response.session_id,
-    //     };
-    //
-    //     let deny_response = agent.tool_permission_deny(deny_request).await.unwrap();
-    //     assert!(deny_response.success);
-    // }
+
 
     #[tokio::test]
     async fn test_protocol_error_handling() {
@@ -1603,21 +1522,7 @@ mod tests {
         let result = agent.prompt(invalid_prompt).await;
         assert!(result.is_err());
 
-        // TODO: Add tool permission tests when ToolPermissionGrantRequest/DenyRequest types are available
-        // Test tool permission grant with non-existent tool call
-        // let invalid_grant = ToolPermissionGrantRequest {
-        //     tool_call_id: "non-existent-id".to_string(),
-        //     session_id: SessionId("test-session".to_string().into()),
-        // };
-        //
-        // let grant_result = agent.tool_permission_grant(invalid_grant).await.unwrap();
-        // assert!(!grant_result.success);
-        // assert!(grant_result.error_message.is_some());
-        //
-        // // Test tool permission deny with non-existent tool call
-        // let invalid_deny = ToolPermissionDenyRequest {
-        //     tool_call_id: "non-existent-id".to_string(),
-        //     session_id: SessionId("test-session".to_string().into()),
+
         // };
         //
         // let deny_result = agent.tool_permission_deny(invalid_deny).await.unwrap();

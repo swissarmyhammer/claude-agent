@@ -7,6 +7,11 @@ fn default_max_prompt_length() -> usize {
     100_000
 }
 
+/// Default value for notification_buffer_size
+fn default_notification_buffer_size() -> usize {
+    1000
+}
+
 /// Main configuration structure for the Claude Agent
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentConfig {
@@ -17,6 +22,9 @@ pub struct AgentConfig {
     /// Maximum allowed prompt length in characters (default: 100,000)
     #[serde(default = "default_max_prompt_length")]
     pub max_prompt_length: usize,
+    /// Buffer size for notification broadcast channel (default: 1,000)
+    #[serde(default = "default_notification_buffer_size")]
+    pub notification_buffer_size: usize,
 }
 
 /// Configuration for Claude SDK integration
@@ -116,6 +124,7 @@ impl Default for AgentConfig {
             },
             mcp_servers: vec![],
             max_prompt_length: 100_000,
+            notification_buffer_size: 1000,
         }
     }
 }

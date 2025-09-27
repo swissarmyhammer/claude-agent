@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 /// The main ACP server that handles JSON-RPC communication
 pub struct ClaudeAgentServer {
     agent: Arc<ClaudeAgent>,
-    notification_receiver: broadcast::Receiver<crate::agent::SessionUpdateNotification>,
+    notification_receiver: broadcast::Receiver<agent_client_protocol::SessionNotification>,
 }
 
 impl ClaudeAgentServer {
@@ -299,7 +299,7 @@ impl ClaudeAgentServer {
     /// Send a session update notification
     async fn send_notification<W>(
         writer: Arc<tokio::sync::Mutex<W>>,
-        notification: crate::agent::SessionUpdateNotification,
+        notification: agent_client_protocol::SessionNotification,
     ) -> crate::Result<()>
     where
         W: AsyncWrite + Unpin + Send + 'static,
@@ -309,7 +309,8 @@ impl ClaudeAgentServer {
             "method": "session/update",
             "params": {
                 "session_id": notification.session_id,
-                "message_chunk": notification.message_chunk
+                "update": notification.update,
+                "meta": notification.meta
             }
         });
 
