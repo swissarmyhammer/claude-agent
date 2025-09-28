@@ -3,9 +3,7 @@
 use crate::{
     claude::ClaudeClient,
     config::AgentConfig,
-    permissions::{
-        FilePermissionStorage, PermissionPolicyEngine, PolicyEvaluation,
-    },
+    permissions::{FilePermissionStorage, PermissionPolicyEngine, PolicyEvaluation},
     plan::{PlanGenerator, PlanManager},
     session::SessionManager,
     tools::ToolCallHandler,
@@ -48,6 +46,63 @@ pub struct PermissionResponse {
     /// The outcome of the permission request
     pub outcome: crate::tools::PermissionOutcome,
 }
+
+/// Agent reasoning phases for thought generation
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum ReasoningPhase {
+    /// Initial analysis of the user's prompt
+    PromptAnalysis,
+    /// Planning the overall strategy and approach
+    StrategyPlanning,
+    /// Selecting appropriate tools for the task
+    ToolSelection,
+    /// Breaking down complex problems into smaller parts
+    ProblemDecomposition,
+    /// Executing the planned approach
+    Execution,
+    /// Evaluating results and determining next steps
+    ResultEvaluation,
+}
+
+/// Agent thought content with contextual information
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentThought {
+    /// The reasoning phase this thought belongs to
+    pub phase: ReasoningPhase,
+    /// Human-readable thought content
+    pub content: String,
+    /// Optional structured context data
+    pub context: Option<serde_json::Value>,
+    /// Timestamp when the thought was generated
+    pub timestamp: SystemTime,
+}
+
+impl AgentThought {
+    /// Create a new agent thought for a specific reasoning phase
+    pub fn new(phase: ReasoningPhase, content: impl Into<String>) -> Self {
+        Self {
+            phase,
+            content: content.into(),
+            context: None,
+            timestamp: SystemTime::now(),
+        }
+    }
+
+    /// Create a new agent thought with additional context
+    pub fn with_context(
+        phase: ReasoningPhase,
+        content: impl Into<String>,
+        context: serde_json::Value,
+    ) -> Self {
+        Self {
+            phase,
+            content: content.into(),
+            context: Some(context),
+            timestamp: SystemTime::now(),
+        }
+    }
+}
+
 use tokio::sync::{broadcast, RwLock};
 use tokio_stream::StreamExt;
 
@@ -982,6 +1037,15 @@ impl ClaudeAgent {
     ) -> Result<PromptResponse, agent_client_protocol::Error> {
         tracing::info!("Handling streaming prompt for session: {}", session_id);
 
+        // Send execution thought
+        let execution_thought = AgentThought::new(
+            ReasoningPhase::Execution,
+            "Executing the planned approach using streaming response generation...",
+        );
+        let _ = self
+            .send_agent_thought(&request.session_id, &execution_thought)
+            .await;
+
         // Extract text content from the prompt
         let mut prompt_text = String::new();
         for content_block in &request.prompt {
@@ -1082,7 +1146,7 @@ impl ClaudeAgent {
         // Store complete response in session
         let assistant_message = crate::session::Message {
             role: crate::session::MessageRole::Assistant,
-            content: full_response,
+            content: full_response.clone(),
             timestamp: std::time::SystemTime::now(),
         };
 
@@ -1091,6 +1155,22 @@ impl ClaudeAgent {
                 session.add_message(assistant_message);
             })
             .map_err(|_| agent_client_protocol::Error::internal_error())?;
+
+        // Send result evaluation thought
+        let result_thought = AgentThought::with_context(
+            ReasoningPhase::ResultEvaluation,
+            format!(
+                "Successfully completed streaming response with {} chunks",
+                chunk_count
+            ),
+            serde_json::json!({
+                "chunks_sent": chunk_count,
+                "response_length": full_response.len()
+            }),
+        );
+        let _ = self
+            .send_agent_thought(&request.session_id, &result_thought)
+            .await;
 
         Ok(PromptResponse {
             stop_reason: StopReason::EndTurn,
@@ -1111,6 +1191,15 @@ impl ClaudeAgent {
         session: &crate::session::Session,
     ) -> Result<PromptResponse, agent_client_protocol::Error> {
         tracing::info!("Handling non-streaming prompt for session: {}", session_id);
+
+        // Send execution thought
+        let execution_thought = AgentThought::new(
+            ReasoningPhase::Execution,
+            "Executing the planned approach using non-streaming response generation...",
+        );
+        let _ = self
+            .send_agent_thought(&request.session_id, &execution_thought)
+            .await;
 
         // Extract text content from the prompt
         let mut prompt_text = String::new();
@@ -1181,6 +1270,22 @@ impl ClaudeAgent {
             })
             .map_err(|_| agent_client_protocol::Error::internal_error())?;
 
+        // Send result evaluation thought
+        let result_thought = AgentThought::with_context(
+            ReasoningPhase::ResultEvaluation,
+            format!(
+                "Successfully completed non-streaming response ({} characters)",
+                response_content.len()
+            ),
+            serde_json::json!({
+                "response_length": response_content.len(),
+                "session_messages": session.context.len() + 1
+            }),
+        );
+        let _ = self
+            .send_agent_thought(&request.session_id, &result_thought)
+            .await;
+
         Ok(PromptResponse {
             stop_reason: StopReason::EndTurn,
             meta: Some(serde_json::json!({
@@ -1195,6 +1300,46 @@ impl ClaudeAgent {
     /// Send session update notification
     async fn send_session_update(&self, notification: SessionNotification) -> crate::Result<()> {
         self.notification_sender.send_update(notification).await
+    }
+
+    /// Send agent thought chunk update for reasoning transparency
+    ///
+    /// ACP agent thought chunks provide reasoning transparency:
+    /// 1. Send agent_thought_chunk updates during internal processing
+    /// 2. Verbalize reasoning steps and decision-making process
+    /// 3. Provide insight into problem analysis and planning
+    /// 4. Enable clients to show agent thinking to users
+    /// 5. Support debugging and understanding of agent behavior
+    ///
+    /// Thought chunks enhance user trust and system transparency.
+    async fn send_agent_thought(
+        &self,
+        session_id: &SessionId,
+        thought: &AgentThought,
+    ) -> crate::Result<()> {
+        let notification = SessionNotification {
+            session_id: session_id.clone(),
+            update: SessionUpdate::AgentThoughtChunk {
+                content: ContentBlock::Text(TextContent {
+                    text: thought.content.clone(),
+                    annotations: None,
+                    meta: Some(serde_json::json!({
+                        "reasoning_phase": thought.phase,
+                        "timestamp": thought.timestamp.duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default().as_secs(),
+                        "context": thought.context
+                    })),
+                }),
+            },
+            meta: None,
+        };
+
+        // Continue processing even if thought sending fails - don't block agent operation
+        if let Err(e) = self.send_session_update(notification).await {
+            tracing::warn!("Failed to send agent thought: {}", e);
+        }
+
+        Ok(())
     }
 
     /// Send plan update notification via session/update for ACP compliance
@@ -1766,6 +1911,15 @@ impl Agent for ClaudeAgent {
         // Parse session ID
         let session_id = self.parse_session_id(&request.session_id)?;
 
+        // Send initial analysis thought
+        let analysis_thought = AgentThought::new(
+            ReasoningPhase::PromptAnalysis,
+            "Analyzing the user's request and determining the best approach...",
+        );
+        let _ = self
+            .send_agent_thought(&request.session_id, &analysis_thought)
+            .await;
+
         // Check if session is already cancelled before processing
         if self
             .cancellation_manager
@@ -1817,6 +1971,30 @@ impl Agent for ClaudeAgent {
             let mut plan_manager = self.plan_manager.write().await;
             plan_manager.set_plan(session_id.to_string(), agent_plan.clone());
         }
+
+        // Send strategy planning thought with plan context
+        let plan_summary = format!(
+            "I'll approach this task with {} steps: {}",
+            agent_plan.entries.len(),
+            agent_plan
+                .entries
+                .iter()
+                .take(3)
+                .map(|entry| entry.content.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let strategy_thought = AgentThought::with_context(
+            ReasoningPhase::StrategyPlanning,
+            plan_summary,
+            serde_json::json!({
+                "plan_entries": agent_plan.entries.len(),
+                "session_id": session_id.to_string()
+            }),
+        );
+        let _ = self
+            .send_agent_thought(&request.session_id, &strategy_thought)
+            .await;
 
         // Send initial plan via session/update notification
         if let Err(e) = self
@@ -3834,5 +4012,197 @@ mod tests {
                 panic!("Should have received notification within timeout");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_agent_thought_creation() {
+        let thought = AgentThought::new(
+            ReasoningPhase::PromptAnalysis,
+            "Analyzing user request for complexity",
+        );
+
+        assert_eq!(thought.phase, ReasoningPhase::PromptAnalysis);
+        assert_eq!(thought.content, "Analyzing user request for complexity");
+        assert!(thought.context.is_none());
+        assert!(thought.timestamp <= SystemTime::now());
+    }
+
+    #[tokio::test]
+    async fn test_agent_thought_with_context() {
+        let context = serde_json::json!({
+            "complexity": "medium",
+            "tools_needed": 3
+        });
+
+        let thought = AgentThought::with_context(
+            ReasoningPhase::StrategyPlanning,
+            "Planning approach with multiple tools",
+            context.clone(),
+        );
+
+        assert_eq!(thought.phase, ReasoningPhase::StrategyPlanning);
+        assert_eq!(thought.content, "Planning approach with multiple tools");
+        assert_eq!(thought.context, Some(context));
+    }
+
+    #[tokio::test]
+    async fn test_reasoning_phase_serialization() {
+        let phases = vec![
+            ReasoningPhase::PromptAnalysis,
+            ReasoningPhase::StrategyPlanning,
+            ReasoningPhase::ToolSelection,
+            ReasoningPhase::ProblemDecomposition,
+            ReasoningPhase::Execution,
+            ReasoningPhase::ResultEvaluation,
+        ];
+
+        for phase in phases {
+            let serialized = serde_json::to_string(&phase).unwrap();
+            let deserialized: ReasoningPhase = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(phase, deserialized);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_agent_thought() {
+        let (agent, mut receiver) = create_test_agent_with_notifications().await;
+        let session_id = SessionId("test_thought_session".to_string().into());
+
+        let thought = AgentThought::new(
+            ReasoningPhase::PromptAnalysis,
+            "Testing agent thought sending",
+        );
+
+        // Send the thought
+        let result = agent.send_agent_thought(&session_id, &thought).await;
+        assert!(result.is_ok());
+
+        // Verify notification was sent
+        tokio::select! {
+            result = receiver.recv() => {
+                assert!(result.is_ok());
+                let notification = result.unwrap();
+                assert_eq!(notification.session_id, session_id);
+
+                // Verify it's an agent thought chunk
+                match notification.update {
+                    SessionUpdate::AgentThoughtChunk { content } => {
+                        match content {
+                            ContentBlock::Text(text_content) => {
+                                assert_eq!(text_content.text, "Testing agent thought sending");
+
+                                // Verify metadata contains reasoning phase
+                                let meta = text_content.meta.unwrap();
+                                assert_eq!(
+                                    meta["reasoning_phase"],
+                                    serde_json::to_value(&ReasoningPhase::PromptAnalysis).unwrap()
+                                );
+                            }
+                            _ => panic!("Expected text content in agent thought chunk"),
+                        }
+                    }
+                    _ => panic!("Expected AgentThoughtChunk, got {:?}", notification.update),
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                panic!("Timeout waiting for agent thought notification");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_agent_thoughts_during_prompt_processing() {
+        let (agent, mut receiver) = create_test_agent_with_notifications().await;
+
+        // Create session
+        let new_session_request = NewSessionRequest {
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![],
+            meta: None,
+        };
+        let session_response = agent.new_session(new_session_request).await.unwrap();
+
+        // Create prompt request
+        let prompt_request = PromptRequest {
+            session_id: session_response.session_id.clone(),
+            prompt: vec![ContentBlock::Text(TextContent {
+                text: "Hello, test this thought generation".to_string(),
+                annotations: None,
+                meta: None,
+            })],
+            meta: None,
+        };
+
+        // Process prompt (this should generate thoughts)
+        let _result = agent.prompt(prompt_request).await;
+
+        // Collect notifications for a brief period
+        let mut thought_notifications = Vec::new();
+        let start = tokio::time::Instant::now();
+
+        while start.elapsed() < tokio::time::Duration::from_millis(200) {
+            tokio::select! {
+                result = receiver.recv() => {
+                    if let Ok(notification) = result {
+                        if matches!(notification.update, SessionUpdate::AgentThoughtChunk { .. }) {
+                            thought_notifications.push(notification);
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {
+                    // Brief pause between checks
+                }
+            }
+        }
+
+        // Verify we received thought notifications
+        assert!(
+            !thought_notifications.is_empty(),
+            "Expected agent thought notifications during prompt processing"
+        );
+
+        // Verify we have analysis and strategy thoughts at minimum
+        let phases: Vec<ReasoningPhase> = thought_notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::AgentThoughtChunk { content } => match content {
+                    ContentBlock::Text(text_content) => text_content
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("reasoning_phase"))
+                        .and_then(|phase| serde_json::from_value(phase.clone()).ok()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            phases.contains(&ReasoningPhase::PromptAnalysis),
+            "Expected PromptAnalysis phase in thoughts"
+        );
+        assert!(
+            phases.contains(&ReasoningPhase::StrategyPlanning),
+            "Expected StrategyPlanning phase in thoughts"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agent_thought_error_handling() {
+        let (agent, _receiver) = create_test_agent_with_notifications().await;
+
+        // Test with invalid session ID format (should not panic)
+        let invalid_session_id = SessionId("".to_string().into());
+        let thought = AgentThought::new(ReasoningPhase::Execution, "Testing error handling");
+
+        // This should not fail even with invalid session ID
+        // (error handling in send_agent_thought should prevent failures)
+        let result = agent
+            .send_agent_thought(&invalid_session_id, &thought)
+            .await;
+        assert!(
+            result.is_ok(),
+            "Agent thought sending should handle errors gracefully"
+        );
     }
 }
