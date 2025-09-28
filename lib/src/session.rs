@@ -21,6 +21,8 @@ pub struct Session {
     pub mcp_servers: Vec<String>,
     /// Working directory for this session (ACP requirement - must be absolute path)
     pub cwd: PathBuf,
+    /// Available commands that can be invoked during this session
+    pub available_commands: Vec<agent_client_protocol::AvailableCommand>,
 }
 
 impl Session {
@@ -51,6 +53,7 @@ impl Session {
             client_capabilities: None,
             mcp_servers: Vec::new(),
             cwd,
+            available_commands: Vec::new(),
         }
     }
 
@@ -63,6 +66,34 @@ impl Session {
     /// Update the last accessed time
     pub fn update_access_time(&mut self) {
         self.last_accessed = SystemTime::now();
+    }
+
+    /// Update available commands for this session
+    pub fn update_available_commands(
+        &mut self,
+        commands: Vec<agent_client_protocol::AvailableCommand>,
+    ) {
+        self.available_commands = commands;
+        self.last_accessed = SystemTime::now();
+    }
+
+    /// Check if available commands have changed from the given set
+    pub fn has_available_commands_changed(
+        &self,
+        new_commands: &[agent_client_protocol::AvailableCommand],
+    ) -> bool {
+        if self.available_commands.len() != new_commands.len() {
+            return true;
+        }
+
+        // Compare each command by name and description
+        for (existing, new) in self.available_commands.iter().zip(new_commands.iter()) {
+            if existing.name != new.name || existing.description != new.description {
+                return true;
+            }
+        }
+
+        false
     }
 }
 
@@ -210,6 +241,37 @@ impl SessionManager {
             .map_err(|_| crate::AgentError::Session("Failed to acquire read lock".to_string()))?;
 
         Ok(sessions.len())
+    }
+
+    /// Update available commands for a session and return whether an update was sent
+    /// Returns true if commands changed and update was needed, false if no change
+    pub fn update_available_commands(
+        &self,
+        session_id: &SessionId,
+        commands: Vec<agent_client_protocol::AvailableCommand>,
+    ) -> crate::Result<bool> {
+        let mut sessions = self
+            .sessions
+            .write()
+            .map_err(|_| crate::AgentError::Session("Failed to acquire write lock".to_string()))?;
+
+        if let Some(session) = sessions.get_mut(session_id) {
+            let commands_changed = session.has_available_commands_changed(&commands);
+            if commands_changed {
+                session.update_available_commands(commands);
+                tracing::debug!("Updated available commands for session: {}", session_id);
+                Ok(true)
+            } else {
+                tracing::trace!("Available commands unchanged for session: {}", session_id);
+                Ok(false)
+            }
+        } else {
+            tracing::warn!(
+                "Attempted to update commands for non-existent session: {}",
+                session_id
+            );
+            Ok(false)
+        }
     }
 
     /// Start the cleanup task that removes expired sessions
@@ -627,5 +689,102 @@ mod tests {
         } else {
             panic!("Expected Session error for non-existent directory");
         }
+    }
+
+    #[test]
+    fn test_session_has_available_commands_field() {
+        let session_id = Ulid::new();
+        let cwd = std::env::current_dir().unwrap();
+        let session = Session::new(session_id, cwd);
+
+        // Session should have an available_commands field
+        assert_eq!(session.available_commands.len(), 0);
+    }
+
+    #[test]
+    fn test_session_update_available_commands() {
+        let session_id = Ulid::new();
+        let cwd = std::env::current_dir().unwrap();
+        let mut session = Session::new(session_id, cwd);
+
+        let commands = vec![
+            agent_client_protocol::AvailableCommand {
+                name: "create_plan".to_string(),
+                description: "Create an execution plan for complex tasks".to_string(),
+                input: None,
+                meta: None,
+            },
+            agent_client_protocol::AvailableCommand {
+                name: "research_codebase".to_string(),
+                description: "Research and analyze the codebase structure".to_string(),
+                input: None,
+                meta: None,
+            },
+        ];
+
+        session.update_available_commands(commands.clone());
+        assert_eq!(session.available_commands.len(), 2);
+        assert_eq!(session.available_commands[0].name, "create_plan");
+        assert_eq!(session.available_commands[1].name, "research_codebase");
+    }
+
+    #[test]
+    fn test_session_detect_available_commands_changes() {
+        let session_id = Ulid::new();
+        let cwd = std::env::current_dir().unwrap();
+        let mut session = Session::new(session_id, cwd);
+
+        let initial_commands = vec![agent_client_protocol::AvailableCommand {
+            name: "create_plan".to_string(),
+            description: "Create an execution plan for complex tasks".to_string(),
+            input: None,
+            meta: None,
+        }];
+
+        // Set initial commands
+        session.update_available_commands(initial_commands.clone());
+        assert!(!session.has_available_commands_changed(&initial_commands));
+
+        // Change commands - should detect difference
+        let updated_commands = vec![agent_client_protocol::AvailableCommand {
+            name: "research_codebase".to_string(),
+            description: "Research and analyze the codebase structure".to_string(),
+            input: None,
+            meta: None,
+        }];
+
+        assert!(session.has_available_commands_changed(&updated_commands));
+    }
+
+    #[test]
+    fn test_session_manager_send_available_commands_update() {
+        let manager = SessionManager::new();
+        let cwd = std::env::current_dir().unwrap();
+        let session_id = manager.create_session(cwd).unwrap();
+
+        let commands = vec![agent_client_protocol::AvailableCommand {
+            name: "create_plan".to_string(),
+            description: "Create an execution plan for complex tasks".to_string(),
+            input: None,
+            meta: None,
+        }];
+
+        // This should update session and return whether an update was sent
+        let update_sent = manager
+            .update_available_commands(&session_id, commands)
+            .unwrap();
+        assert!(update_sent);
+
+        // Same commands again - should not send update
+        let commands = vec![agent_client_protocol::AvailableCommand {
+            name: "create_plan".to_string(),
+            description: "Create an execution plan for complex tasks".to_string(),
+            input: None,
+            meta: None,
+        }];
+        let update_sent = manager
+            .update_available_commands(&session_id, commands)
+            .unwrap();
+        assert!(!update_sent);
     }
 }

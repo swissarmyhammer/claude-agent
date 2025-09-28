@@ -1402,6 +1402,37 @@ impl ClaudeAgent {
         self.send_session_update(notification).await
     }
 
+    /// Send available commands update notification
+    ///
+    /// Sends available commands update via SessionUpdate::AvailableCommandsUpdate
+    /// when command availability changes during session execution.
+    pub async fn send_available_commands_update(
+        &self,
+        session_id: &SessionId,
+        commands: Vec<agent_client_protocol::AvailableCommand>,
+    ) -> crate::Result<()> {
+        let notification = SessionNotification {
+            session_id: session_id.clone(),
+            update: SessionUpdate::AvailableCommandsUpdate {
+                available_commands: commands,
+            },
+            meta: Some(serde_json::json!({
+                "update_type": "available_commands",
+                "session_id": session_id,
+                "timestamp": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            })),
+        };
+
+        tracing::debug!(
+            "Sending available commands update for session: {}",
+            session_id
+        );
+        self.send_session_update(notification).await
+    }
+
     /// Update plan entry status and send notification
     pub async fn update_plan_entry_status(
         &self,
@@ -1493,6 +1524,82 @@ impl ClaudeAgent {
         if let Some(_removed_plan) = plan_manager.remove_plan(session_id) {
             tracing::debug!("Cleaned up plan for session: {}", session_id);
         }
+    }
+
+    /// Update available commands for a session and send notification if changed
+    ///
+    /// This method updates the session's available commands and sends an
+    /// AvailableCommandsUpdate notification if the commands have changed.
+    /// Returns true if an update was sent, false if commands were unchanged.
+    pub async fn update_session_available_commands(
+        &self,
+        session_id: &SessionId,
+        commands: Vec<agent_client_protocol::AvailableCommand>,
+    ) -> crate::Result<bool> {
+        // Convert SessionId to internal Ulid format
+        let session_ulid = ulid::Ulid::from_string(&session_id.0)
+            .map_err(|_| crate::AgentError::Session("Invalid session ID format".to_string()))?;
+
+        // Update commands in session manager
+        let commands_changed = self
+            .session_manager
+            .update_available_commands(&session_ulid, commands.clone())?;
+
+        // Send notification if commands changed
+        if commands_changed {
+            self.send_available_commands_update(session_id, commands.clone())
+                .await?;
+            tracing::info!(
+                "Sent available commands update for session: {} ({} commands)",
+                session_id,
+                commands.len()
+            );
+        }
+
+        Ok(commands_changed)
+    }
+
+    /// Get available commands for a session
+    ///
+    /// This method determines what commands are available for the given session
+    /// based on capabilities, MCP servers, and current session state.
+    async fn get_available_commands_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Vec<agent_client_protocol::AvailableCommand> {
+        let mut commands = Vec::new();
+
+        // Always available core commands
+        commands.push(agent_client_protocol::AvailableCommand {
+            name: "create_plan".to_string(),
+            description: "Create an execution plan for complex tasks".to_string(),
+            input: None,
+            meta: Some(serde_json::json!({
+                "category": "planning",
+                "source": "core"
+            })),
+        });
+
+        commands.push(agent_client_protocol::AvailableCommand {
+            name: "research_codebase".to_string(),
+            description: "Research and analyze the codebase structure".to_string(),
+            input: None,
+            meta: Some(serde_json::json!({
+                "category": "analysis",
+                "source": "core"
+            })),
+        });
+
+        // TODO: Add commands from MCP servers for this session
+        // TODO: Add commands from tool handler based on capabilities
+        // TODO: Add commands from permission engine (available vs restricted)
+
+        tracing::debug!(
+            "Generated {} available commands for session {}",
+            commands.len(),
+            session_id
+        );
+        commands
     }
 
     /// Cancel ongoing Claude API requests for a session
@@ -1737,6 +1844,22 @@ impl Agent for ClaudeAgent {
         }
 
         tracing::info!("Created session: {}", session_id);
+
+        // Send initial available commands after session creation
+        let protocol_session_id = SessionId(session_id.to_string().into());
+        let initial_commands = self
+            .get_available_commands_for_session(&protocol_session_id)
+            .await;
+        if let Err(e) = self
+            .update_session_available_commands(&protocol_session_id, initial_commands)
+            .await
+        {
+            tracing::warn!(
+                "Failed to send initial available commands for session {}: {}",
+                session_id,
+                e
+            );
+        }
 
         let response = NewSessionResponse {
             session_id: SessionId(session_id.to_string().into()),
@@ -2278,6 +2401,7 @@ mod tests {
     use super::*;
     // Import specific types as needed
     use std::sync::Arc;
+    use tokio::time::Duration;
 
     async fn create_test_agent() -> ClaudeAgent {
         let config = AgentConfig::default();
@@ -4203,6 +4327,119 @@ mod tests {
         assert!(
             result.is_ok(),
             "Agent thought sending should handle errors gracefully"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_available_commands_integration_flow() {
+        let (agent, mut notification_receiver) = create_test_agent_with_notifications().await;
+
+        // Create a session
+        let cwd = std::env::current_dir().unwrap();
+        let new_session_request = NewSessionRequest {
+            cwd,
+            mcp_servers: vec![],
+            meta: None,
+        };
+
+        let session_response = agent.new_session(new_session_request).await.unwrap();
+        let session_id = session_response.session_id;
+
+        // Should receive initial available commands update
+        let notification =
+            tokio::time::timeout(Duration::from_millis(1000), notification_receiver.recv()).await;
+
+        assert!(
+            notification.is_ok(),
+            "Should receive initial available commands notification"
+        );
+        let notification = notification.unwrap().unwrap();
+
+        // Verify it's an available commands update
+        assert_eq!(notification.session_id, session_id);
+        match notification.update {
+            SessionUpdate::AvailableCommandsUpdate { available_commands } => {
+                assert!(
+                    !available_commands.is_empty(),
+                    "Should have initial commands"
+                );
+                assert!(
+                    available_commands
+                        .iter()
+                        .any(|cmd| cmd.name == "create_plan"),
+                    "Should include create_plan command"
+                );
+                assert!(
+                    available_commands
+                        .iter()
+                        .any(|cmd| cmd.name == "research_codebase"),
+                    "Should include research_codebase command"
+                );
+            }
+            _ => panic!(
+                "Expected AvailableCommandsUpdate, got: {:?}",
+                notification.update
+            ),
+        }
+
+        // Test updating commands for the session
+        let updated_commands = vec![agent_client_protocol::AvailableCommand {
+            name: "new_command".to_string(),
+            description: "A newly available command".to_string(),
+            input: None,
+            meta: Some(serde_json::json!({
+                "category": "testing",
+                "source": "test"
+            })),
+        }];
+
+        let update_sent = agent
+            .update_session_available_commands(&session_id, updated_commands.clone())
+            .await
+            .unwrap();
+        assert!(update_sent, "Update should be sent for changed commands");
+
+        // Should receive update notification
+        let notification =
+            tokio::time::timeout(Duration::from_millis(1000), notification_receiver.recv()).await;
+
+        assert!(
+            notification.is_ok(),
+            "Should receive updated commands notification"
+        );
+        let notification = notification.unwrap().unwrap();
+
+        match notification.update {
+            SessionUpdate::AvailableCommandsUpdate { available_commands } => {
+                assert_eq!(available_commands.len(), 1);
+                assert_eq!(available_commands[0].name, "new_command");
+                assert_eq!(
+                    available_commands[0].description,
+                    "A newly available command"
+                );
+            }
+            _ => panic!(
+                "Expected AvailableCommandsUpdate, got: {:?}",
+                notification.update
+            ),
+        }
+
+        // Test that identical commands don't send an update
+        let no_update_sent = agent
+            .update_session_available_commands(&session_id, updated_commands)
+            .await
+            .unwrap();
+        assert!(
+            !no_update_sent,
+            "Should not send update for unchanged commands"
+        );
+
+        // Verify no additional notification is sent
+        let no_notification =
+            tokio::time::timeout(Duration::from_millis(100), notification_receiver.recv()).await;
+        assert!(
+            no_notification.is_err(),
+            "Should not receive notification for unchanged commands"
         );
     }
 }
