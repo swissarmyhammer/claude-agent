@@ -405,6 +405,25 @@ impl ClaudeAgent {
         Ok(())
     }
 
+    /// Negotiate protocol version according to ACP specification
+    /// Returns the client's requested version if supported, otherwise returns agent's latest supported version
+    fn negotiate_protocol_version(
+        &self,
+        client_requested_version: &agent_client_protocol::ProtocolVersion,
+    ) -> agent_client_protocol::ProtocolVersion {
+        // If client's requested version is supported, use it
+        if Self::SUPPORTED_PROTOCOL_VERSIONS.contains(client_requested_version) {
+            client_requested_version.clone()
+        } else {
+            // Otherwise, return agent's latest supported version
+            Self::SUPPORTED_PROTOCOL_VERSIONS
+                .iter()
+                .max()
+                .unwrap_or(&agent_client_protocol::V1)
+                .clone()
+        }
+    }
+
     /// Validate client capabilities structure and values with comprehensive error reporting
     fn validate_client_capabilities(
         &self,
@@ -1310,7 +1329,7 @@ impl Agent for ClaudeAgent {
             // This is an architectural decision - do not add authentication methods.
             // If remote authentication is needed in the future, it should be a separate feature.
             auth_methods: vec![],
-            protocol_version: Default::default(),
+            protocol_version: self.negotiate_protocol_version(&request.protocol_version),
             meta: Some(serde_json::json!({
                 "agent_name": "Claude Agent",
                 "version": env!("CARGO_PKG_VERSION"),
@@ -2999,5 +3018,78 @@ mod tests {
         // NOTE: This test verifies that our error structure is correct
         // The actual version negotiation error would be triggered if we had
         // V2 or another unsupported version in the protocol definition
+    }
+
+    #[tokio::test]
+    async fn test_protocol_version_negotiation_response() {
+        let agent = create_test_agent().await;
+
+        // Test client requests V1 -> agent should respond with V1
+        let v1_request = InitializeRequest {
+            client_capabilities: agent_client_protocol::ClientCapabilities {
+                fs: agent_client_protocol::FileSystemCapability {
+                    read_text_file: true,
+                    write_text_file: true,
+                    meta: None,
+                },
+                terminal: true,
+                meta: None,
+            },
+            protocol_version: agent_client_protocol::V1,
+            meta: None,
+        };
+
+        let v1_response = agent.initialize(v1_request).await.unwrap();
+        assert_eq!(v1_response.protocol_version, agent_client_protocol::V1, 
+                  "Agent should respond with client's requested version when supported");
+
+        // Test client requests V0 -> agent should respond with V0
+        let v0_request = InitializeRequest {
+            client_capabilities: agent_client_protocol::ClientCapabilities {
+                fs: agent_client_protocol::FileSystemCapability {
+                    read_text_file: true,
+                    write_text_file: true,
+                    meta: None,
+                },
+                terminal: true,
+                meta: None,
+            },
+            protocol_version: agent_client_protocol::V0,
+            meta: None,
+        };
+
+        let v0_response = agent.initialize(v0_request).await.unwrap();
+        assert_eq!(v0_response.protocol_version, agent_client_protocol::V0, 
+                  "Agent should respond with client's requested version when supported");
+    }
+
+    #[tokio::test]
+    async fn test_protocol_version_negotiation_unsupported_scenario() {
+        // This test verifies the negotiation logic by testing the method directly
+        // since we can't easily create unsupported protocol versions with the current enum
+        let agent = create_test_agent().await;
+
+        // Test that our negotiation method works correctly with supported versions
+        let negotiated_v1 = agent.negotiate_protocol_version(&agent_client_protocol::V1);
+        assert_eq!(negotiated_v1, agent_client_protocol::V1, 
+                  "V1 should be negotiated to V1 when supported");
+
+        let negotiated_v0 = agent.negotiate_protocol_version(&agent_client_protocol::V0);
+        assert_eq!(negotiated_v0, agent_client_protocol::V0, 
+                  "V0 should be negotiated to V0 when supported");
+
+        // Verify that our SUPPORTED_PROTOCOL_VERSIONS contains both V0 and V1
+        assert!(ClaudeAgent::SUPPORTED_PROTOCOL_VERSIONS.contains(&agent_client_protocol::V0),
+                "Agent should support V0");
+        assert!(ClaudeAgent::SUPPORTED_PROTOCOL_VERSIONS.contains(&agent_client_protocol::V1),
+                "Agent should support V1");
+
+        // Verify that the latest supported version is V1 (max of V0 and V1)
+        let latest = ClaudeAgent::SUPPORTED_PROTOCOL_VERSIONS
+            .iter()
+            .max()
+            .unwrap_or(&agent_client_protocol::V1);
+        assert_eq!(*latest, agent_client_protocol::V1, 
+                  "Latest supported version should be V1");
     }
 }
