@@ -4,7 +4,7 @@
 //! with external MCP servers to extend the agent's tool capabilities beyond
 //! the built-in file system and terminal operations.
 
-use crate::{config::McpServerConfig, tools::InternalToolRequest};
+use crate::{config::McpServerConfig, error::McpError, tools::InternalToolRequest};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -98,6 +98,11 @@ impl McpServerManager {
                 let mut command = Command::new(&stdio_config.command);
                 command.args(&stdio_config.args);
 
+                // Set working directory if provided
+                if let Some(cwd) = &stdio_config.cwd {
+                    command.current_dir(cwd);
+                }
+
                 // Set environment variables
                 for env_var in &stdio_config.env {
                     command.env(&env_var.name, &env_var.value);
@@ -108,24 +113,11 @@ impl McpServerManager {
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
                     .spawn()
-                    .map_err(|e| {
-                        crate::AgentError::ToolExecution(format!(
-                            "Failed to start MCP server {}: {}",
-                            stdio_config.name, e
-                        ))
-                    })?;
+                    .map_err(|e| McpError::ProcessSpawnFailed(stdio_config.name.clone(), e))?;
 
                 // Get stdio handles
-                let stdin = child.stdin.take().ok_or_else(|| {
-                    crate::AgentError::ToolExecution(
-                        "Failed to get stdin for MCP server".to_string(),
-                    )
-                })?;
-                let stdout = child.stdout.take().ok_or_else(|| {
-                    crate::AgentError::ToolExecution(
-                        "Failed to get stdout for MCP server".to_string(),
-                    )
-                })?;
+                let stdin = child.stdin.take().ok_or(McpError::StdinNotAvailable)?;
+                let stdout = child.stdout.take().ok_or(McpError::StdoutNotAvailable)?;
 
                 let mut stdin_writer = BufWriter::new(stdin);
                 let mut stdout_reader = BufReader::new(stdout);
@@ -284,25 +276,17 @@ impl McpServerManager {
 
         // Read initialize response
         let mut response_line = String::new();
-        let bytes_read = reader.read_line(&mut response_line).await.map_err(|e| {
-            crate::AgentError::ToolExecution(format!(
-                "Failed to read initialize response from MCP server: {}",
-                e
-            ))
-        })?;
+        let bytes_read = reader
+            .read_line(&mut response_line)
+            .await
+            .map_err(McpError::IoError)?;
 
         if bytes_read == 0 {
-            return Err(crate::AgentError::ToolExecution(
-                "MCP server closed connection during initialization".to_string(),
-            ));
+            return Err(McpError::ConnectionClosed.into());
         }
 
-        let response: Value = serde_json::from_str(response_line.trim()).map_err(|e| {
-            crate::AgentError::ToolExecution(format!(
-                "Invalid JSON from MCP server during initialization: {}",
-                e
-            ))
-        })?;
+        let response: Value =
+            serde_json::from_str(response_line.trim()).map_err(McpError::SerializationFailed)?;
 
         // Extract available tools from response
         let _tools = self.extract_tools_from_initialize_response(&response)?;
@@ -547,7 +531,7 @@ impl McpServerManager {
     ) -> crate::Result<String> {
         let connections = self.connections.read().await;
         let connection = connections.get(server_name).ok_or_else(|| {
-            crate::AgentError::ToolExecution(format!("MCP server {} not found", server_name))
+            McpError::InvalidConfiguration(format!("MCP server '{}' not found", server_name))
         })?;
 
         // Send tool call to the server
@@ -588,58 +572,32 @@ impl McpServerManager {
             } => {
                 // Get writer and reader
                 let mut writer_guard = stdin_writer.write().await;
-                let writer = writer_guard.as_mut().ok_or_else(|| {
-                    crate::AgentError::ToolExecution(
-                        "MCP server stdin writer not available".to_string(),
-                    )
-                })?;
+                let writer = writer_guard.as_mut().ok_or(McpError::StdinNotAvailable)?;
 
                 let mut reader_guard = stdout_reader.write().await;
-                let reader = reader_guard.as_mut().ok_or_else(|| {
-                    crate::AgentError::ToolExecution(
-                        "MCP server stdout reader not available".to_string(),
-                    )
-                })?;
+                let reader = reader_guard.as_mut().ok_or(McpError::StdoutNotAvailable)?;
 
                 // Send request
                 let request_line = format!("{}\n", mcp_request);
                 writer
                     .write_all(request_line.as_bytes())
                     .await
-                    .map_err(|e| {
-                        crate::AgentError::ToolExecution(format!(
-                            "Failed to write tool call request to MCP server: {}",
-                            e
-                        ))
-                    })?;
-                writer.flush().await.map_err(|e| {
-                    crate::AgentError::ToolExecution(format!(
-                        "Failed to flush tool call request to MCP server: {}",
-                        e
-                    ))
-                })?;
+                    .map_err(McpError::IoError)?;
+                writer.flush().await.map_err(McpError::IoError)?;
 
                 // Read response
                 let mut response_line = String::new();
-                let bytes_read = reader.read_line(&mut response_line).await.map_err(|e| {
-                    crate::AgentError::ToolExecution(format!(
-                        "Failed to read tool call response from MCP server: {}",
-                        e
-                    ))
-                })?;
+                let bytes_read = reader
+                    .read_line(&mut response_line)
+                    .await
+                    .map_err(McpError::IoError)?;
 
                 if bytes_read == 0 {
-                    return Err(crate::AgentError::ToolExecution(
-                        "MCP server closed connection during tool call".to_string(),
-                    ));
+                    return Err(McpError::ConnectionClosed.into());
                 }
 
-                let response: Value = serde_json::from_str(response_line.trim()).map_err(|e| {
-                    crate::AgentError::ToolExecution(format!(
-                        "Invalid JSON from MCP server tool call response: {}",
-                        e
-                    ))
-                })?;
+                let response: Value = serde_json::from_str(response_line.trim())
+                    .map_err(McpError::SerializationFailed)?;
 
                 Ok(response)
             }
@@ -658,7 +616,7 @@ impl McpServerManager {
                     })?;
 
                 let response_json: Value = response.json().await.map_err(|e| {
-                    crate::AgentError::ToolExecution(format!(
+                    McpError::ProtocolError(format!(
                         "Failed to parse HTTP tool call response from MCP server: {}",
                         e
                     ))
@@ -695,19 +653,10 @@ impl McpServerManager {
         }
 
         if let Some(error) = response.get("error") {
-            let error_message = error
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("Unknown MCP error");
-            return Err(crate::AgentError::ToolExecution(format!(
-                "MCP server error: {}",
-                error_message
-            )));
+            return Err(McpError::ServerError(error.clone()).into());
         }
 
-        Err(crate::AgentError::ToolExecution(
-            "Invalid MCP server response: no result or error".to_string(),
-        ))
+        Err(McpError::MissingResult.into())
     }
 
     /// List all available tools from all connected MCP servers
@@ -818,6 +767,7 @@ mod tests {
             command: "nonexistent_command_12345".to_string(),
             args: vec![],
             env: vec![],
+            cwd: None,
         });
 
         // Should succeed but log errors for individual server failures
@@ -932,10 +882,9 @@ mod tests {
 
         let result = manager.process_tool_call_response(&response);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("MCP server error: File not found"));
+        let error_message = result.unwrap_err().to_string();
+        assert!(error_message.contains("MCP server error:"));
+        assert!(error_message.contains("File not found"));
     }
 
     #[test]
@@ -984,6 +933,7 @@ mod tests {
                 name: "TEST_VAR".to_string(),
                 value: "test_value".to_string(),
             }],
+            cwd: None,
         });
 
         // Should fail gracefully and log errors
@@ -1052,6 +1002,7 @@ mod tests {
             command: "/bin/echo".to_string(),
             args: vec!["hello".to_string()],
             env: vec![],
+            cwd: None,
         });
 
         let http_config = McpServerConfig::Http(crate::config::HttpTransport {
@@ -1085,6 +1036,7 @@ mod tests {
             command: String::new(),
             args: vec![],
             env: vec![],
+            cwd: None,
         };
         assert!(invalid_stdio.validate().is_err());
 
@@ -1115,6 +1067,7 @@ mod tests {
                 name: String::new(),
                 value: "value".to_string(),
             }],
+            cwd: None,
         };
         assert!(invalid_stdio_env.validate().is_err());
 
@@ -1179,6 +1132,7 @@ mod tests {
                     name: "TRANSPORT".to_string(),
                     value: "stdio".to_string(),
                 }],
+                cwd: None,
             }),
             // Note: HTTP and SSE will likely fail to connect in tests
             // but the manager should handle this gracefully

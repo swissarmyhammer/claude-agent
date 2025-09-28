@@ -80,9 +80,9 @@ pub struct CancellationManager {
 }
 
 impl CancellationManager {
-    /// Create a new cancellation manager
-    pub fn new() -> (Self, broadcast::Receiver<String>) {
-        let (sender, receiver) = broadcast::channel(100);
+    /// Create a new cancellation manager with configurable buffer size
+    pub fn new(buffer_size: usize) -> (Self, broadcast::Receiver<String>) {
+        let (sender, receiver) = broadcast::channel(buffer_size);
         (
             Self {
                 cancellation_states: Arc::new(RwLock::new(HashMap::new())),
@@ -299,7 +299,7 @@ impl ClaudeAgent {
         };
 
         // Create cancellation manager for session cancellation support
-        let (cancellation_manager, _cancellation_receiver) = CancellationManager::new();
+        let (cancellation_manager, _cancellation_receiver) = CancellationManager::new(config.cancellation_buffer_size);
 
         let agent = Self {
             session_manager,
@@ -1125,65 +1125,59 @@ impl ClaudeAgent {
     }
 
     /// Cancel ongoing Claude API requests for a session
+    /// 
+    /// Note: This is a minimal implementation that registers cancellation state.
+    /// Individual request cancellation is not yet implemented as the ClaudeClient
+    /// doesn't currently track requests by session. The cancellation state is
+    /// checked before making new requests to prevent further API calls.
     async fn cancel_claude_requests(&self, session_id: &str) {
         tracing::debug!("Cancelling Claude API requests for session: {}", session_id);
 
-        // Currently the ClaudeClient doesn't track individual requests
-        // In a future enhancement, we would:
-        // 1. Track ongoing requests by session ID
-        // 2. Cancel HTTP requests using cancellation tokens
-        // 3. Handle partial responses appropriately
-        //
-        // For now, we mark the cancellation and let the prompt method
-        // detect cancellation state before making new requests
+        // Register cancellation state to prevent new requests
+        self.cancellation_manager
+            .add_cancelled_operation(session_id, "claude_requests".to_string())
+            .await;
 
         tracing::debug!(
-            "Claude API request cancellation completed for session: {}",
+            "Claude API request cancellation registered for session: {}",
             session_id
         );
     }
 
     /// Cancel ongoing tool executions for a session  
+    /// 
+    /// Note: This is a minimal implementation that registers cancellation state.
+    /// Individual tool execution cancellation is not yet implemented as the
+    /// ToolCallHandler doesn't track executions by session. The cancellation
+    /// state prevents new tool calls from being initiated.
     async fn cancel_tool_executions(&self, session_id: &str) {
         tracing::debug!("Cancelling tool executions for session: {}", session_id);
 
-        // Currently the ToolCallHandler doesn't track requests by session
-        // In a future enhancement, we would:
-        // 1. Track tool executions by session ID
-        // 2. Cancel background processes and operations
-        // 3. Send tool_call_update notifications with cancelled status
-        //
-        // For now, we add cancelled operations to the cancellation manager
-        // so future tool calls can be prevented
-
         self.cancellation_manager
-            .add_cancelled_operation(session_id, "all_tool_executions".to_string())
+            .add_cancelled_operation(session_id, "tool_executions".to_string())
             .await;
 
         tracing::debug!(
-            "Tool execution cancellation completed for session: {}",
+            "Tool execution cancellation registered for session: {}",
             session_id
         );
     }
 
     /// Cancel pending permission requests for a session
+    /// 
+    /// Note: This is a minimal implementation that registers cancellation state.
+    /// Individual permission request cancellation is not yet implemented as
+    /// permission requests are not currently tracked by session. The cancellation
+    /// state prevents new permission requests from being initiated.
     async fn cancel_permission_requests(&self, session_id: &str) {
         tracing::debug!("Cancelling permission requests for session: {}", session_id);
 
-        // Currently we don't track permission requests by session
-        // In a future enhancement, we would:
-        // 1. Track pending permission requests by session ID
-        // 2. Respond to pending requests with 'cancelled' outcome
-        // 3. Clean up permission request state
-        //
-        // For now, we mark permission requests as cancelled
-
         self.cancellation_manager
-            .add_cancelled_operation(session_id, "all_permission_requests".to_string())
+            .add_cancelled_operation(session_id, "permission_requests".to_string())
             .await;
 
         tracing::debug!(
-            "Permission request cancellation completed for session: {}",
+            "Permission request cancellation registered for session: {}",
             session_id
         );
     }
@@ -1672,6 +1666,48 @@ mod tests {
         assert!(response.meta.is_some());
         // Protocol version should be the default value
         assert_eq!(response.protocol_version, Default::default());
+    }
+
+    #[tokio::test]
+    async fn test_initialize_mcp_capabilities() {
+        let agent = create_test_agent().await;
+
+        let request = InitializeRequest {
+            client_capabilities: agent_client_protocol::ClientCapabilities {
+                fs: agent_client_protocol::FileSystemCapability {
+                    read_text_file: true,
+                    write_text_file: true,
+                    meta: None,
+                },
+                terminal: true,
+                meta: Some(serde_json::json!({"streaming": true})),
+            },
+            protocol_version: Default::default(),
+            meta: None,
+        };
+
+        let response = agent.initialize(request).await.unwrap();
+
+        // Verify MCP capabilities are declared according to ACP specification
+        assert!(
+            response.agent_capabilities.mcp_capabilities.http,
+            "MCP HTTP transport should be enabled"
+        );
+        assert!(
+            !response.agent_capabilities.mcp_capabilities.sse,
+            "MCP SSE transport should be disabled (deprecated)"
+        );
+
+        // Verify the structure matches ACP specification requirements
+        // The MCP capabilities should be present in the agent_capabilities field
+        assert!(response.agent_capabilities.meta.is_some());
+
+        // Verify that meta field contains tools information since we have MCP support
+        let meta = response.agent_capabilities.meta.as_ref().unwrap();
+        assert!(
+            meta.get("tools").is_some(),
+            "Agent capabilities should declare available tools"
+        );
     }
 
     #[tokio::test]

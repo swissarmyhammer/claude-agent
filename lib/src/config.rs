@@ -12,6 +12,11 @@ fn default_notification_buffer_size() -> usize {
     1000
 }
 
+/// Default value for cancellation_buffer_size
+fn default_cancellation_buffer_size() -> usize {
+    100
+}
+
 /// Main configuration structure for the Claude Agent
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentConfig {
@@ -25,6 +30,9 @@ pub struct AgentConfig {
     /// Buffer size for notification broadcast channel (default: 1,000)
     #[serde(default = "default_notification_buffer_size")]
     pub notification_buffer_size: usize,
+    /// Buffer size for cancellation broadcast channel (default: 100)
+    #[serde(default = "default_cancellation_buffer_size")]
+    pub cancellation_buffer_size: usize,
 }
 
 /// Configuration for Claude SDK integration
@@ -71,6 +79,8 @@ pub struct StdioTransport {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: Vec<EnvVariable>,
+    /// Optional working directory for the MCP server process
+    pub cwd: Option<String>,
 }
 
 /// HTTP transport configuration
@@ -149,6 +159,31 @@ impl StdioTransport {
                 "MCP server '{}' command cannot be empty",
                 self.name
             )));
+        }
+
+        // Validate working directory if provided
+        if let Some(cwd) = &self.cwd {
+            if cwd.is_empty() {
+                return Err(crate::error::AgentError::Config(format!(
+                    "MCP server '{}' working directory cannot be empty",
+                    self.name
+                )));
+            }
+
+            let cwd_path = std::path::Path::new(cwd);
+            if !cwd_path.exists() {
+                return Err(crate::error::AgentError::Config(format!(
+                    "MCP server '{}' working directory does not exist: {}",
+                    self.name, cwd
+                )));
+            }
+
+            if !cwd_path.is_dir() {
+                return Err(crate::error::AgentError::Config(format!(
+                    "MCP server '{}' working directory is not a directory: {}",
+                    self.name, cwd
+                )));
+            }
         }
 
         // Validate environment variables
@@ -305,6 +340,7 @@ impl Default for AgentConfig {
             mcp_servers: vec![],
             max_prompt_length: 100_000,
             notification_buffer_size: 1000,
+            cancellation_buffer_size: 100,
         }
     }
 }
@@ -422,6 +458,7 @@ mod tests {
                 command: "test".to_string(),
                 args: vec![],
                 env: vec![],
+                cwd: None,
             }));
 
         let result = config.validate();
@@ -442,6 +479,7 @@ mod tests {
                 command: String::new(),
                 args: vec![],
                 env: vec![],
+                cwd: None,
             }));
 
         let result = config.validate();
@@ -560,6 +598,7 @@ mod tests {
                 name: "API_KEY".to_string(),
                 value: "secret123".to_string(),
             }],
+            cwd: None,
         };
         assert!(stdio.validate().is_ok());
 
@@ -569,6 +608,7 @@ mod tests {
             command: "/path/to/server".to_string(),
             args: vec![],
             env: vec![],
+            cwd: None,
         };
         assert!(invalid_stdio.validate().is_err());
 
@@ -578,6 +618,7 @@ mod tests {
             command: String::new(),
             args: vec![],
             env: vec![],
+            cwd: None,
         };
         assert!(invalid_stdio.validate().is_err());
 
@@ -590,8 +631,39 @@ mod tests {
                 name: String::new(),
                 value: "value".to_string(),
             }],
+            cwd: None,
         };
         assert!(invalid_stdio.validate().is_err());
+
+        // Test working directory validation
+        let stdio_with_cwd = StdioTransport {
+            name: "test".to_string(),
+            command: "/bin/echo".to_string(),
+            args: vec![],
+            env: vec![],
+            cwd: Some(".".to_string()), // Current directory should exist
+        };
+        assert!(stdio_with_cwd.validate().is_ok());
+
+        // Test invalid working directory
+        let stdio_invalid_cwd = StdioTransport {
+            name: "test".to_string(),
+            command: "/bin/echo".to_string(),
+            args: vec![],
+            env: vec![],
+            cwd: Some("/nonexistent/directory/path".to_string()),
+        };
+        assert!(stdio_invalid_cwd.validate().is_err());
+
+        // Test empty working directory
+        let stdio_empty_cwd = StdioTransport {
+            name: "test".to_string(),
+            command: "/bin/echo".to_string(),
+            args: vec![],
+            env: vec![],
+            cwd: Some(String::new()),
+        };
+        assert!(stdio_empty_cwd.validate().is_err());
     }
 
     #[test]
@@ -677,6 +749,7 @@ mod tests {
             command: "/path/to/server".to_string(),
             args: vec![],
             env: vec![],
+            cwd: None,
         });
 
         let http_config = McpServerConfig::Http(HttpTransport {
