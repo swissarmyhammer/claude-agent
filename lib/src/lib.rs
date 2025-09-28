@@ -5,13 +5,19 @@
 //! to interact with Claude Code.
 
 pub mod agent;
+pub mod capability_validation;
 pub mod claude;
 pub mod config;
 pub mod error;
 pub mod mcp;
+pub mod mcp_error_handling;
 pub mod path_validator;
+pub mod request_validation;
 pub mod server;
 pub mod session;
+pub mod session_errors;
+pub mod session_loading;
+pub mod session_validation;
 pub mod tools;
 
 pub use agent::ClaudeAgent;

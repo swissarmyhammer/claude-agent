@@ -1,0 +1,524 @@
+//! Capability validation for ACP session setup operations
+//!
+//! This module provides comprehensive validation of agent and client capabilities
+//! ensuring ACP compliance and proper error reporting for capability mismatches.
+
+use crate::session_errors::{SessionSetupError, SessionSetupResult};
+use agent_client_protocol::{AgentCapabilities, ClientCapabilities};
+use serde_json::Value;
+use std::collections::HashSet;
+
+/// Comprehensive capability validator for ACP compliance
+pub struct CapabilityValidator {
+    /// Known capability names for validation
+    known_agent_capabilities: HashSet<String>,
+    known_client_capabilities: HashSet<String>,
+}
+
+impl Default for CapabilityValidator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CapabilityValidator {
+    /// Create a new capability validator with default known capabilities
+    pub fn new() -> Self {
+        let mut known_agent_capabilities = HashSet::new();
+        known_agent_capabilities.insert("load_session".to_string());
+        known_agent_capabilities.insert("mcp".to_string());
+        known_agent_capabilities.insert("stdio".to_string());
+        known_agent_capabilities.insert("http".to_string());
+        known_agent_capabilities.insert("sse".to_string());
+
+        let mut known_client_capabilities = HashSet::new();
+        known_client_capabilities.insert("notifications".to_string());
+        known_client_capabilities.insert("progress".to_string());
+        known_client_capabilities.insert("cancellation".to_string());
+
+        Self {
+            known_agent_capabilities,
+            known_client_capabilities,
+        }
+    }
+
+    /// Validate agent capabilities for session setup operations
+    pub fn validate_agent_capabilities(
+        &self,
+        capabilities: &AgentCapabilities,
+        requested_operations: &[String],
+    ) -> SessionSetupResult<()> {
+        // Validate loadSession capability if session loading is requested
+        if requested_operations.contains(&"session/load".to_string())
+            && !capabilities.load_session {
+                return Err(SessionSetupError::LoadSessionNotSupported {
+                    declared_capability: false,
+                });
+            }
+
+        // Validate MCP transport capabilities if MCP servers are requested
+        let has_mcp_request = requested_operations
+            .iter()
+            .any(|op| op.contains("mcp") || op.contains("server"));
+
+        if has_mcp_request {
+            self.validate_mcp_transport_capabilities(capabilities, requested_operations)?;
+        }
+
+        Ok(())
+    }
+
+    /// Validate MCP transport capabilities
+    fn validate_mcp_transport_capabilities(
+        &self,
+        capabilities: &AgentCapabilities,
+        requested_operations: &[String],
+    ) -> SessionSetupResult<()> {
+        // Check if any transport-specific operations are requested
+        for operation in requested_operations {
+            if operation.contains("http") && !capabilities.mcp_capabilities.http {
+                return Err(SessionSetupError::TransportNotSupported {
+                    requested_transport: "http".to_string(),
+                    declared_capability: false,
+                    supported_transports: self.get_supported_transports(capabilities),
+                });
+            }
+
+            if operation.contains("sse") && !capabilities.mcp_capabilities.sse {
+                return Err(SessionSetupError::TransportNotSupported {
+                    requested_transport: "sse".to_string(),
+                    declared_capability: false,
+                    supported_transports: self.get_supported_transports(capabilities),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get list of supported transport types from capabilities
+    fn get_supported_transports(&self, capabilities: &AgentCapabilities) -> Vec<String> {
+        let mut supported = Vec::new();
+        
+        // STDIO is always supported (it's the base transport)
+        supported.push("stdio".to_string());
+        
+        if capabilities.mcp_capabilities.http {
+            supported.push("http".to_string());
+        }
+        
+        if capabilities.mcp_capabilities.sse {
+            supported.push("sse".to_string());
+        }
+        
+        supported
+    }
+
+    /// Validate client capabilities for compatibility
+    pub fn validate_client_capabilities(
+        &self,
+        capabilities: Option<&ClientCapabilities>,
+    ) -> SessionSetupResult<()> {
+        if let Some(_client_caps) = capabilities {
+            // Validate client capability format and content
+            // For now, we accept any client capabilities as they're optional
+            // Future versions might validate specific client capability requirements
+        }
+
+        Ok(())
+    }
+
+    /// Validate capability format from JSON value
+    pub fn validate_capability_format(
+        &self,
+        capability_name: &str,
+        capability_value: &Value,
+        expected_type: &str,
+    ) -> SessionSetupResult<()> {
+        match expected_type {
+            "boolean" => {
+                if !capability_value.is_boolean() {
+                    return Err(SessionSetupError::CapabilityFormatError {
+                        capability_name: capability_name.to_string(),
+                        expected_format: "boolean".to_string(),
+                        actual_value: capability_value.clone(),
+                    });
+                }
+            }
+            "object" => {
+                if !capability_value.is_object() {
+                    return Err(SessionSetupError::CapabilityFormatError {
+                        capability_name: capability_name.to_string(),
+                        expected_format: "object".to_string(),
+                        actual_value: capability_value.clone(),
+                    });
+                }
+            }
+            "array" => {
+                if !capability_value.is_array() {
+                    return Err(SessionSetupError::CapabilityFormatError {
+                        capability_name: capability_name.to_string(),
+                        expected_format: "array".to_string(),
+                        actual_value: capability_value.clone(),
+                    });
+                }
+            }
+            "string" => {
+                if !capability_value.is_string() {
+                    return Err(SessionSetupError::CapabilityFormatError {
+                        capability_name: capability_name.to_string(),
+                        expected_format: "string".to_string(),
+                        actual_value: capability_value.clone(),
+                    });
+                }
+            }
+            _ => {
+                // Unknown expected type - this is a validation error in our own code
+                return Err(SessionSetupError::CapabilityFormatError {
+                    capability_name: capability_name.to_string(),
+                    expected_format: expected_type.to_string(),
+                    actual_value: capability_value.clone(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate that capability names are known/supported
+    pub fn validate_capability_names(
+        &self,
+        agent_capabilities: Option<&Value>,
+        client_capabilities: Option<&Value>,
+    ) -> SessionSetupResult<()> {
+        // Validate agent capability names
+        if let Some(agent_caps) = agent_capabilities {
+            if let Some(agent_obj) = agent_caps.as_object() {
+                for capability_name in agent_obj.keys() {
+                    if !self.known_agent_capabilities.contains(capability_name) {
+                        return Err(SessionSetupError::UnknownCapability {
+                            capability_name: capability_name.clone(),
+                            known_capabilities: self.known_agent_capabilities.iter().cloned().collect(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Validate client capability names
+        if let Some(client_caps) = client_capabilities {
+            if let Some(client_obj) = client_caps.as_object() {
+                for capability_name in client_obj.keys() {
+                    if !self.known_client_capabilities.contains(capability_name) {
+                        // For client capabilities, we're more lenient - just log unknown ones
+                        tracing::warn!("Unknown client capability: {}", capability_name);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check capability compatibility between agent and client
+    pub fn check_capability_compatibility(
+        &self,
+        agent_capabilities: &AgentCapabilities,
+        client_capabilities: Option<&ClientCapabilities>,
+    ) -> SessionSetupResult<Vec<String>> {
+        let mut compatibility_warnings = Vec::new();
+
+        // Check if client expects features that agent doesn't support
+        if let Some(_client_caps) = client_capabilities {
+            // Example compatibility checks:
+            // - If client expects progress notifications but agent doesn't support them
+            // - If client expects cancellation but agent doesn't support it
+            // For now, we don't have specific compatibility requirements
+        }
+
+        // Check if agent capabilities have requirements that client might not meet
+        if agent_capabilities.load_session {
+            // Client should support session notifications for proper session loading
+            compatibility_warnings.push(
+                "Agent supports session loading - ensure client handles session/update notifications".to_string()
+            );
+        }
+
+        if agent_capabilities.mcp_capabilities.http || agent_capabilities.mcp_capabilities.sse {
+            compatibility_warnings.push(
+                "Agent supports HTTP/SSE MCP transports - ensure client can handle network-based MCP servers".to_string()
+            );
+        }
+
+        Ok(compatibility_warnings)
+    }
+
+    /// Validate transport capability requirements for specific MCP server configs
+    pub fn validate_transport_requirements(
+        &self,
+        agent_capabilities: &AgentCapabilities,
+        mcp_servers: &[crate::config::McpServerConfig],
+    ) -> SessionSetupResult<()> {
+        for server_config in mcp_servers {
+            match server_config {
+                crate::config::McpServerConfig::Stdio(_) => {
+                    // STDIO is always supported - no validation needed
+                }
+                crate::config::McpServerConfig::Http(_) => {
+                    if !agent_capabilities.mcp_capabilities.http {
+                        return Err(SessionSetupError::TransportNotSupported {
+                            requested_transport: "http".to_string(),
+                            declared_capability: false,
+                            supported_transports: self.get_supported_transports(agent_capabilities),
+                        });
+                    }
+                }
+                crate::config::McpServerConfig::Sse(_) => {
+                    if !agent_capabilities.mcp_capabilities.sse {
+                        return Err(SessionSetupError::TransportNotSupported {
+                            requested_transport: "sse".to_string(),
+                            declared_capability: false,
+                            supported_transports: self.get_supported_transports(agent_capabilities),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Add custom capability name to known capabilities
+    pub fn add_known_agent_capability(&mut self, capability_name: String) {
+        self.known_agent_capabilities.insert(capability_name);
+    }
+
+    /// Add custom client capability name to known capabilities
+    pub fn add_known_client_capability(&mut self, capability_name: String) {
+        self.known_client_capabilities.insert(capability_name);
+    }
+}
+
+/// Capability requirement checker for specific operations
+pub struct CapabilityRequirementChecker;
+
+impl CapabilityRequirementChecker {
+    /// Check if all requirements are met for session/new operation
+    pub fn check_new_session_requirements(
+        agent_capabilities: &AgentCapabilities,
+        mcp_servers: &[crate::config::McpServerConfig],
+    ) -> SessionSetupResult<()> {
+        let validator = CapabilityValidator::new();
+        
+        // Check transport requirements
+        validator.validate_transport_requirements(agent_capabilities, mcp_servers)?;
+        
+        Ok(())
+    }
+
+    /// Check if all requirements are met for session/load operation
+    pub fn check_load_session_requirements(
+        agent_capabilities: &AgentCapabilities,
+        mcp_servers: &[crate::config::McpServerConfig],
+    ) -> SessionSetupResult<()> {
+        let validator = CapabilityValidator::new();
+        
+        // Check loadSession capability
+        if !agent_capabilities.load_session {
+            return Err(SessionSetupError::LoadSessionNotSupported {
+                declared_capability: false,
+            });
+        }
+        
+        // Check transport requirements
+        validator.validate_transport_requirements(agent_capabilities, mcp_servers)?;
+        
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Test imports are above in the test function
+
+    fn create_test_agent_capabilities() -> AgentCapabilities {
+        AgentCapabilities {
+            load_session: true,
+            prompt_capabilities: agent_client_protocol::PromptCapabilities {
+                image: false,
+                audio: false,
+                embedded_context: false,
+                meta: None,
+            },
+            mcp_capabilities: agent_client_protocol::McpCapabilities {
+                http: true,
+                sse: false,
+                meta: None,
+            },
+            meta: None,
+        }
+    }
+
+    #[test]
+    fn test_capability_validator_creation() {
+        let validator = CapabilityValidator::new();
+        assert!(validator.known_agent_capabilities.contains("load_session"));
+        assert!(validator.known_agent_capabilities.contains("mcp"));
+        assert!(validator.known_client_capabilities.contains("notifications"));
+    }
+
+    #[test]
+    fn test_validate_agent_capabilities_load_session_supported() {
+        let validator = CapabilityValidator::new();
+        let capabilities = create_test_agent_capabilities();
+        let operations = vec!["session/load".to_string()];
+        
+        let result = validator.validate_agent_capabilities(&capabilities, &operations);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_agent_capabilities_load_session_not_supported() {
+        let validator = CapabilityValidator::new();
+        let mut capabilities = create_test_agent_capabilities();
+        capabilities.load_session = false;
+        let operations = vec!["session/load".to_string()];
+        
+        let result = validator.validate_agent_capabilities(&capabilities, &operations);
+        assert!(result.is_err());
+        
+        if let Err(SessionSetupError::LoadSessionNotSupported { .. }) = result {
+            // Expected error type
+        } else {
+            panic!("Expected LoadSessionNotSupported error");
+        }
+    }
+
+    #[test]
+    fn test_validate_transport_capabilities_http_supported() {
+        let validator = CapabilityValidator::new();
+        let capabilities = create_test_agent_capabilities();
+        let operations = vec!["mcp_http".to_string()];
+        
+        let result = validator.validate_agent_capabilities(&capabilities, &operations);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_transport_capabilities_sse_not_supported() {
+        let validator = CapabilityValidator::new();
+        let capabilities = create_test_agent_capabilities();
+        let operations = vec!["mcp_sse".to_string()];
+        
+        let result = validator.validate_agent_capabilities(&capabilities, &operations);
+        assert!(result.is_err());
+        
+        if let Err(SessionSetupError::TransportNotSupported { .. }) = result {
+            // Expected error type
+        } else {
+            panic!("Expected TransportNotSupported error");
+        }
+    }
+
+    #[test]
+    fn test_get_supported_transports() {
+        let validator = CapabilityValidator::new();
+        let capabilities = create_test_agent_capabilities();
+        
+        let supported = validator.get_supported_transports(&capabilities);
+        assert!(supported.contains(&"stdio".to_string()));
+        assert!(supported.contains(&"http".to_string()));
+        assert!(!supported.contains(&"sse".to_string()));
+    }
+
+    #[test]
+    fn test_validate_capability_format_boolean() {
+        let validator = CapabilityValidator::new();
+        let valid_bool = serde_json::json!(true);
+        let invalid_bool = serde_json::json!("not_a_boolean");
+        
+        assert!(validator.validate_capability_format("test", &valid_bool, "boolean").is_ok());
+        assert!(validator.validate_capability_format("test", &invalid_bool, "boolean").is_err());
+    }
+
+    #[test]
+    fn test_validate_capability_format_object() {
+        let validator = CapabilityValidator::new();
+        let valid_object = serde_json::json!({"key": "value"});
+        let invalid_object = serde_json::json!("not_an_object");
+        
+        assert!(validator.validate_capability_format("test", &valid_object, "object").is_ok());
+        assert!(validator.validate_capability_format("test", &invalid_object, "object").is_err());
+    }
+
+    #[test]
+    fn test_validate_unknown_capability() {
+        let validator = CapabilityValidator::new();
+        let unknown_agent_caps = serde_json::json!({
+            "unknown_capability": true
+        });
+        
+        let result = validator.validate_capability_names(Some(&unknown_agent_caps), None);
+        assert!(result.is_err());
+        
+        if let Err(SessionSetupError::UnknownCapability { .. }) = result {
+            // Expected error type
+        } else {
+            panic!("Expected UnknownCapability error");
+        }
+    }
+
+    #[test]
+    fn test_check_capability_compatibility() {
+        let validator = CapabilityValidator::new();
+        let capabilities = create_test_agent_capabilities();
+        
+        let warnings = validator.check_capability_compatibility(&capabilities, None).unwrap();
+        assert!(!warnings.is_empty()); // Should have at least one warning about session loading
+    }
+
+    #[test]
+    fn test_capability_requirement_checker_new_session() {
+        let capabilities = create_test_agent_capabilities();
+        let mcp_servers = vec![];
+        
+        let result = CapabilityRequirementChecker::check_new_session_requirements(&capabilities, &mcp_servers);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_capability_requirement_checker_load_session_supported() {
+        let capabilities = create_test_agent_capabilities();
+        let mcp_servers = vec![];
+        
+        let result = CapabilityRequirementChecker::check_load_session_requirements(&capabilities, &mcp_servers);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_capability_requirement_checker_load_session_not_supported() {
+        let mut capabilities = create_test_agent_capabilities();
+        capabilities.load_session = false;
+        let mcp_servers = vec![];
+        
+        let result = CapabilityRequirementChecker::check_load_session_requirements(&capabilities, &mcp_servers);
+        assert!(result.is_err());
+        
+        if let Err(SessionSetupError::LoadSessionNotSupported { .. }) = result {
+            // Expected error type
+        } else {
+            panic!("Expected LoadSessionNotSupported error");
+        }
+    }
+
+    #[test]
+    fn test_add_custom_capabilities() {
+        let mut validator = CapabilityValidator::new();
+        validator.add_known_agent_capability("custom_agent_cap".to_string());
+        validator.add_known_client_capability("custom_client_cap".to_string());
+        
+        assert!(validator.known_agent_capabilities.contains("custom_agent_cap"));
+        assert!(validator.known_client_capabilities.contains("custom_client_cap"));
+    }
+}
