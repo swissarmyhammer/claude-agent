@@ -310,10 +310,11 @@ impl NotificationSender {
 pub struct ClaudeAgent {
     session_manager: Arc<SessionManager>,
     claude_client: Arc<ClaudeClient>,
-    tool_handler: Arc<ToolCallHandler>,
+    tool_handler: Arc<RwLock<ToolCallHandler>>,
     mcp_manager: Option<Arc<crate::mcp::McpServerManager>>,
     config: AgentConfig,
     capabilities: AgentCapabilities,
+    client_capabilities: Arc<RwLock<Option<agent_client_protocol::ClientCapabilities>>>,
     notification_sender: Arc<NotificationSender>,
     cancellation_manager: Arc<CancellationManager>,
     permission_engine: Arc<PermissionPolicyEngine>,
@@ -364,13 +365,16 @@ impl ClaudeAgent {
         let mcp_manager = Arc::new(mcp_manager);
 
         // Create tool handler with MCP support
-        let tool_handler = Arc::new(ToolCallHandler::new_with_mcp_manager(
+        let tool_handler = Arc::new(RwLock::new(ToolCallHandler::new_with_mcp_manager(
             config.security.to_tool_permissions(),
             Arc::clone(&mcp_manager),
-        ));
+        )));
 
         // Get all available tools for capabilities
-        let available_tools = tool_handler.list_all_available_tools().await;
+        let available_tools = {
+            let handler = tool_handler.read().await;
+            handler.list_all_available_tools().await
+        };
 
         let capabilities = AgentCapabilities {
             load_session: true,
@@ -419,6 +423,7 @@ impl ClaudeAgent {
             mcp_manager: Some(mcp_manager),
             config,
             capabilities,
+            client_capabilities: Arc::new(RwLock::new(None)),
             notification_sender: Arc::new(notification_sender),
             cancellation_manager: Arc::new(cancellation_manager),
             permission_engine,
@@ -461,8 +466,8 @@ impl ClaudeAgent {
     /// # Returns
     ///
     /// A reference to the ToolCallHandler instance used by this agent.
-    pub fn tool_handler(&self) -> &ToolCallHandler {
-        &self.tool_handler
+    pub fn tool_handler(&self) -> Arc<RwLock<ToolCallHandler>> {
+        Arc::clone(&self.tool_handler)
     }
 
     /// Supported protocol versions by this agent
@@ -1075,10 +1080,63 @@ impl ClaudeAgent {
             .send_agent_thought(&request.session_id, &execution_thought)
             .await;
 
+        // ACP requires validation of content types against agent's prompt capabilities
+        // Validate that all content types in the prompt are supported by this agent
+        for content_block in &request.prompt {
+            match content_block {
+                ContentBlock::Image(_) => {
+                    if !self.capabilities.prompt_capabilities.image {
+                        return Err(agent_client_protocol::Error {
+                            code: -32602,
+                            message:
+                                "Content type not supported: agent does not support image content"
+                                    .to_string(),
+                            data: Some(serde_json::json!({
+                                "content_type": "image",
+                                "required_capability": "promptCapabilities.image",
+                                "declared": false
+                            })),
+                        });
+                    }
+                }
+                ContentBlock::Audio(_) => {
+                    if !self.capabilities.prompt_capabilities.audio {
+                        return Err(agent_client_protocol::Error {
+                            code: -32602,
+                            message:
+                                "Content type not supported: agent does not support audio content"
+                                    .to_string(),
+                            data: Some(serde_json::json!({
+                                "content_type": "audio",
+                                "required_capability": "promptCapabilities.audio",
+                                "declared": false
+                            })),
+                        });
+                    }
+                }
+                ContentBlock::Resource(_) | ContentBlock::ResourceLink(_) => {
+                    if !self.capabilities.prompt_capabilities.embedded_context {
+                        return Err(agent_client_protocol::Error {
+                            code: -32602,
+                            message: "Content type not supported: agent does not support embedded context content".to_string(),
+                            data: Some(serde_json::json!({
+                                "content_type": "embedded_context",
+                                "required_capability": "promptCapabilities.embedded_context",
+                                "declared": false
+                            })),
+                        });
+                    }
+                }
+                ContentBlock::Text(_) => {
+                    // Text content is always supported - no capability check needed
+                }
+            }
+        }
+
         // Extract and process all content from the prompt
         let mut prompt_text = String::new();
         let mut has_binary_content = false;
-        
+
         for content_block in &request.prompt {
             match content_block {
                 ContentBlock::Text(text_content) => {
@@ -1086,33 +1144,39 @@ impl ClaudeAgent {
                 }
                 ContentBlock::Image(image_content) => {
                     // Process image data (already validated in validate_prompt_request)
-                    let _decoded = self.base64_processor
+                    let _decoded = self
+                        .base64_processor
                         .decode_image_data(&image_content.data, &image_content.mime_type)
                         .map_err(|e| {
                             tracing::error!("Failed to decode image data: {}", e);
                             agent_client_protocol::Error::invalid_params()
                         })?;
-                    
+
                     // Add descriptive text for now until full multimodal support
                     prompt_text.push_str(&format!(
-                        "\n[Image content: {} ({})]", 
-                        image_content.mime_type, 
-                        if let Some(ref uri) = image_content.uri { uri } else { "embedded data" }
+                        "\n[Image content: {} ({})]",
+                        image_content.mime_type,
+                        if let Some(ref uri) = image_content.uri {
+                            uri
+                        } else {
+                            "embedded data"
+                        }
                     ));
                     has_binary_content = true;
                 }
                 ContentBlock::Audio(audio_content) => {
                     // Process audio data (already validated in validate_prompt_request)
-                    let _decoded = self.base64_processor
+                    let _decoded = self
+                        .base64_processor
                         .decode_audio_data(&audio_content.data, &audio_content.mime_type)
                         .map_err(|e| {
                             tracing::error!("Failed to decode audio data: {}", e);
                             agent_client_protocol::Error::invalid_params()
                         })?;
-                    
+
                     // Add descriptive text for now until full multimodal support
                     prompt_text.push_str(&format!(
-                        "\n[Audio content: {} (embedded data)]", 
+                        "\n[Audio content: {} (embedded data)]",
                         audio_content.mime_type
                     ));
                     has_binary_content = true;
@@ -1124,17 +1188,17 @@ impl ClaudeAgent {
                 }
                 ContentBlock::ResourceLink(resource_link) => {
                     // Add descriptive text for the resource link
-                    prompt_text.push_str(&format!(
-                        "\n[Resource Link: {}]", 
-                        resource_link.uri
-                    ));
+                    prompt_text.push_str(&format!("\n[Resource Link: {}]", resource_link.uri));
                     has_binary_content = true;
                 }
             }
         }
 
         if has_binary_content {
-            tracing::info!("Processing prompt with binary content for session: {}", session_id);
+            tracing::info!(
+                "Processing prompt with binary content for session: {}",
+                session_id
+            );
         }
 
         let context: crate::claude::SessionContext = session.into();
@@ -1282,7 +1346,7 @@ impl ClaudeAgent {
         // Extract and process all content from the prompt
         let mut prompt_text = String::new();
         let mut has_binary_content = false;
-        
+
         for content_block in &request.prompt {
             match content_block {
                 ContentBlock::Text(text_content) => {
@@ -1290,33 +1354,39 @@ impl ClaudeAgent {
                 }
                 ContentBlock::Image(image_content) => {
                     // Process image data (already validated in validate_prompt_request)
-                    let _decoded = self.base64_processor
+                    let _decoded = self
+                        .base64_processor
                         .decode_image_data(&image_content.data, &image_content.mime_type)
                         .map_err(|e| {
                             tracing::error!("Failed to decode image data: {}", e);
                             agent_client_protocol::Error::invalid_params()
                         })?;
-                    
+
                     // Add descriptive text for now until full multimodal support
                     prompt_text.push_str(&format!(
-                        "\n[Image content: {} ({})]", 
-                        image_content.mime_type, 
-                        if let Some(ref uri) = image_content.uri { uri } else { "embedded data" }
+                        "\n[Image content: {} ({})]",
+                        image_content.mime_type,
+                        if let Some(ref uri) = image_content.uri {
+                            uri
+                        } else {
+                            "embedded data"
+                        }
                     ));
                     has_binary_content = true;
                 }
                 ContentBlock::Audio(audio_content) => {
                     // Process audio data (already validated in validate_prompt_request)
-                    let _decoded = self.base64_processor
+                    let _decoded = self
+                        .base64_processor
                         .decode_audio_data(&audio_content.data, &audio_content.mime_type)
                         .map_err(|e| {
                             tracing::error!("Failed to decode audio data: {}", e);
                             agent_client_protocol::Error::invalid_params()
                         })?;
-                    
+
                     // Add descriptive text for now until full multimodal support
                     prompt_text.push_str(&format!(
-                        "\n[Audio content: {} (embedded data)]", 
+                        "\n[Audio content: {} (embedded data)]",
                         audio_content.mime_type
                     ));
                     has_binary_content = true;
@@ -1328,17 +1398,17 @@ impl ClaudeAgent {
                 }
                 ContentBlock::ResourceLink(resource_link) => {
                     // Add descriptive text for the resource link
-                    prompt_text.push_str(&format!(
-                        "\n[Resource Link: {}]", 
-                        resource_link.uri
-                    ));
+                    prompt_text.push_str(&format!("\n[Resource Link: {}]", resource_link.uri));
                     has_binary_content = true;
                 }
             }
         }
 
         if has_binary_content {
-            tracing::info!("Processing prompt with binary content for session: {}", session_id);
+            tracing::info!(
+                "Processing prompt with binary content for session: {}",
+                session_id
+            );
         }
 
         let context: crate::claude::SessionContext = session.into();
@@ -1900,6 +1970,20 @@ impl Agent for ClaudeAgent {
 
         tracing::info!("Agent initialization validation completed successfully");
 
+        // Store client capabilities for ACP compliance - required for capability gating
+        {
+            let mut client_caps = self.client_capabilities.write().await;
+            *client_caps = Some(request.client_capabilities.clone());
+        }
+
+        // Pass client capabilities to tool handler for capability validation
+        {
+            let mut tool_handler = self.tool_handler.write().await;
+            tool_handler.set_client_capabilities(request.client_capabilities.clone());
+        }
+
+        tracing::info!("Stored client capabilities for ACP compliance");
+
         let response = InitializeResponse {
             agent_capabilities: self.capabilities.clone(),
             // AUTHENTICATION ARCHITECTURE DECISION:
@@ -2192,7 +2276,7 @@ impl Agent for ClaudeAgent {
         // Extract and process all content from the prompt
         let mut prompt_text = String::new();
         let mut has_binary_content = false;
-        
+
         for content_block in &request.prompt {
             match content_block {
                 ContentBlock::Text(text_content) => {
@@ -2201,16 +2285,20 @@ impl Agent for ClaudeAgent {
                 ContentBlock::Image(image_content) => {
                     // Add descriptive text for plan analysis
                     prompt_text.push_str(&format!(
-                        "\n[Image content: {} ({})]", 
-                        image_content.mime_type, 
-                        if let Some(ref uri) = image_content.uri { uri } else { "embedded data" }
+                        "\n[Image content: {} ({})]",
+                        image_content.mime_type,
+                        if let Some(ref uri) = image_content.uri {
+                            uri
+                        } else {
+                            "embedded data"
+                        }
                     ));
                     has_binary_content = true;
                 }
                 ContentBlock::Audio(audio_content) => {
                     // Add descriptive text for plan analysis
                     prompt_text.push_str(&format!(
-                        "\n[Audio content: {} (embedded data)]", 
+                        "\n[Audio content: {} (embedded data)]",
                         audio_content.mime_type
                     ));
                     has_binary_content = true;
@@ -2222,17 +2310,17 @@ impl Agent for ClaudeAgent {
                 }
                 ContentBlock::ResourceLink(resource_link) => {
                     // Add descriptive text for the resource link
-                    prompt_text.push_str(&format!(
-                        "\n[Resource Link: {}]", 
-                        resource_link.uri
-                    ));
+                    prompt_text.push_str(&format!("\n[Resource Link: {}]", resource_link.uri));
                     has_binary_content = true;
                 }
             }
         }
 
         if has_binary_content {
-            tracing::info!("Processing prompt with binary content for plan analysis in session: {}", session_id);
+            tracing::info!(
+                "Processing prompt with binary content for plan analysis in session: {}",
+                session_id
+            );
         }
 
         // ACP requires agent plan reporting for transparency and progress tracking:
@@ -4448,8 +4536,8 @@ mod tests {
         let phases: Vec<ReasoningPhase> = thought_notifications
             .iter()
             .filter_map(|notification| match &notification.update {
-                SessionUpdate::AgentThoughtChunk { 
-                    content: ContentBlock::Text(text_content) 
+                SessionUpdate::AgentThoughtChunk {
+                    content: ContentBlock::Text(text_content),
                 } => text_content
                     .meta
                     .as_ref()

@@ -1,5 +1,5 @@
-use std::collections::HashSet;
 use base64::{engine::general_purpose, Engine as _};
+use std::collections::HashSet;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -216,10 +216,7 @@ impl Base64Processor {
                 }
             }
             "image/webp" => {
-                if data.len() < 12
-                    || &data[0..4] != b"RIFF"
-                    || &data[8..12] != b"WEBP"
-                {
+                if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WEBP" {
                     return Err(Base64ProcessorError::FormatMismatch {
                         expected: "WebP".to_string(),
                         actual: "unknown".to_string(),
@@ -333,11 +330,15 @@ mod tests {
 
         // Valid PNG header
         let png_header = b"\x89PNG\r\n\x1a\n";
-        assert!(processor.validate_image_format(png_header, "image/png").is_ok());
+        assert!(processor
+            .validate_image_format(png_header, "image/png")
+            .is_ok());
 
         // Invalid PNG header
         let invalid_header = b"NOTPNG\x00\x00";
-        assert!(processor.validate_image_format(invalid_header, "image/png").is_err());
+        assert!(processor
+            .validate_image_format(invalid_header, "image/png")
+            .is_err());
     }
 
     #[test]
@@ -346,7 +347,7 @@ mod tests {
 
         // Valid JPEG header (SOI marker)
         let jpeg_header = b"\xFF\xD8\xFF\xE0";
-        
+
         let result = processor.validate_image_format(jpeg_header, "image/jpeg");
         if let Err(e) = result {
             panic!("JPEG validation should have succeeded but got error: {}", e);
@@ -366,7 +367,7 @@ mod tests {
 
         // This is a 1x1 PNG in base64
         let png_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
-        
+
         let result = processor.decode_image_data(png_data, "image/png");
         assert!(result.is_ok());
 
