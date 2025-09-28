@@ -411,14 +411,19 @@ impl ToolCallHandler {
     }
 
     /// Check if client has declared the required terminal capability
+    /// 
+    /// ACP requires strict terminal capability validation:
+    /// 1. MUST check clientCapabilities.terminal before any terminal operations
+    /// 2. MUST NOT attempt terminal methods if capability not declared
+    /// 3. MUST return proper errors for unsupported operations
     fn validate_terminal_capability(&self) -> crate::Result<()> {
         match &self.client_capabilities {
             Some(caps) if caps.terminal => Ok(()),
             Some(_) => Err(crate::AgentError::Protocol(
-                "Method not available: client did not declare terminal capability".to_string(),
+                "Method not supported: client does not support terminal operations. Required capability: clientCapabilities.terminal = true".to_string(),
             )),
             None => Err(crate::AgentError::Protocol(
-                "No client capabilities available for validation".to_string(),
+                "No client capabilities available - terminal operations require clientCapabilities.terminal = true".to_string(),
             )),
         }
     }
@@ -491,14 +496,24 @@ impl ToolCallHandler {
     }
 
     /// List all available tools including MCP tools
+    /// 
+    /// ACP requires strict capability validation:
+    /// - Terminal tools are only included if client declares terminal capability
+    /// - This prevents protocol violations and ensures client compatibility
     pub async fn list_all_available_tools(&self) -> Vec<String> {
         let mut tools = vec![
             "fs_read".to_string(),
             "fs_write".to_string(),
             "fs_list".to_string(),
-            "terminal_create".to_string(),
-            "terminal_write".to_string(),
         ];
+
+        // ACP compliance: Only include terminal tools if client supports them
+        if let Some(caps) = &self.client_capabilities {
+            if caps.terminal {
+                tools.push("terminal_create".to_string());
+                tools.push("terminal_write".to_string());
+            }
+        }
 
         if let Some(ref mcp_manager) = self.mcp_manager {
             let mcp_tools = mcp_manager.list_available_tools().await;
@@ -1953,6 +1968,156 @@ mod tests {
                 assert!(!msg.contains("capability"));
             }
             _ => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn test_terminal_capability_tool_availability_filtering() {
+        // Test that terminal tools are filtered from available tools based on client capabilities
+        
+        // Test with terminal capability disabled
+        let mut handler_no_terminal = ToolCallHandler::new(
+            ToolPermissions {
+                auto_approved: vec![],
+                require_permission_for: vec![],
+                forbidden_paths: vec![],
+            },
+        );
+        
+        let caps_no_terminal = agent_client_protocol::ClientCapabilities {
+            fs: agent_client_protocol::FileSystemCapability {
+                read_text_file: true,
+                write_text_file: true,
+                meta: None,
+            },
+            terminal: false,
+            meta: None,
+        };
+        
+        handler_no_terminal.set_client_capabilities(caps_no_terminal);
+        
+        let tools_no_terminal = handler_no_terminal.list_all_available_tools().await;
+        
+        // Should not include terminal tools
+        assert!(!tools_no_terminal.contains(&"terminal_create".to_string()));
+        assert!(!tools_no_terminal.contains(&"terminal_write".to_string()));
+        
+        // Should still include file system tools
+        assert!(tools_no_terminal.contains(&"fs_read".to_string()));
+        assert!(tools_no_terminal.contains(&"fs_write".to_string()));
+        assert!(tools_no_terminal.contains(&"fs_list".to_string()));
+        
+        // Test with terminal capability enabled
+        let mut handler_with_terminal = ToolCallHandler::new(
+            ToolPermissions {
+                auto_approved: vec![],
+                require_permission_for: vec![],
+                forbidden_paths: vec![],
+            },
+        );
+        
+        let caps_with_terminal = agent_client_protocol::ClientCapabilities {
+            fs: agent_client_protocol::FileSystemCapability {
+                read_text_file: true,
+                write_text_file: true,
+                meta: None,
+            },
+            terminal: true,
+            meta: None,
+        };
+        
+        handler_with_terminal.set_client_capabilities(caps_with_terminal);
+        
+        let tools_with_terminal = handler_with_terminal.list_all_available_tools().await;
+        
+        // Should include all tools including terminal tools
+        assert!(tools_with_terminal.contains(&"terminal_create".to_string()));
+        assert!(tools_with_terminal.contains(&"terminal_write".to_string()));
+        assert!(tools_with_terminal.contains(&"fs_read".to_string()));
+        assert!(tools_with_terminal.contains(&"fs_write".to_string()));
+        assert!(tools_with_terminal.contains(&"fs_list".to_string()));
+        
+        // Test with no client capabilities set
+        let handler_no_caps = ToolCallHandler::new(
+            ToolPermissions {
+                auto_approved: vec![],
+                require_permission_for: vec![],
+                forbidden_paths: vec![],
+            },
+        );
+        
+        let tools_no_caps = handler_no_caps.list_all_available_tools().await;
+        
+        // Should not include terminal tools when no capabilities are set
+        assert!(!tools_no_caps.contains(&"terminal_create".to_string()));
+        assert!(!tools_no_caps.contains(&"terminal_write".to_string()));
+        
+        // Should still include file system tools
+        assert!(tools_no_caps.contains(&"fs_read".to_string()));
+        assert!(tools_no_caps.contains(&"fs_write".to_string()));
+        assert!(tools_no_caps.contains(&"fs_list".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_improved_terminal_capability_error_messages() {
+        // Test that terminal capability validation returns improved error messages
+        let mut handler = ToolCallHandler::new(
+            ToolPermissions {
+                auto_approved: vec!["terminal_create".to_string()],
+                require_permission_for: vec![],
+                forbidden_paths: vec![],
+            },
+        );
+
+        // Test with terminal capability explicitly disabled
+        let caps_disabled = agent_client_protocol::ClientCapabilities {
+            fs: agent_client_protocol::FileSystemCapability {
+                read_text_file: true,
+                write_text_file: true,
+                meta: None,
+            },
+            terminal: false,
+            meta: None,
+        };
+
+        handler.set_client_capabilities(caps_disabled);
+
+        let terminal_request = InternalToolRequest {
+            id: "test".to_string(),
+            name: "terminal_create".to_string(),
+            arguments: json!({}),
+        };
+
+        let result = handler.handle_tool_request(terminal_request).await.unwrap();
+        match result {
+            ToolCallResult::Error(msg) => {
+                assert!(msg.contains("Method not supported"));
+                assert!(msg.contains("clientCapabilities.terminal = true"));
+            }
+            _ => panic!("Expected error for disabled terminal capability"),
+        }
+
+        // Test with no capabilities provided
+        let handler_no_caps = ToolCallHandler::new(
+            ToolPermissions {
+                auto_approved: vec!["terminal_create".to_string()],
+                require_permission_for: vec![],
+                forbidden_paths: vec![],
+            },
+        );
+
+        let result_no_caps = handler_no_caps.handle_tool_request(InternalToolRequest {
+            id: "test".to_string(),
+            name: "terminal_create".to_string(),
+            arguments: json!({}),
+        }).await.unwrap();
+
+        match result_no_caps {
+            ToolCallResult::Error(msg) => {
+                assert!(msg.contains("No client capabilities available"));
+                assert!(msg.contains("clientCapabilities.terminal = true"));
+            }
+            _ => panic!("Expected error for missing client capabilities"),
         }
     }
 }

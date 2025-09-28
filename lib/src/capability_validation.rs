@@ -35,6 +35,7 @@ impl CapabilityValidator {
         known_client_capabilities.insert("notifications".to_string());
         known_client_capabilities.insert("progress".to_string());
         known_client_capabilities.insert("cancellation".to_string());
+        known_client_capabilities.insert("terminal".to_string());
 
         Self {
             known_agent_capabilities,
@@ -301,6 +302,35 @@ impl CapabilityValidator {
     pub fn add_known_client_capability(&mut self, capability_name: String) {
         self.known_client_capabilities.insert(capability_name);
     }
+
+    /// Validate terminal capability for ACP compliance
+    pub fn validate_terminal_capability(
+        &self,
+        client_capabilities: Option<&ClientCapabilities>,
+    ) -> SessionSetupResult<()> {
+        match client_capabilities {
+            Some(caps) => {
+                if !caps.terminal {
+                    return Err(SessionSetupError::CapabilityNotSupported {
+                        capability_name: "terminal".to_string(),
+                        required_for: "terminal operations".to_string(),
+                    });
+                }
+                Ok(())
+            }
+            None => Err(SessionSetupError::CapabilityNotSupported {
+                capability_name: "terminal".to_string(),
+                required_for: "terminal operations - no client capabilities provided".to_string(),
+            }),
+        }
+    }
+
+    /// Check if terminal operations should be available based on client capabilities
+    pub fn is_terminal_supported(client_capabilities: Option<&ClientCapabilities>) -> bool {
+        client_capabilities
+            .map(|caps| caps.terminal)
+            .unwrap_or(false)
+    }
 }
 
 /// Capability requirement checker for specific operations
@@ -549,5 +579,92 @@ mod tests {
         assert!(validator
             .known_client_capabilities
             .contains("custom_client_cap"));
+    }
+
+    fn create_test_client_capabilities_with_terminal(terminal_enabled: bool) -> ClientCapabilities {
+        use agent_client_protocol::{ClientCapabilities, FileSystemCapability};
+        
+        ClientCapabilities {
+            fs: FileSystemCapability {
+                read_text_file: true,
+                write_text_file: true,
+                meta: None,
+            },
+            terminal: terminal_enabled,
+            meta: None,
+        }
+    }
+
+    #[test]
+    fn test_validate_terminal_capability_supported() {
+        let validator = CapabilityValidator::new();
+        let capabilities = create_test_client_capabilities_with_terminal(true);
+
+        let result = validator.validate_terminal_capability(Some(&capabilities));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_terminal_capability_not_supported() {
+        let validator = CapabilityValidator::new();
+        let capabilities = create_test_client_capabilities_with_terminal(false);
+
+        let result = validator.validate_terminal_capability(Some(&capabilities));
+        assert!(result.is_err());
+
+        match result {
+            Err(SessionSetupError::CapabilityNotSupported { capability_name, required_for }) => {
+                assert_eq!(capability_name, "terminal");
+                assert_eq!(required_for, "terminal operations");
+            }
+            _ => panic!("Expected CapabilityNotSupported error"),
+        }
+    }
+
+    #[test]
+    fn test_validate_terminal_capability_no_capabilities() {
+        let validator = CapabilityValidator::new();
+
+        let result = validator.validate_terminal_capability(None);
+        assert!(result.is_err());
+
+        match result {
+            Err(SessionSetupError::CapabilityNotSupported { capability_name, required_for }) => {
+                assert_eq!(capability_name, "terminal");
+                assert!(required_for.contains("no client capabilities provided"));
+            }
+            _ => panic!("Expected CapabilityNotSupported error"),
+        }
+    }
+
+    #[test]
+    fn test_is_terminal_supported() {
+        // Test with terminal enabled
+        let capabilities_enabled = create_test_client_capabilities_with_terminal(true);
+        assert!(CapabilityValidator::is_terminal_supported(Some(&capabilities_enabled)));
+
+        // Test with terminal disabled
+        let capabilities_disabled = create_test_client_capabilities_with_terminal(false);
+        assert!(!CapabilityValidator::is_terminal_supported(Some(&capabilities_disabled)));
+
+        // Test with no capabilities
+        assert!(!CapabilityValidator::is_terminal_supported(None));
+    }
+
+    #[test]
+    fn test_terminal_capability_known_capabilities() {
+        let validator = CapabilityValidator::new();
+        
+        // Terminal should be in known client capabilities
+        assert!(validator.known_client_capabilities.contains("terminal"));
+        
+        // Test that terminal capability name validation passes
+        let client_caps_with_terminal = serde_json::json!({
+            "terminal": true,
+            "notifications": true
+        });
+
+        let result = validator.validate_capability_names(None, Some(&client_caps_with_terminal));
+        assert!(result.is_ok());
     }
 }

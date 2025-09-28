@@ -155,6 +155,12 @@ pub enum SessionSetupError {
         known_capabilities: Vec<String>,
     },
 
+    #[error("Capability not supported: {capability_name} required for {required_for}")]
+    CapabilityNotSupported {
+        capability_name: String,
+        required_for: String,
+    },
+
     // Request validation errors
     #[error("Malformed session request: {details}")]
     MalformedRequest {
@@ -210,7 +216,8 @@ impl SessionSetupError {
             | Self::MissingRequiredParameter { .. }
             | Self::InvalidParameterType(..)
             | Self::SessionNotFound { .. }
-            | Self::UnknownCapability { .. } => -32602,
+            | Self::UnknownCapability { .. }
+            | Self::CapabilityNotSupported { .. } => -32602,
 
             // Internal Error (-32603): Internal JSON-RPC error
             Self::WorkingDirectoryNotFound { .. }
@@ -541,6 +548,17 @@ impl SessionSetupError {
                     "serverName": server_name,
                     "cleanupError": cleanup_error,
                     "error": "mcp_server_cleanup_failed"
+                })
+            }
+
+            Self::CapabilityNotSupported {
+                capability_name,
+                required_for,
+            } => {
+                serde_json::json!({
+                    "capabilityName": capability_name,
+                    "requiredFor": required_for,
+                    "error": "capability_not_supported"
                 })
             }
         }
