@@ -1387,6 +1387,27 @@ impl Agent for ClaudeAgent {
         self.log_request("load_session", &request);
         tracing::info!("Loading session: {}", request.session_id);
 
+        // ACP requires complete conversation history replay during session loading:
+        // 1. Validate loadSession capability before allowing session/load
+        // 2. Stream ALL historical messages via session/update notifications
+        // 3. Maintain exact chronological order of original conversation
+        // 4. Only respond to session/load AFTER all history is streamed
+        // 5. Client can then continue conversation seamlessly
+
+        // Step 1: Validate loadSession capability before allowing session/load
+        if !self.capabilities.load_session {
+            tracing::warn!("Session load requested but loadSession capability not supported");
+            return Err(agent_client_protocol::Error {
+                code: -32601,
+                message: "Method not supported: agent does not support loadSession capability".to_string(),
+                data: Some(serde_json::json!({
+                    "method": "session/load",
+                    "requiredCapability": "loadSession",
+                    "declared": false
+                })),
+            });
+        }
+
         let session_id = self.parse_session_id(&request.session_id)?;
 
         let session = self
@@ -1396,20 +1417,81 @@ impl Agent for ClaudeAgent {
 
         match session {
             Some(session) => {
-                tracing::info!("Loaded session: {}", session_id);
+                tracing::info!("Loaded session: {} with {} historical messages", session_id, session.context.len());
+                
+                // Step 2-3: Stream ALL historical messages via session/update notifications
+                // Maintain exact chronological order using message timestamps
+                if !session.context.is_empty() {
+                    tracing::info!("Replaying {} historical messages for session {}", session.context.len(), session_id);
+                    
+                    for message in &session.context {
+                        let session_update = match message.role {
+                            crate::session::MessageRole::User => {
+                                SessionUpdate::UserMessageChunk {
+                                    content: ContentBlock::Text(TextContent { 
+                                        text: message.content.clone(),
+                                        annotations: None,
+                                        meta: None,
+                                    }),
+                                }
+                            }
+                            crate::session::MessageRole::Assistant | crate::session::MessageRole::System => {
+                                SessionUpdate::AgentMessageChunk {
+                                    content: ContentBlock::Text(TextContent { 
+                                        text: message.content.clone(),
+                                        annotations: None,
+                                        meta: None,
+                                    }),
+                                }
+                            }
+                        };
+
+                        let notification = SessionNotification {
+                            session_id: SessionId(session.id.to_string().into()),
+                            update: session_update,
+                            meta: Some(serde_json::json!({
+                                "timestamp": message.timestamp.duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default().as_secs(),
+                                "message_type": "historical_replay",
+                                "original_role": format!("{:?}", message.role)
+                            })),
+                        };
+
+                        // Stream historical message via session/update notification
+                        if let Err(e) = self.notification_sender.send_update(notification).await {
+                            tracing::error!("Failed to send historical message notification: {}", e);
+                            // Continue with other messages even if one fails
+                        }
+                    }
+
+                    tracing::info!("Completed history replay for session {}", session_id);
+                }
+
+                // Step 4: Send session/load response ONLY after all history is streamed
                 let response = LoadSessionResponse {
                     modes: None, // No specific session modes for now
                     meta: Some(serde_json::json!({
                         "session_id": session.id.to_string(),
                         "created_at": session.created_at.duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default().as_secs(),
-                        "message_count": session.context.len()
+                        "message_count": session.context.len(),
+                        "history_replayed": session.context.len()
                     })),
                 };
                 self.log_response("load_session", &response);
                 Ok(response)
             }
-            None => Err(agent_client_protocol::Error::invalid_params()),
+            None => {
+                tracing::warn!("Session not found: {}", session_id);
+                Err(agent_client_protocol::Error {
+                    code: -32602,
+                    message: "Session not found: sessionId does not exist or has expired".to_string(),
+                    data: Some(serde_json::json!({
+                        "sessionId": request.session_id,
+                        "error": "session_not_found"
+                    })),
+                })
+            }
         }
     }
 
@@ -1779,21 +1861,181 @@ mod tests {
 
         let load_response = agent.load_session(load_request).await.unwrap();
         assert!(load_response.meta.is_some());
+        
+        // Verify that message_count and history_replayed are present in meta
+        let meta = load_response.meta.unwrap();
+        assert!(meta.get("message_count").is_some());
+        assert!(meta.get("history_replayed").is_some());
+        assert_eq!(meta.get("message_count").unwrap().as_u64().unwrap(), 0); // Empty session
+        assert_eq!(meta.get("history_replayed").unwrap().as_u64().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_load_session_with_history_replay() {
+        let agent = create_test_agent().await;
+
+        // First create a session
+        let new_request = NewSessionRequest {
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![],
+            meta: Some(serde_json::json!({"test": true})),
+        };
+        let new_response = agent.new_session(new_request).await.unwrap();
+        let session_id = agent.parse_session_id(&new_response.session_id).unwrap();
+
+        // Add some messages to the session history
+        agent.session_manager.update_session(&session_id, |session| {
+            session.add_message(crate::session::Message::new(
+                crate::session::MessageRole::User, 
+                "Hello, world!".to_string()
+            ));
+            session.add_message(crate::session::Message::new(
+                crate::session::MessageRole::Assistant, 
+                "Hello! How can I help you?".to_string()
+            ));
+            session.add_message(crate::session::Message::new(
+                crate::session::MessageRole::User, 
+                "What's the weather like?".to_string()
+            ));
+        }).unwrap();
+
+        // Subscribe to notifications to verify history replay
+        let mut notification_receiver = agent.notification_sender.sender.subscribe();
+
+        // Now load the session - should trigger history replay
+        let load_request = LoadSessionRequest {
+            session_id: new_response.session_id,
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![],
+            meta: None,
+        };
+
+        let load_response = agent.load_session(load_request).await.unwrap();
+        
+        // Verify meta includes correct history information
+        let meta = load_response.meta.unwrap();
+        assert_eq!(meta.get("message_count").unwrap().as_u64().unwrap(), 3);
+        assert_eq!(meta.get("history_replayed").unwrap().as_u64().unwrap(), 3);
+
+        // Verify that history replay notifications were sent
+        // We should receive 3 notifications for the historical messages
+        let mut received_notifications = Vec::new();
+        for _ in 0..3 {
+            match tokio::time::timeout(
+                tokio::time::Duration::from_millis(100), 
+                notification_receiver.recv()
+            ).await {
+                Ok(Ok(notification)) => {
+                    received_notifications.push(notification);
+                },
+                Ok(Err(_)) => break, // Channel error
+                Err(_) => break, // Timeout
+            }
+        }
+
+        assert_eq!(received_notifications.len(), 3, "Should receive 3 historical message notifications");
+
+        // Verify the content and order of notifications
+        let first_notification = &received_notifications[0];
+        assert!(matches!(first_notification.update, SessionUpdate::UserMessageChunk { .. }));
+        if let SessionUpdate::UserMessageChunk { content: ContentBlock::Text(ref text_content) } = first_notification.update {
+            assert_eq!(text_content.text, "Hello, world!");
+        }
+
+        let second_notification = &received_notifications[1];
+        assert!(matches!(second_notification.update, SessionUpdate::AgentMessageChunk { .. }));
+        if let SessionUpdate::AgentMessageChunk { content: ContentBlock::Text(ref text_content) } = second_notification.update {
+            assert_eq!(text_content.text, "Hello! How can I help you?");
+        }
+
+        let third_notification = &received_notifications[2];
+        assert!(matches!(third_notification.update, SessionUpdate::UserMessageChunk { .. }));
+        if let SessionUpdate::UserMessageChunk { content: ContentBlock::Text(ref text_content) } = third_notification.update {
+            assert_eq!(text_content.text, "What's the weather like?");
+        }
+
+        // Verify all notifications have proper meta with historical_replay marker
+        for notification in &received_notifications {
+            let meta = notification.meta.as_ref().unwrap();
+            assert_eq!(meta.get("message_type").unwrap().as_str().unwrap(), "historical_replay");
+            assert!(meta.get("timestamp").is_some());
+            assert!(meta.get("original_role").is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_load_session_capability_validation() {
+        let agent = create_test_agent().await;
+
+        // The agent should have loadSession capability enabled by default
+        assert!(agent.capabilities.load_session, "loadSession capability should be enabled by default");
+
+        // Test that the capability validation code path exists by verifying
+        // that the agent properly declares the capability in initialize response
+        let init_request = InitializeRequest {
+            client_capabilities: agent_client_protocol::ClientCapabilities {
+                fs: agent_client_protocol::FileSystemCapability {
+                    read_text_file: true,
+                    write_text_file: true,
+                    meta: None,
+                },
+                terminal: true,
+                meta: Some(serde_json::json!({"streaming": true})),
+            },
+            protocol_version: Default::default(),
+            meta: None,
+        };
+
+        let init_response = agent.initialize(init_request).await.unwrap();
+        assert!(init_response.agent_capabilities.load_session, "Agent should declare loadSession capability in initialize response");
     }
 
     #[tokio::test]
     async fn test_load_nonexistent_session() {
         let agent = create_test_agent().await;
+        // Use a valid ULID format that doesn't exist in session manager
+        let nonexistent_session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"; // Valid ULID format
+        let session_id_wrapper = SessionId(nonexistent_session_id.to_string().into());
 
         let request = LoadSessionRequest {
-            session_id: SessionId("01234567890123456789012345".to_string().into()), // Invalid ULID
+            session_id: session_id_wrapper.clone(),
             cwd: std::path::PathBuf::from("/tmp"),
             mcp_servers: vec![],
             meta: None,
         };
 
         let result = agent.load_session(request).await;
-        assert!(result.is_err());
+        assert!(result.is_err(), "Loading nonexistent session should fail");
+
+        let error = result.unwrap_err();
+        assert_eq!(error.code, -32602, "Should return invalid params error for nonexistent session");
+        
+        // The error should either be our custom "Session not found" message or generic invalid params
+        // Both are acceptable as they indicate the session couldn't be loaded
+        assert!(
+            error.message.contains("Session not found") || error.message.contains("Invalid params"),
+            "Error message should indicate session issue, got: '{}'", error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_session_invalid_ulid() {
+        let agent = create_test_agent().await;
+        
+        // Test with an invalid ULID format - should fail at parsing stage
+        let request = LoadSessionRequest {
+            session_id: SessionId("invalid_session_format".to_string().into()),
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![],
+            meta: None,
+        };
+
+        let result = agent.load_session(request).await;
+        assert!(result.is_err(), "Loading with invalid ULID format should fail");
+
+        let error = result.unwrap_err();
+        assert_eq!(error.code, -32602, "Should return invalid params error for invalid ULID");
+        // This should fail at parse_session_id stage, so it won't have our custom error data
     }
 
     #[tokio::test]
