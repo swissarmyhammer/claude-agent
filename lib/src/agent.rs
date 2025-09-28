@@ -13,6 +13,34 @@ use agent_client_protocol::{
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::SystemTime;
+
+/// ACP tool call information for permission requests
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolCallUpdate {
+    /// Unique identifier for the tool call
+    #[serde(rename = "toolCallId")]
+    pub tool_call_id: String,
+}
+
+/// ACP-compliant permission request
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PermissionRequest {
+    /// Session identifier for the permission request
+    #[serde(rename = "sessionId")]
+    pub session_id: SessionId,
+    /// Tool call information
+    #[serde(rename = "toolCall")]
+    pub tool_call: ToolCallUpdate,
+    /// Available permission options for the user
+    pub options: Vec<crate::tools::PermissionOption>,
+}
+
+/// ACP-compliant permission response
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PermissionResponse {
+    /// The outcome of the permission request
+    pub outcome: crate::tools::PermissionOutcome,
+}
 use tokio::sync::{broadcast, RwLock};
 use tokio_stream::StreamExt;
 
@@ -1541,6 +1569,87 @@ impl Agent for ClaudeAgent {
         };
 
         self.log_response("set_session_mode", &response);
+        Ok(response)
+    }
+
+    /// Request permission for a tool call (ACP session/request_permission method)
+    async fn request_permission(
+        &self,
+        request: PermissionRequest,
+    ) -> Result<PermissionResponse, agent_client_protocol::Error> {
+        self.log_request("request_permission", &request);
+        tracing::info!(
+            "Processing permission request for session: {} and tool call: {}",
+            request.session_id.0,
+            request.tool_call.tool_call_id
+        );
+
+        // ACP requires comprehensive permission system with user choice:
+        // 1. Multiple permission options: allow/reject with once/always variants
+        // 2. Permission persistence: Remember "always" decisions across sessions
+        // 3. Tool call integration: Block execution until permission granted
+        // 4. Cancellation support: Handle cancelled prompt turns gracefully
+        // 5. Context awareness: Generate appropriate options for different tools
+        //
+        // Advanced permissions provide user control while maintaining security.
+
+        // Parse session ID
+        let session_id = self.parse_session_id(&request.session_id)?;
+
+        // Check if session is cancelled
+        if self.cancellation_manager.is_cancelled(&session_id.to_string()).await {
+            tracing::info!("Session {} is cancelled, returning cancelled outcome", session_id);
+            return Ok(PermissionResponse {
+                outcome: crate::tools::PermissionOutcome::Cancelled,
+            });
+        }
+
+        // For this initial implementation, we'll generate default permission options
+        // if none were provided, or use the provided options
+        let permission_options = if request.options.is_empty() {
+            // Generate default ACP-compliant options
+            vec![
+                crate::tools::PermissionOption {
+                    option_id: "allow-once".to_string(),
+                    name: "Allow once".to_string(),
+                    kind: crate::tools::PermissionOptionKind::AllowOnce,
+                },
+                crate::tools::PermissionOption {
+                    option_id: "allow-always".to_string(),
+                    name: "Allow always".to_string(),
+                    kind: crate::tools::PermissionOptionKind::AllowAlways,
+                },
+                crate::tools::PermissionOption {
+                    option_id: "reject-once".to_string(),
+                    name: "Reject".to_string(),
+                    kind: crate::tools::PermissionOptionKind::RejectOnce,
+                },
+                crate::tools::PermissionOption {
+                    option_id: "reject-always".to_string(),
+                    name: "Reject always".to_string(),
+                    kind: crate::tools::PermissionOptionKind::RejectAlways,
+                },
+            ]
+        } else {
+            request.options
+        };
+
+        // For this initial implementation, automatically grant "allow-once" permission
+        // In a full implementation, this would present the options to the user and wait for their choice
+        let selected_outcome = crate::tools::PermissionOutcome::Selected {
+            option_id: "allow-once".to_string(),
+        };
+
+        let response = PermissionResponse {
+            outcome: selected_outcome,
+        };
+
+        tracing::info!(
+            "Permission request completed for session: {} with outcome: allow-once",
+            session_id
+        );
+
+        self.log_response("request_permission", &response);
         Ok(response)
     }
 
@@ -3168,5 +3277,124 @@ mod tests {
             agent_client_protocol::V1,
             "Latest supported version should be V1"
         );
+    }
+
+    #[tokio::test]
+    async fn test_request_permission_basic() {
+        let agent = create_test_agent().await;
+        
+        // First create a session
+        let new_session_request = NewSessionRequest {
+            cwd: Some("/tmp".to_string()),
+            client_capabilities: None,
+            meta: None,
+            mcp_servers: vec![],
+        };
+        let session_response = agent.new_session(new_session_request).await.unwrap();
+        
+        // Create a permission request using the new structures
+        let permission_request = PermissionRequest {
+            session_id: session_response.session_id.clone(),
+            tool_call: ToolCallUpdate {
+                tool_call_id: "call_001".to_string(),
+            },
+            options: vec![
+                crate::tools::PermissionOption {
+                    option_id: "allow-once".to_string(),
+                    name: "Allow once".to_string(),
+                    kind: crate::tools::PermissionOptionKind::AllowOnce,
+                },
+                crate::tools::PermissionOption {
+                    option_id: "reject-once".to_string(), 
+                    name: "Reject".to_string(),
+                    kind: crate::tools::PermissionOptionKind::RejectOnce,
+                },
+            ],
+        };
+        
+        // This should not panic and should return appropriate permission response
+        let result = agent.request_permission(permission_request).await;
+        assert!(result.is_ok(), "Permission request should succeed");
+        
+        let response = result.unwrap();
+        match response.outcome {
+            crate::tools::PermissionOutcome::Selected { option_id } => {
+                assert_eq!(option_id, "allow-once", "Should select allow-once by default");
+            }
+            _ => panic!("Expected Selected outcome"),
+        }
+    }
+
+    #[tokio::test] 
+    async fn test_request_permission_generates_default_options() {
+        let agent = create_test_agent().await;
+        
+        // Create a session
+        let new_session_request = NewSessionRequest {
+            cwd: Some("/tmp".to_string()),
+            client_capabilities: None,
+            meta: None,
+            mcp_servers: vec![],
+        };
+        let session_response = agent.new_session(new_session_request).await.unwrap();
+        
+        // Test permission request with empty options (should generate defaults)
+        let permission_request = PermissionRequest {
+            session_id: session_response.session_id.clone(),
+            tool_call: ToolCallUpdate {
+                tool_call_id: "call_002".to_string(),
+            },
+            options: vec![], // Empty options should trigger default generation
+        };
+        
+        let result = agent.request_permission(permission_request).await;
+        assert!(result.is_ok(), "Permission request should succeed");
+        
+        let response = result.unwrap();
+        // Should select allow-once by default in our implementation
+        match response.outcome {
+            crate::tools::PermissionOutcome::Selected { option_id } => {
+                assert_eq!(option_id, "allow-once", "Should select allow-once by default");
+            }
+            _ => panic!("Expected Selected outcome"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_permission_cancelled_session() {
+        let agent = create_test_agent().await;
+        
+        // Create a session
+        let new_session_request = NewSessionRequest {
+            cwd: Some("/tmp".to_string()),
+            client_capabilities: None,
+            meta: None,
+            mcp_servers: vec![],
+        };
+        let session_response = agent.new_session(new_session_request).await.unwrap();
+        let session_id_str = session_response.session_id.0.as_ref().clone();
+        
+        // Cancel the session
+        agent.cancellation_manager.mark_cancelled(&session_id_str, "Test cancellation").await.unwrap();
+        
+        // Test permission request for cancelled session
+        let permission_request = PermissionRequest {
+            session_id: session_response.session_id.clone(),
+            tool_call: ToolCallUpdate {
+                tool_call_id: "call_003".to_string(),
+            },
+            options: vec![],
+        };
+        
+        let result = agent.request_permission(permission_request).await;
+        assert!(result.is_ok(), "Permission request should succeed even for cancelled session");
+        
+        let response = result.unwrap();
+        match response.outcome {
+            crate::tools::PermissionOutcome::Cancelled => {
+                // This is expected for cancelled sessions
+            }
+            _ => panic!("Expected Cancelled outcome for cancelled session"),
+        }
     }
 }

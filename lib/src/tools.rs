@@ -114,6 +114,64 @@ pub enum ToolCallResult {
     Error(String),
 }
 
+/// ACP-compliant permission option for user choice
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PermissionOption {
+    /// Unique identifier for this permission option
+    pub option_id: String,
+    /// Human-readable name for the option
+    pub name: String,
+    /// The kind of permission action this option represents
+    pub kind: PermissionOptionKind,
+}
+
+/// ACP permission option kinds as defined in the specification
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionOptionKind {
+    /// Allow this specific tool call once
+    AllowOnce,
+    /// Allow all future calls of this tool type
+    AllowAlways,
+    /// Reject this specific tool call once
+    RejectOnce,
+    /// Reject all future calls of this tool type
+    RejectAlways,
+}
+
+/// Enhanced permission request with multiple user options (ACP-compliant)
+#[derive(Debug, Clone)]
+pub struct EnhancedPermissionRequest {
+    /// Session identifier for the permission request
+    pub session_id: String,
+    /// ID of the tool request requiring permission
+    pub tool_request_id: String,
+    /// Name of the tool requiring permission
+    pub tool_name: String,
+    /// Human-readable description of what the tool will do
+    pub description: String,
+    /// Original arguments for the tool request
+    pub arguments: serde_json::Value,
+    /// Available permission options for the user
+    pub options: Vec<PermissionOption>,
+}
+
+/// Outcome of a permission request
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "outcome")]
+pub enum PermissionOutcome {
+    /// User cancelled the permission request
+    #[serde(rename = "cancelled")]
+    Cancelled,
+    /// User selected one of the permission options
+    #[serde(rename = "selected")]
+    Selected {
+        /// The ID of the selected permission option
+        #[serde(rename = "optionId")]
+        option_id: String,
+    },
+}
+
 /// Request for permission to execute a tool
 #[derive(Debug, Clone)]
 pub struct PermissionRequest {
@@ -733,6 +791,133 @@ impl ToolCallHandler {
             )),
         }
     }
+
+    #[test]
+    fn test_permission_option_creation() {
+        let option = PermissionOption {
+            option_id: "allow-once".to_string(),
+            name: "Allow once".to_string(),
+            kind: PermissionOptionKind::AllowOnce,
+        };
+        
+        assert_eq!(option.option_id, "allow-once");
+        assert_eq!(option.name, "Allow once");
+        assert!(matches!(option.kind, PermissionOptionKind::AllowOnce));
+    }
+
+    #[test]
+    fn test_enhanced_permission_request() {
+        let options = vec![
+            PermissionOption {
+                option_id: "allow-once".to_string(),
+                name: "Allow once".to_string(),
+                kind: PermissionOptionKind::AllowOnce,
+            },
+            PermissionOption {
+                option_id: "reject-once".to_string(),
+                name: "Reject".to_string(),
+                kind: PermissionOptionKind::RejectOnce,
+            },
+        ];
+
+        let request = EnhancedPermissionRequest {
+            session_id: "session-123".to_string(),
+            tool_request_id: "tool-456".to_string(),
+            tool_name: "fs_write".to_string(),
+            description: "Write to file".to_string(),
+            arguments: serde_json::json!({"path": "/test.txt"}),
+            options,
+        };
+
+        assert_eq!(request.session_id, "session-123");
+        assert_eq!(request.options.len(), 2);
+        assert_eq!(request.options[0].option_id, "allow-once");
+        assert_eq!(request.options[1].option_id, "reject-once");
+    }
+
+    #[test]
+    fn test_permission_outcome_serialization() {
+        let outcome = PermissionOutcome::Selected {
+            option_id: "allow-once".to_string(),
+        };
+        
+        match outcome {
+            PermissionOutcome::Selected { option_id } => {
+                assert_eq!(option_id, "allow-once");
+            },
+            _ => panic!("Expected Selected outcome"),
+        }
+
+        let cancelled_outcome = PermissionOutcome::Cancelled;
+        assert!(matches!(cancelled_outcome, PermissionOutcome::Cancelled));
+    }
+
+    #[test]
+    fn test_generate_permission_options_safe_tool() {
+        let handler = create_test_handler();
+        
+        let request = InternalToolRequest {
+            id: "test-id".to_string(),
+            name: "fs_read".to_string(),
+            arguments: json!({"path": "/safe/file.txt"}),
+        };
+
+        let options = handler.generate_permission_options(&request);
+        
+        // Safe read operations should offer all options
+        assert_eq!(options.len(), 4);
+        assert!(options.iter().any(|o| o.kind == PermissionOptionKind::AllowOnce));
+        assert!(options.iter().any(|o| o.kind == PermissionOptionKind::AllowAlways));
+        assert!(options.iter().any(|o| o.kind == PermissionOptionKind::RejectOnce));
+        assert!(options.iter().any(|o| o.kind == PermissionOptionKind::RejectAlways));
+    }
+
+    #[test]
+    fn test_generate_permission_options_dangerous_tool() {
+        let handler = create_test_handler();
+        
+        let request = InternalToolRequest {
+            id: "test-id".to_string(),
+            name: "fs_write".to_string(),
+            arguments: json!({"path": "/important/config.txt", "content": "new config"}),
+        };
+
+        let options = handler.generate_permission_options(&request);
+        
+        // Dangerous operations should offer all options but with appropriate warnings
+        assert_eq!(options.len(), 4);
+        assert!(options.iter().any(|o| o.kind == PermissionOptionKind::AllowOnce));
+        assert!(options.iter().any(|o| o.kind == PermissionOptionKind::AllowAlways));
+        assert!(options.iter().any(|o| o.kind == PermissionOptionKind::RejectOnce));
+        assert!(options.iter().any(|o| o.kind == PermissionOptionKind::RejectAlways));
+        
+        // Check that "allow always" option has warning text
+        let allow_always_option = options.iter().find(|o| o.kind == PermissionOptionKind::AllowAlways).unwrap();
+        assert!(allow_always_option.name.contains("caution") || allow_always_option.name.contains("warning"));
+    }
+
+    #[test]
+    fn test_generate_permission_options_terminal_tool() {
+        let handler = create_test_handler();
+        
+        let request = InternalToolRequest {
+            id: "test-id".to_string(),
+            name: "terminal_write".to_string(),
+            arguments: json!({"terminal_id": "term-123", "command": "ls -la"}),
+        };
+
+        let options = handler.generate_permission_options(&request);
+        
+        // Terminal operations should be treated as high-risk
+        assert_eq!(options.len(), 4);
+        
+        // Verify option IDs follow ACP pattern
+        let option_ids: Vec<&str> = options.iter().map(|o| o.option_id.as_str()).collect();
+        assert!(option_ids.contains(&"allow-once"));
+        assert!(option_ids.contains(&"allow-always"));
+        assert!(option_ids.contains(&"reject-once"));
+        assert!(option_ids.contains(&"reject-always"));
+    }
 }
 
 impl ToolCallHandler {
@@ -770,6 +955,138 @@ impl ToolCallHandler {
             arguments: request.arguments.clone(),
         })
     }
+
+    /// Generate ACP-compliant permission options for a tool request
+    pub fn generate_permission_options(&self, request: &InternalToolRequest) -> Vec<PermissionOption> {
+        // ACP requires comprehensive permission system with user choice:
+        // 1. Multiple permission options: allow/reject with once/always variants
+        // 2. Permission persistence: Remember "always" decisions across sessions
+        // 3. Tool call integration: Block execution until permission granted
+        // 4. Cancellation support: Handle cancelled prompt turns gracefully
+        // 5. Context awareness: Generate appropriate options for different tools
+        //
+        // Advanced permissions provide user control while maintaining security.
+        
+        let tool_risk_level = self.assess_tool_risk(&request.name, &request.arguments);
+        
+        match tool_risk_level {
+            ToolRiskLevel::Safe => {
+                vec![
+                    PermissionOption {
+                        option_id: "allow-once".to_string(),
+                        name: "Allow once".to_string(),
+                        kind: PermissionOptionKind::AllowOnce,
+                    },
+                    PermissionOption {
+                        option_id: "allow-always".to_string(),
+                        name: "Allow always".to_string(),
+                        kind: PermissionOptionKind::AllowAlways,
+                    },
+                    PermissionOption {
+                        option_id: "reject-once".to_string(),
+                        name: "Reject".to_string(),
+                        kind: PermissionOptionKind::RejectOnce,
+                    },
+                    PermissionOption {
+                        option_id: "reject-always".to_string(),
+                        name: "Reject always".to_string(),
+                        kind: PermissionOptionKind::RejectAlways,
+                    },
+                ]
+            }
+            ToolRiskLevel::Moderate => {
+                vec![
+                    PermissionOption {
+                        option_id: "allow-once".to_string(),
+                        name: "Allow once".to_string(),
+                        kind: PermissionOptionKind::AllowOnce,
+                    },
+                    PermissionOption {
+                        option_id: "allow-always".to_string(),
+                        name: "Allow always (use with caution)".to_string(),
+                        kind: PermissionOptionKind::AllowAlways,
+                    },
+                    PermissionOption {
+                        option_id: "reject-once".to_string(),
+                        name: "Reject".to_string(),
+                        kind: PermissionOptionKind::RejectOnce,
+                    },
+                    PermissionOption {
+                        option_id: "reject-always".to_string(),
+                        name: "Reject always".to_string(),
+                        kind: PermissionOptionKind::RejectAlways,
+                    },
+                ]
+            }
+            ToolRiskLevel::High => {
+                vec![
+                    PermissionOption {
+                        option_id: "allow-once".to_string(),
+                        name: "Allow once".to_string(),
+                        kind: PermissionOptionKind::AllowOnce,
+                    },
+                    PermissionOption {
+                        option_id: "allow-always".to_string(),
+                        name: "Allow always (warning: high-risk operation)".to_string(),
+                        kind: PermissionOptionKind::AllowAlways,
+                    },
+                    PermissionOption {
+                        option_id: "reject-once".to_string(),
+                        name: "Reject".to_string(),
+                        kind: PermissionOptionKind::RejectOnce,
+                    },
+                    PermissionOption {
+                        option_id: "reject-always".to_string(),
+                        name: "Reject always".to_string(),
+                        kind: PermissionOptionKind::RejectAlways,
+                    },
+                ]
+            }
+        }
+    }
+
+    /// Assess the risk level of a tool operation
+    fn assess_tool_risk(&self, tool_name: &str, arguments: &serde_json::Value) -> ToolRiskLevel {
+        match tool_name {
+            // File read operations are generally safe
+            "fs_read" | "fs_list" => ToolRiskLevel::Safe,
+            
+            // File write operations have moderate risk
+            "fs_write" => {
+                // Check if writing to sensitive locations
+                if let Ok(args) = self.parse_tool_args(arguments) {
+                    if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                        let sensitive_patterns = ["/etc", "/usr", "/bin", "/sys", "/proc"];
+                        if sensitive_patterns.iter().any(|&pattern| path.starts_with(pattern)) {
+                            return ToolRiskLevel::High;
+                        }
+                        // Configuration files are moderate risk
+                        if path.ends_with(".conf") || path.ends_with(".config") || path.contains("config") {
+                            return ToolRiskLevel::Moderate;
+                        }
+                    }
+                }
+                ToolRiskLevel::Moderate
+            }
+            
+            // Terminal operations are high risk
+            "terminal_create" | "terminal_write" => ToolRiskLevel::High,
+            
+            // Unknown tools are treated as moderate risk
+            _ => ToolRiskLevel::Moderate,
+        }
+    }
+}
+
+/// Risk assessment levels for tool operations
+#[derive(Debug, Clone, PartialEq)]
+enum ToolRiskLevel {
+    /// Safe operations with minimal risk
+    Safe,
+    /// Moderate risk operations requiring caution
+    Moderate,  
+    /// High-risk operations requiring careful consideration
+    High,
 }
 
 #[cfg(test)]
