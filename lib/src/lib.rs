@@ -9,6 +9,7 @@ pub mod claude;
 pub mod config;
 pub mod error;
 pub mod mcp;
+pub mod path_validator;
 pub mod server;
 pub mod session;
 pub mod tools;

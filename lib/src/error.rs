@@ -6,7 +6,7 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum McpError {
     /// Failed to spawn an MCP server process
-    /// 
+    ///
     /// Occurs when the system cannot execute the MCP server command,
     /// typically due to missing executable, insufficient permissions,
     /// or invalid command configuration.
@@ -14,98 +14,98 @@ pub enum McpError {
     ProcessSpawnFailed(String, #[source] std::io::Error),
 
     /// MCP server stdin stream is not available for writing
-    /// 
+    ///
     /// Occurs when attempting to send messages to an MCP server
     /// whose stdin pipe has been closed or is not accessible.
     #[error("MCP server stdin not available")]
     StdinNotAvailable,
 
     /// MCP server stdout stream is not available for reading
-    /// 
+    ///
     /// Occurs when attempting to read responses from an MCP server
     /// whose stdout pipe has been closed or is not accessible.
     #[error("MCP server stdout not available")]
     StdoutNotAvailable,
 
     /// MCP server stderr stream is not available for reading
-    /// 
+    ///
     /// Occurs when attempting to read error messages from an MCP server
     /// whose stderr pipe has been closed or is not accessible.
     #[error("MCP server stderr not available")]
     StderrNotAvailable,
 
     /// MCP server returned an error response
-    /// 
+    ///
     /// Occurs when the MCP server processes a request successfully
     /// but returns an error result according to the MCP protocol.
     #[error("MCP server error: {0}")]
     ServerError(serde_json::Value),
 
     /// MCP protocol violation or malformed message
-    /// 
+    ///
     /// Occurs when messages don't conform to the MCP protocol specification,
     /// such as missing required fields or invalid message structure.
     #[error("MCP protocol error: {0}")]
     ProtocolError(String),
 
     /// MCP server connection closed unexpectedly
-    /// 
+    ///
     /// Occurs when the MCP server process terminates or closes its
     /// communication channels while still expected to be active.
     #[error("MCP connection closed unexpectedly")]
     ConnectionClosed,
 
     /// MCP response message missing required result field
-    /// 
+    ///
     /// Occurs when an MCP server response is received but lacks
     /// the expected result field for successful operations.
     #[error("MCP response missing result field")]
     MissingResult,
 
     /// MCP server initialization handshake failed
-    /// 
+    ///
     /// Occurs during the initial MCP protocol handshake when the server
     /// fails to respond correctly to initialization requests.
     #[error("MCP server initialization failed: {0}")]
     InitializationFailed(String),
 
     /// Failed to retrieve tools list from MCP server
-    /// 
+    ///
     /// Occurs when the MCP server fails to respond to a tools/list
     /// request or returns an invalid tools list response.
     #[error("MCP server tools list request failed: {0}")]
     ToolsListFailed(String),
 
     /// MCP server configuration is invalid
-    /// 
+    ///
     /// Occurs when MCP server configuration contains invalid values,
     /// missing required fields, or unsupported transport types.
     #[error("Invalid MCP configuration: {0}")]
     InvalidConfiguration(String),
 
     /// JSON message serialization or deserialization failed
-    /// 
+    ///
     /// Occurs when converting MCP messages to/from JSON format fails,
     /// typically due to malformed JSON or incompatible data structures.
     #[error("MCP message serialization failed: {0}")]
     SerializationFailed(#[from] serde_json::Error),
 
     /// Input/output operation failed
-    /// 
+    ///
     /// Occurs when reading from or writing to MCP server pipes fails
     /// due to system-level I/O errors.
     #[error("MCP I/O error: {0}")]
     IoError(#[from] std::io::Error),
 
     /// MCP request timed out waiting for response
-    /// 
+    ///
     /// Occurs when an MCP server doesn't respond within the configured
     /// timeout period for request-response operations.
     #[error("MCP request timeout")]
     RequestTimeout,
 
     /// MCP server process terminated unexpectedly
-    /// 
+    ///
     /// Occurs when the MCP server process crashes or exits with
     /// a non-zero status code during normal operation.
     #[error("MCP server process crashed")]

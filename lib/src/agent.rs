@@ -299,7 +299,8 @@ impl ClaudeAgent {
         };
 
         // Create cancellation manager for session cancellation support
-        let (cancellation_manager, _cancellation_receiver) = CancellationManager::new(config.cancellation_buffer_size);
+        let (cancellation_manager, _cancellation_receiver) =
+            CancellationManager::new(config.cancellation_buffer_size);
 
         let agent = Self {
             session_manager,
@@ -1125,7 +1126,7 @@ impl ClaudeAgent {
     }
 
     /// Cancel ongoing Claude API requests for a session
-    /// 
+    ///
     /// Note: This is a minimal implementation that registers cancellation state.
     /// Individual request cancellation is not yet implemented as the ClaudeClient
     /// doesn't currently track requests by session. The cancellation state is
@@ -1145,7 +1146,7 @@ impl ClaudeAgent {
     }
 
     /// Cancel ongoing tool executions for a session  
-    /// 
+    ///
     /// Note: This is a minimal implementation that registers cancellation state.
     /// Individual tool execution cancellation is not yet implemented as the
     /// ToolCallHandler doesn't track executions by session. The cancellation
@@ -1164,7 +1165,7 @@ impl ClaudeAgent {
     }
 
     /// Cancel pending permission requests for a session
-    /// 
+    ///
     /// Note: This is a minimal implementation that registers cancellation state.
     /// Individual permission request cancellation is not yet implemented as
     /// permission requests are not currently tracked by session. The cancellation

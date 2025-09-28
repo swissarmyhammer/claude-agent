@@ -7,6 +7,7 @@
 //! to clients, not for handling incoming requests. This module defines internal
 //! types for request handling and converts to protocol types when needed.
 
+use crate::path_validator::{PathValidationError, PathValidator};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -517,57 +518,102 @@ impl ToolCallHandler {
 }
 
 impl ToolCallHandler {
-    /// Validate file path for security violations
+    /// ACP-compliant file path validation with comprehensive security checks
     fn validate_file_path(&self, path: &str) -> crate::Result<()> {
-        use std::path::Path;
+        // ACP requires strict absolute path validation:
+        // 1. All paths MUST be absolute (no relative paths allowed)
+        // 2. Unix: Must start with /
+        // 3. Windows: Must include drive letter (C:\) or UNC path
+        // 4. Path traversal prevention (no ../ components)
+        // 5. Cross-platform normalization and security validation
+        //
+        // Path validation prevents security issues and ensures protocol compliance.
 
-        let path = Path::new(path);
+        // Create path validator with non-strict canonicalization to avoid file existence checks
+        let validator = PathValidator::new().with_strict_canonicalization(false);
 
-        // Check for directory traversal attempts
-        if path.to_string_lossy().contains("..") {
-            return Err(crate::AgentError::ToolExecution(
-                "Path traversal not allowed".to_string(),
-            ));
-        }
-
-        // Check for null bytes
-        if path.to_string_lossy().contains('\0') {
-            return Err(crate::AgentError::ToolExecution(
-                "Null bytes in path not allowed".to_string(),
-            ));
-        }
-
-        // Check for absolute paths outside allowed directories
-        if path.is_absolute() {
-            let path_str = path.to_string_lossy();
-
-            for prefix in &self.permissions.forbidden_paths {
-                if path_str.starts_with(prefix) {
-                    return Err(crate::AgentError::ToolExecution(format!(
-                        "Access to {} is forbidden",
-                        prefix
-                    )));
+        // Validate absolute path according to ACP specification
+        let validated_path = validator.validate_absolute_path(path).map_err(|e| {
+            match e {
+                PathValidationError::NotAbsolute(p) => {
+                    crate::AgentError::ToolExecution(format!(
+                        "Invalid path: must be absolute path. Provided: '{}'. Examples: Unix: '/home/user/file.txt', Windows: 'C:\\\\Users\\\\user\\\\file.txt'",
+                        p
+                    ))
+                }
+                PathValidationError::PathTraversalAttempt => {
+                    crate::AgentError::ToolExecution(
+                        "Path traversal attempt detected. Parent directory references (..) are not allowed".to_string()
+                    )
+                }
+                PathValidationError::RelativeComponent => {
+                    crate::AgentError::ToolExecution(
+                        "Path contains relative components (. or ..) which are not allowed".to_string()
+                    )
+                }
+                PathValidationError::PathTooLong(actual, max) => {
+                    crate::AgentError::ToolExecution(format!(
+                        "Path too long: {} characters exceeds maximum of {} characters", actual, max
+                    ))
+                }
+                PathValidationError::NullBytesInPath => {
+                    crate::AgentError::ToolExecution(
+                        "Null bytes in path not allowed".to_string()
+                    )
+                }
+                PathValidationError::EmptyPath => {
+                    crate::AgentError::ToolExecution(
+                        "Empty path provided".to_string()
+                    )
+                }
+                PathValidationError::CanonicalizationFailed(path, err) => {
+                    crate::AgentError::ToolExecution(format!(
+                        "Path canonicalization failed for '{}': {}", path, err
+                    ))
+                }
+                PathValidationError::OutsideBoundaries(path) => {
+                    crate::AgentError::ToolExecution(format!(
+                        "Path outside allowed boundaries: {}", path
+                    ))
+                }
+                PathValidationError::InvalidFormat(msg) => {
+                    crate::AgentError::ToolExecution(format!(
+                        "Invalid path format: {}", msg
+                    ))
                 }
             }
+        })?;
 
-            // Additional forbidden system directories
-            let forbidden_prefixes = ["/etc", "/usr", "/bin", "/sys", "/proc", "/dev"];
-            for prefix in &forbidden_prefixes {
-                if path_str.starts_with(prefix) {
-                    return Err(crate::AgentError::ToolExecution(format!(
-                        "Access to {} is forbidden",
-                        prefix
-                    )));
-                }
+        // Additional security checks beyond ACP requirements
+        let path_str = validated_path.to_string_lossy();
+
+        // Check against forbidden paths from configuration
+        for prefix in &self.permissions.forbidden_paths {
+            if path_str.starts_with(prefix) {
+                return Err(crate::AgentError::ToolExecution(format!(
+                    "Access to {} is forbidden by configuration",
+                    prefix
+                )));
+            }
+        }
+
+        // Additional forbidden system directories for security
+        let forbidden_prefixes = ["/etc", "/usr", "/bin", "/sys", "/proc", "/dev"];
+        for prefix in &forbidden_prefixes {
+            if path_str.starts_with(prefix) {
+                return Err(crate::AgentError::ToolExecution(format!(
+                    "Access to system directory {} is forbidden for security",
+                    prefix
+                )));
             }
         }
 
         // Check file extension restrictions for write operations
-        if let Some(ext) = path.extension() {
+        if let Some(ext) = validated_path.extension() {
             let dangerous_extensions = ["exe", "bat", "cmd", "scr", "com", "pif"];
             if dangerous_extensions.contains(&ext.to_string_lossy().as_ref()) {
                 return Err(crate::AgentError::ToolExecution(format!(
-                    "File extension .{} is not allowed",
+                    "File extension .{} is not allowed for security",
                     ext.to_string_lossy()
                 )));
             }
@@ -769,10 +815,10 @@ mod tests {
 
         match result {
             ToolCallResult::Error(msg) => {
-                // Expected - path traversal should be blocked
-                assert!(msg.contains("Path traversal not allowed"));
+                // Expected - relative path should be blocked (ACP requires absolute paths)
+                assert!(msg.contains("must be absolute path"));
             }
-            _ => panic!("Expected error for dangerous path"),
+            _ => panic!("Expected error for relative path"),
         }
     }
 
@@ -830,10 +876,8 @@ mod tests {
     fn test_validate_file_path_safe() {
         let handler = create_test_handler();
 
-        // These paths should be allowed
+        // These paths should be allowed (ACP requires absolute paths only)
         let safe_paths = vec![
-            "relative/path/file.txt",
-            "./local/file.txt",
             "/home/user/document.txt",
             "/tmp/safe_file.txt",
         ];
@@ -867,6 +911,36 @@ mod tests {
                 handler.validate_file_path(path).is_err(),
                 "Path should be blocked: {}",
                 path
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_file_path_relative_rejected() {
+        let handler = create_test_handler();
+
+        // These relative paths should be rejected per ACP specification
+        let relative_paths = vec![
+            "relative/path/file.txt",
+            "./local/file.txt",
+            "../parent/dir/file.txt",
+            "file.txt",
+            "src/main.rs",
+        ];
+
+        for path in relative_paths {
+            let result = handler.validate_file_path(path);
+            assert!(
+                result.is_err(),
+                "Relative path should be rejected per ACP spec: {}",
+                path
+            );
+            // Verify it's specifically an absolute path error
+            let error_msg = result.unwrap_err().to_string();
+            assert!(
+                error_msg.contains("must be absolute path"),
+                "Error should mention absolute path requirement for '{}', got: {}",
+                path, error_msg
             );
         }
     }
@@ -1077,6 +1151,212 @@ mod tests {
             }
             _ => panic!("CD operation should succeed"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_acp_absolute_path_requirement() {
+        let permissions = ToolPermissions {
+            require_permission_for: vec![],
+            auto_approved: vec!["fs_read".to_string(), "fs_write".to_string()],
+            forbidden_paths: vec![],
+        };
+        let handler = ToolCallHandler::new(permissions);
+
+        // Test relative paths are rejected with proper ACP error messages
+        let relative_paths = vec![
+            "relative/path/file.txt",
+            "./current/dir/file.txt",
+            "../parent/dir/file.txt",
+            "src/main.rs",
+            "config/settings.json",
+        ];
+
+        for path in relative_paths {
+            let read_request = InternalToolRequest {
+                id: "read-test".to_string(),
+                name: "fs_read".to_string(),
+                arguments: json!({
+                    "path": path
+                }),
+            };
+
+            let result = handler.handle_tool_request(read_request).await.unwrap();
+            match result {
+                ToolCallResult::Error(msg) => {
+                    assert!(
+                        msg.contains("must be absolute path"),
+                        "Error message should mention absolute path requirement for '{}': {}",
+                        path,
+                        msg
+                    );
+                    assert!(
+                        msg.contains("Examples:"),
+                        "Error message should include examples for '{}': {}",
+                        path,
+                        msg
+                    );
+                }
+                _ => panic!("Relative path '{}' should be rejected", path),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_acp_absolute_path_acceptance() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test_file.txt");
+
+        // Write test content to file first
+        tokio::fs::write(&file_path, "ACP test content")
+            .await
+            .unwrap();
+
+        let file_path_str = file_path.to_string_lossy();
+
+        let permissions = ToolPermissions {
+            require_permission_for: vec![],
+            auto_approved: vec!["fs_read".to_string(), "fs_write".to_string()],
+            forbidden_paths: vec![],
+        };
+        let handler = ToolCallHandler::new(permissions);
+
+        // Test that absolute path is accepted
+        let read_request = InternalToolRequest {
+            id: "read-test".to_string(),
+            name: "fs_read".to_string(),
+            arguments: json!({
+                "path": file_path_str
+            }),
+        };
+
+        let result = handler.handle_tool_request(read_request).await.unwrap();
+        match result {
+            ToolCallResult::Success(content) => {
+                assert_eq!(content, "ACP test content");
+            }
+            ToolCallResult::Error(msg) => panic!("Absolute path should be accepted: {}", msg),
+            _ => panic!("Expected success for absolute path"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_acp_path_traversal_prevention() {
+        let permissions = ToolPermissions {
+            require_permission_for: vec![],
+            auto_approved: vec!["fs_read".to_string()],
+            forbidden_paths: vec![],
+        };
+        let handler = ToolCallHandler::new(permissions);
+
+        // Test path traversal attempts are blocked
+        let traversal_paths = vec![
+            "/home/user/../../../etc/passwd",
+            "/tmp/../../../root/.ssh/id_rsa",
+        ];
+
+        for path in traversal_paths {
+            let read_request = InternalToolRequest {
+                id: "read-test".to_string(),
+                name: "fs_read".to_string(),
+                arguments: json!({
+                    "path": path
+                }),
+            };
+
+            let result = handler.handle_tool_request(read_request).await.unwrap();
+            match result {
+                ToolCallResult::Error(msg) => {
+                    assert!(
+                        msg.contains("traversal") || msg.contains("relative"),
+                        "Error message should mention path traversal prevention for '{}': {}",
+                        path,
+                        msg
+                    );
+                }
+                _ => panic!("Path traversal attempt '{}' should be blocked", path),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_acp_error_message_format() {
+        let permissions = ToolPermissions {
+            require_permission_for: vec![],
+            auto_approved: vec!["fs_read".to_string()],
+            forbidden_paths: vec![],
+        };
+        let handler = ToolCallHandler::new(permissions);
+
+        // Test that error messages include proper ACP examples
+        let read_request = InternalToolRequest {
+            id: "read-test".to_string(),
+            name: "fs_read".to_string(),
+            arguments: json!({
+                "path": "relative/file.txt"
+            }),
+        };
+
+        let result = handler.handle_tool_request(read_request).await.unwrap();
+        match result {
+            ToolCallResult::Error(msg) => {
+                // Verify error message contains ACP-compliant examples
+                assert!(
+                    msg.contains("/home/user/file.txt") || msg.contains("Unix:"),
+                    "Error should include Unix example: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("C:\\\\Users\\\\user\\\\file.txt") || msg.contains("Windows:"),
+                    "Error should include Windows example: {}",
+                    msg
+                );
+            }
+            _ => panic!("Expected error for relative path"),
+        }
+    }
+
+    #[test]
+    fn test_acp_empty_path_handling() {
+        let permissions = ToolPermissions {
+            require_permission_for: vec![],
+            auto_approved: vec![],
+            forbidden_paths: vec![],
+        };
+        let handler = ToolCallHandler::new(permissions);
+
+        // Test empty path is handled properly
+        let result = handler.validate_file_path("");
+        assert!(result.is_err(), "Empty path should be rejected");
+
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("Empty path"),
+            "Error should mention empty path: {}",
+            error_msg
+        );
+    }
+
+    #[test]
+    fn test_acp_null_byte_prevention() {
+        let permissions = ToolPermissions {
+            require_permission_for: vec![],
+            auto_approved: vec![],
+            forbidden_paths: vec![],
+        };
+        let handler = ToolCallHandler::new(permissions);
+
+        // Test null byte injection is prevented
+        let result = handler.validate_file_path("/path/with\0null/byte");
+        assert!(result.is_err(), "Path with null byte should be rejected");
+
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("Null bytes"),
+            "Error should mention null bytes: {}",
+            error_msg
+        );
     }
 
     #[test]
