@@ -12,6 +12,7 @@ pub mod error;
 pub mod mcp;
 pub mod mcp_error_handling;
 pub mod path_validator;
+pub mod permissions;
 pub mod request_validation;
 pub mod server;
 pub mod session;

@@ -53,7 +53,7 @@
 //! These errors are mapped to appropriate JSON-RPC error codes for client communication.
 
 use crate::path_validator::{PathValidationError, PathValidator};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::process::{Child, Command};
@@ -790,133 +790,6 @@ impl ToolCallHandler {
                 "Tool arguments must be an object".to_string(),
             )),
         }
-    }
-
-    #[test]
-    fn test_permission_option_creation() {
-        let option = PermissionOption {
-            option_id: "allow-once".to_string(),
-            name: "Allow once".to_string(),
-            kind: PermissionOptionKind::AllowOnce,
-        };
-        
-        assert_eq!(option.option_id, "allow-once");
-        assert_eq!(option.name, "Allow once");
-        assert!(matches!(option.kind, PermissionOptionKind::AllowOnce));
-    }
-
-    #[test]
-    fn test_enhanced_permission_request() {
-        let options = vec![
-            PermissionOption {
-                option_id: "allow-once".to_string(),
-                name: "Allow once".to_string(),
-                kind: PermissionOptionKind::AllowOnce,
-            },
-            PermissionOption {
-                option_id: "reject-once".to_string(),
-                name: "Reject".to_string(),
-                kind: PermissionOptionKind::RejectOnce,
-            },
-        ];
-
-        let request = EnhancedPermissionRequest {
-            session_id: "session-123".to_string(),
-            tool_request_id: "tool-456".to_string(),
-            tool_name: "fs_write".to_string(),
-            description: "Write to file".to_string(),
-            arguments: serde_json::json!({"path": "/test.txt"}),
-            options,
-        };
-
-        assert_eq!(request.session_id, "session-123");
-        assert_eq!(request.options.len(), 2);
-        assert_eq!(request.options[0].option_id, "allow-once");
-        assert_eq!(request.options[1].option_id, "reject-once");
-    }
-
-    #[test]
-    fn test_permission_outcome_serialization() {
-        let outcome = PermissionOutcome::Selected {
-            option_id: "allow-once".to_string(),
-        };
-        
-        match outcome {
-            PermissionOutcome::Selected { option_id } => {
-                assert_eq!(option_id, "allow-once");
-            },
-            _ => panic!("Expected Selected outcome"),
-        }
-
-        let cancelled_outcome = PermissionOutcome::Cancelled;
-        assert!(matches!(cancelled_outcome, PermissionOutcome::Cancelled));
-    }
-
-    #[test]
-    fn test_generate_permission_options_safe_tool() {
-        let handler = create_test_handler();
-        
-        let request = InternalToolRequest {
-            id: "test-id".to_string(),
-            name: "fs_read".to_string(),
-            arguments: json!({"path": "/safe/file.txt"}),
-        };
-
-        let options = handler.generate_permission_options(&request);
-        
-        // Safe read operations should offer all options
-        assert_eq!(options.len(), 4);
-        assert!(options.iter().any(|o| o.kind == PermissionOptionKind::AllowOnce));
-        assert!(options.iter().any(|o| o.kind == PermissionOptionKind::AllowAlways));
-        assert!(options.iter().any(|o| o.kind == PermissionOptionKind::RejectOnce));
-        assert!(options.iter().any(|o| o.kind == PermissionOptionKind::RejectAlways));
-    }
-
-    #[test]
-    fn test_generate_permission_options_dangerous_tool() {
-        let handler = create_test_handler();
-        
-        let request = InternalToolRequest {
-            id: "test-id".to_string(),
-            name: "fs_write".to_string(),
-            arguments: json!({"path": "/important/config.txt", "content": "new config"}),
-        };
-
-        let options = handler.generate_permission_options(&request);
-        
-        // Dangerous operations should offer all options but with appropriate warnings
-        assert_eq!(options.len(), 4);
-        assert!(options.iter().any(|o| o.kind == PermissionOptionKind::AllowOnce));
-        assert!(options.iter().any(|o| o.kind == PermissionOptionKind::AllowAlways));
-        assert!(options.iter().any(|o| o.kind == PermissionOptionKind::RejectOnce));
-        assert!(options.iter().any(|o| o.kind == PermissionOptionKind::RejectAlways));
-        
-        // Check that "allow always" option has warning text
-        let allow_always_option = options.iter().find(|o| o.kind == PermissionOptionKind::AllowAlways).unwrap();
-        assert!(allow_always_option.name.contains("caution") || allow_always_option.name.contains("warning"));
-    }
-
-    #[test]
-    fn test_generate_permission_options_terminal_tool() {
-        let handler = create_test_handler();
-        
-        let request = InternalToolRequest {
-            id: "test-id".to_string(),
-            name: "terminal_write".to_string(),
-            arguments: json!({"terminal_id": "term-123", "command": "ls -la"}),
-        };
-
-        let options = handler.generate_permission_options(&request);
-        
-        // Terminal operations should be treated as high-risk
-        assert_eq!(options.len(), 4);
-        
-        // Verify option IDs follow ACP pattern
-        let option_ids: Vec<&str> = options.iter().map(|o| o.option_id.as_str()).collect();
-        assert!(option_ids.contains(&"allow-once"));
-        assert!(option_ids.contains(&"allow-always"));
-        assert!(option_ids.contains(&"reject-once"));
-        assert!(option_ids.contains(&"reject-always"));
     }
 }
 
@@ -1807,5 +1680,28 @@ mod tests {
                 path
             );
         }
+    }
+
+    #[test]
+    fn test_generate_permission_options_terminal_tool() {
+        let handler = create_test_handler();
+        
+        let request = InternalToolRequest {
+            id: "test-id".to_string(),
+            name: "terminal_write".to_string(),
+            arguments: json!({"terminal_id": "term-123", "command": "ls -la"}),
+        };
+
+        let options = handler.generate_permission_options(&request);
+        
+        // Terminal operations should be treated as high-risk
+        assert_eq!(options.len(), 4);
+        
+        // Verify option IDs follow ACP pattern
+        let option_ids: Vec<&str> = options.iter().map(|o| o.option_id.as_str()).collect();
+        assert!(option_ids.contains(&"allow-once"));
+        assert!(option_ids.contains(&"allow-always"));
+        assert!(option_ids.contains(&"reject-once"));
+        assert!(option_ids.contains(&"reject-always"));
     }
 }

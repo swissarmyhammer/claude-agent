@@ -1,7 +1,7 @@
 //! Agent Client Protocol implementation for Claude Agent
 
 use crate::{
-    claude::ClaudeClient, config::AgentConfig, session::SessionManager, tools::ToolCallHandler,
+    claude::ClaudeClient, config::AgentConfig, permissions::{FilePermissionStorage, PermissionDecision, PermissionPolicyEngine, PolicyEvaluation}, session::SessionManager, tools::ToolCallHandler,
 };
 use agent_client_protocol::{
     Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
@@ -253,6 +253,7 @@ pub struct ClaudeAgent {
     capabilities: AgentCapabilities,
     notification_sender: Arc<NotificationSender>,
     cancellation_manager: Arc<CancellationManager>,
+    permission_engine: Arc<PermissionPolicyEngine>,
 }
 
 impl ClaudeAgent {
@@ -330,6 +331,14 @@ impl ClaudeAgent {
         let (cancellation_manager, _cancellation_receiver) =
             CancellationManager::new(config.cancellation_buffer_size);
 
+        // Create permission policy engine with file-based storage
+        let storage_path = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(".claude-agent")
+            .join("permissions");
+        let storage = FilePermissionStorage::new(storage_path);
+        let permission_engine = Arc::new(PermissionPolicyEngine::new(Box::new(storage)));
+
         let agent = Self {
             session_manager,
             claude_client,
@@ -339,6 +348,7 @@ impl ClaudeAgent {
             capabilities,
             notification_sender: Arc::new(notification_sender),
             cancellation_manager: Arc::new(cancellation_manager),
+            permission_engine,
         };
 
         Ok((agent, notification_receiver))
@@ -1572,86 +1582,7 @@ impl Agent for ClaudeAgent {
         Ok(response)
     }
 
-    /// Request permission for a tool call (ACP session/request_permission method)
-    async fn request_permission(
-        &self,
-        request: PermissionRequest,
-    ) -> Result<PermissionResponse, agent_client_protocol::Error> {
-        self.log_request("request_permission", &request);
-        tracing::info!(
-            "Processing permission request for session: {} and tool call: {}",
-            request.session_id.0,
-            request.tool_call.tool_call_id
-        );
 
-        // ACP requires comprehensive permission system with user choice:
-        // 1. Multiple permission options: allow/reject with once/always variants
-        // 2. Permission persistence: Remember "always" decisions across sessions
-        // 3. Tool call integration: Block execution until permission granted
-        // 4. Cancellation support: Handle cancelled prompt turns gracefully
-        // 5. Context awareness: Generate appropriate options for different tools
-        //
-        // Advanced permissions provide user control while maintaining security.
-
-        // Parse session ID
-        let session_id = self.parse_session_id(&request.session_id)?;
-
-        // Check if session is cancelled
-        if self.cancellation_manager.is_cancelled(&session_id.to_string()).await {
-            tracing::info!("Session {} is cancelled, returning cancelled outcome", session_id);
-            return Ok(PermissionResponse {
-                outcome: crate::tools::PermissionOutcome::Cancelled,
-            });
-        }
-
-        // For this initial implementation, we'll generate default permission options
-        // if none were provided, or use the provided options
-        let permission_options = if request.options.is_empty() {
-            // Generate default ACP-compliant options
-            vec![
-                crate::tools::PermissionOption {
-                    option_id: "allow-once".to_string(),
-                    name: "Allow once".to_string(),
-                    kind: crate::tools::PermissionOptionKind::AllowOnce,
-                },
-                crate::tools::PermissionOption {
-                    option_id: "allow-always".to_string(),
-                    name: "Allow always".to_string(),
-                    kind: crate::tools::PermissionOptionKind::AllowAlways,
-                },
-                crate::tools::PermissionOption {
-                    option_id: "reject-once".to_string(),
-                    name: "Reject".to_string(),
-                    kind: crate::tools::PermissionOptionKind::RejectOnce,
-                },
-                crate::tools::PermissionOption {
-                    option_id: "reject-always".to_string(),
-                    name: "Reject always".to_string(),
-                    kind: crate::tools::PermissionOptionKind::RejectAlways,
-                },
-            ]
-        } else {
-            request.options
-        };
-
-        // For this initial implementation, automatically grant "allow-once" permission
-        // In a full implementation, this would present the options to the user and wait for their choice
-        let selected_outcome = crate::tools::PermissionOutcome::Selected {
-            option_id: "allow-once".to_string(),
-        };
-
-        let response = PermissionResponse {
-            outcome: selected_outcome,
-        };
-
-        tracing::info!(
-            "Permission request completed for session: {} with outcome: allow-once",
-            session_id
-        );
-
-        self.log_response("request_permission", &response);
-        Ok(response)
-    }
 
     async fn prompt(
         &self,
@@ -1850,6 +1781,106 @@ impl Agent for ClaudeAgent {
 
         // Handle extension notifications
         Ok(())
+    }
+}
+
+// Additional ClaudeAgent methods not part of the Agent trait
+impl ClaudeAgent {
+    /// Request permission for a tool call (ACP session/request_permission method)
+    pub async fn request_permission(
+        &self,
+        request: PermissionRequest,
+    ) -> Result<PermissionResponse, agent_client_protocol::Error> {
+        self.log_request("request_permission", &request);
+        tracing::info!(
+            "Processing permission request for session: {} and tool call: {}",
+            request.session_id.0,
+            request.tool_call.tool_call_id
+        );
+
+        // ACP requires comprehensive permission system with user choice:
+        // 1. Multiple permission options: allow/reject with once/always variants
+        // 2. Permission persistence: Remember "always" decisions across sessions
+        // 3. Tool call integration: Block execution until permission granted
+        // 4. Cancellation support: Handle cancelled prompt turns gracefully
+        // 5. Context awareness: Generate appropriate options for different tools
+        //
+        // Advanced permissions provide user control while maintaining security.
+
+        // Parse session ID
+        let session_id = self.parse_session_id(&request.session_id)?;
+
+        // Check if session is cancelled
+        if self.cancellation_manager.is_cancelled(&session_id.to_string()).await {
+            tracing::info!("Session {} is cancelled, returning cancelled outcome", session_id);
+            return Ok(PermissionResponse {
+                outcome: crate::tools::PermissionOutcome::Cancelled,
+            });
+        }
+
+        // Extract tool name from the tool call - assume we can get it from the request
+        // In a real implementation, we'd need to look up the tool call details
+        let tool_name = "unknown_tool"; // TODO: Extract from tool_call
+        let tool_args = serde_json::json!({}); // TODO: Extract from tool_call
+
+        // Use permission policy engine to evaluate the tool call
+        let policy_result = match self.permission_engine.evaluate_tool_call(tool_name, &tool_args).await {
+            Ok(evaluation) => evaluation,
+            Err(e) => {
+                tracing::error!("Permission policy evaluation failed: {}", e);
+                return Ok(PermissionResponse {
+                    outcome: crate::tools::PermissionOutcome::Cancelled,
+                });
+            }
+        };
+
+        let selected_outcome = match policy_result {
+            PolicyEvaluation::Allowed => {
+                tracing::info!("Tool '{}' allowed by policy", tool_name);
+                crate::tools::PermissionOutcome::Selected {
+                    option_id: "allow-once".to_string(),
+                }
+            }
+            PolicyEvaluation::Denied { reason } => {
+                tracing::info!("Tool '{}' denied by policy: {}", tool_name, reason);
+                crate::tools::PermissionOutcome::Selected {
+                    option_id: "reject-once".to_string(),
+                }
+            }
+            PolicyEvaluation::RequireUserConsent { options } => {
+                tracing::info!("Tool '{}' requires user consent", tool_name);
+                
+                // If options were provided in request, use those; otherwise use policy-generated options
+                let permission_options = if !request.options.is_empty() {
+                    request.options
+                } else {
+                    options
+                };
+                
+                // For now, we'll still auto-select "allow-once" but in a real implementation
+                // this would present the options to the user and wait for their choice
+                // TODO: Implement actual user interaction
+                tracing::warn!("Auto-selecting 'allow-once' - user interaction not yet implemented");
+                
+                // Store the permission decision if user selected "always" option
+                // This is where we'd handle the user's actual choice
+                crate::tools::PermissionOutcome::Selected {
+                    option_id: "allow-once".to_string(),
+                }
+            }
+        };
+
+        let response = PermissionResponse {
+            outcome: selected_outcome,
+        };
+
+        tracing::info!(
+            "Permission request completed for session: {} with outcome: allow-once",
+            session_id
+        );
+
+        self.log_response("request_permission", &response);
+        Ok(response)
     }
 }
 
@@ -3285,8 +3316,7 @@ mod tests {
         
         // First create a session
         let new_session_request = NewSessionRequest {
-            cwd: Some("/tmp".to_string()),
-            client_capabilities: None,
+            cwd: std::path::PathBuf::from("/tmp"),
             meta: None,
             mcp_servers: vec![],
         };
@@ -3331,8 +3361,7 @@ mod tests {
         
         // Create a session
         let new_session_request = NewSessionRequest {
-            cwd: Some("/tmp".to_string()),
-            client_capabilities: None,
+            cwd: std::path::PathBuf::from("/tmp"),
             meta: None,
             mcp_servers: vec![],
         };
@@ -3366,8 +3395,7 @@ mod tests {
         
         // Create a session
         let new_session_request = NewSessionRequest {
-            cwd: Some("/tmp".to_string()),
-            client_capabilities: None,
+            cwd: std::path::PathBuf::from("/tmp"),
             meta: None,
             mcp_servers: vec![],
         };
