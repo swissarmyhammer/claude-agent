@@ -136,6 +136,9 @@ pub enum AgentError {
     #[error("MCP error: {0}")]
     Mcp(#[from] McpError),
 
+    #[error("Path validation error: {0}")]
+    PathValidation(#[from] crate::path_validator::PathValidationError),
+
     #[error("Protocol error: {0}")]
     Protocol(String),
 
@@ -175,6 +178,7 @@ impl AgentError {
     pub fn to_json_rpc_error(&self) -> i32 {
         match self {
             AgentError::Mcp(mcp_error) => mcp_error.to_json_rpc_error(),
+            AgentError::PathValidation(_) => -32602, // Invalid params
             AgentError::Protocol(_) => -32600, // Invalid Request
             AgentError::MethodNotFound(_) => -32601, // Method not found
             AgentError::InvalidRequest(_) => -32602, // Invalid params
@@ -221,6 +225,11 @@ mod tests {
 
         let err = AgentError::Internal("internal error".to_string());
         assert_eq!(err.to_string(), "Internal error: internal error");
+
+        // Test PathValidation error
+        let path_err = crate::path_validator::PathValidationError::NotAbsolute("relative/path".to_string());
+        let err = AgentError::PathValidation(path_err);
+        assert_eq!(err.to_string(), "Path validation error: Path is not absolute: relative/path");
     }
 
     #[test]
@@ -248,6 +257,11 @@ mod tests {
 
         let err = AgentError::Config("test".to_string());
         assert_eq!(err.to_json_rpc_error(), -32000);
+
+        // Test PathValidation error code
+        let path_err = crate::path_validator::PathValidationError::NotAbsolute("test".to_string());
+        let err = AgentError::PathValidation(path_err);
+        assert_eq!(err.to_json_rpc_error(), -32602);
     }
 
     #[test]
@@ -270,6 +284,17 @@ mod tests {
         match agent_error {
             AgentError::Serialization(_) => {} // Expected
             _ => panic!("Expected Serialization variant"),
+        }
+    }
+
+    #[test]
+    fn test_path_validation_error_conversion() {
+        let path_err = crate::path_validator::PathValidationError::EmptyPath;
+        let agent_error: AgentError = path_err.into();
+
+        match agent_error {
+            AgentError::PathValidation(_) => {} // Expected
+            _ => panic!("Expected PathValidation variant"),
         }
     }
 

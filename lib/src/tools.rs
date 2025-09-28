@@ -6,6 +6,51 @@
 //! The agent_client_protocol ToolCall types are for displaying execution status
 //! to clients, not for handling incoming requests. This module defines internal
 //! types for request handling and converts to protocol types when needed.
+//!
+//! ## Security Model
+//!
+//! This module implements comprehensive security controls for tool execution:
+//!
+//! ### ACP Path Validation
+//!
+//! All file operations are subject to ACP-compliant absolute path validation:
+//! - **Absolute Path Requirement**: All file paths must be absolute according to platform conventions
+//! - **Path Traversal Prevention**: Detects and blocks `../` and similar traversal attempts
+//! - **Cross-Platform Support**: Handles Unix (`/path/to/file`) and Windows (`C:\path\to\file`) paths
+//! - **Canonicalization**: Resolves symlinks and normalizes paths to prevent bypass attempts
+//! - **Boundary Enforcement**: Optionally restricts operations to configured root directories
+//!
+//! ### Permission System
+//!
+//! Tools are categorized into security levels:
+//! - **Auto-Approved**: Safe read-only operations that execute immediately
+//! - **Permission Required**: Potentially dangerous operations requiring user consent
+//! - **Forbidden**: Operations blocked by security policy
+//!
+//! ### File Operation Security
+//!
+//! File operations implement multiple security layers:
+//! - Path validation prevents access outside allowed boundaries
+//! - Null byte detection blocks injection attempts  
+//! - Path length limits prevent buffer overflow attacks
+//! - Working directory validation ensures operations occur in expected locations
+//!
+//! ### Command Execution Security
+//!
+//! Terminal operations are sandboxed with:
+//! - Working directory restrictions
+//! - Environment variable controls
+//! - Process isolation and cleanup
+//! - Output sanitization and length limits
+//!
+//! ## Error Handling
+//!
+//! Security violations result in specific error types:
+//! - `PathValidationError`: Path validation failures with detailed context
+//! - `PermissionDenied`: Access control violations
+//! - `InvalidRequest`: Malformed or suspicious requests
+//!
+//! These errors are mapped to appropriate JSON-RPC error codes for client communication.
 
 use crate::path_validator::{PathValidationError, PathValidator};
 use serde_json::Value;

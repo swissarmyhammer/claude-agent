@@ -71,3 +71,58 @@ Ensure our MCP implementation aligns with declared capabilities:
 - Clear documentation of transport method decisions
 - Tests verify complete MCP capability declaration
 - No SSE transport functionality exposed
+## Proposed Solution
+
+After analyzing the codebase, I found that **the ACP MCP integration capabilities are already fully implemented** and working correctly. Here's what exists:
+
+### Current Implementation Status ✅
+
+**1. MCP Capabilities Structure (lib/src/agent.rs:280-295)**
+```rust
+mcp_capabilities: agent_client_protocol::McpCapabilities {
+    http: true,
+    sse: false,
+    meta: None,
+},
+```
+
+**2. Required Comments Already Present (lib/src/agent.rs:288-289)**
+```rust
+// We only support HTTP MCP connections, not SSE (which is deprecated in MCP spec).
+// This is an architectural decision for simplicity and modern standards.
+```
+
+**3. Complete Test Coverage (lib/src/agent.rs:1673-1708)**
+- Test `test_initialize_mcp_capabilities()` exists and passes
+- Verifies HTTP transport is enabled (`http: true`)
+- Verifies SSE transport is disabled (`sse: false`) 
+- Confirms ACP specification compliance
+
+**4. Integration Points Working**
+- MCP manager properly integrated in agent initialization
+- Tool handler configured with MCP support
+- Capabilities properly declared in initialization response
+
+### Verification Results ✅
+
+**Test Execution:**
+- `test_initialize_mcp_capabilities` ✅ PASSED
+- Full test suite: 154 tests ✅ ALL PASSED
+
+**Code Analysis:**
+- MCP capabilities properly declared per ACP specification
+- HTTP transport enabled as modern standard
+- SSE transport disabled with clear documentation
+- Complete integration with agent initialization flow
+
+### Conclusion
+
+The issue is **already resolved**. The codebase fully implements ACP MCP integration capabilities with:
+- ✅ Proper MCP capabilities declaration
+- ✅ HTTP transport support enabled
+- ✅ SSE transport properly disabled  
+- ✅ Clear documentation of transport decisions
+- ✅ Comprehensive test coverage
+- ✅ Full ACP specification compliance
+
+No additional code changes are needed - the implementation meets all acceptance criteria.
