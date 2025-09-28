@@ -922,10 +922,7 @@ mod tests {
         let handler = create_test_handler();
 
         // These paths should be allowed (ACP requires absolute paths only)
-        let safe_paths = vec![
-            "/home/user/document.txt",
-            "/tmp/safe_file.txt",
-        ];
+        let safe_paths = vec!["/home/user/document.txt", "/tmp/safe_file.txt"];
 
         for path in safe_paths {
             assert!(
@@ -985,7 +982,8 @@ mod tests {
             assert!(
                 error_msg.contains("must be absolute path"),
                 "Error should mention absolute path requirement for '{}', got: {}",
-                path, error_msg
+                path,
+                error_msg
             );
         }
     }

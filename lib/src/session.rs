@@ -1,6 +1,8 @@
 //! Session management system for tracking conversation contexts and state
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 use ulid::Ulid;
@@ -9,7 +11,7 @@ use ulid::Ulid;
 pub type SessionId = Ulid;
 
 /// A conversation session containing context and metadata
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: SessionId,
     pub created_at: SystemTime,
@@ -17,11 +19,29 @@ pub struct Session {
     pub context: Vec<Message>,
     pub client_capabilities: Option<agent_client_protocol::ClientCapabilities>,
     pub mcp_servers: Vec<String>,
+    /// Working directory for this session (ACP requirement - must be absolute path)
+    pub cwd: PathBuf,
 }
 
 impl Session {
-    /// Create a new session with the given ID
-    pub fn new(id: SessionId) -> Self {
+    /// Create a new session with the given ID and working directory
+    ///
+    /// # Arguments
+    /// * `id` - Unique session identifier (ULID)
+    /// * `cwd` - Working directory for the session (must be absolute path as per ACP spec)
+    ///
+    /// # Panics
+    /// This function will panic if the working directory is not absolute, as this violates
+    /// the ACP specification requirement that sessions must have absolute working directories.
+    pub fn new(id: SessionId, cwd: PathBuf) -> Self {
+        // ACP requires absolute working directory - validate this at session creation
+        if !cwd.is_absolute() {
+            panic!(
+                "Session working directory must be absolute path (ACP requirement), got: {}",
+                cwd.display()
+            );
+        }
+
         let now = SystemTime::now();
         Self {
             id,
@@ -30,6 +50,7 @@ impl Session {
             context: Vec::new(),
             client_capabilities: None,
             mcp_servers: Vec::new(),
+            cwd,
         }
     }
 
@@ -46,7 +67,7 @@ impl Session {
 }
 
 /// A message within a session context
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: MessageRole,
     pub content: String,
@@ -65,7 +86,7 @@ impl Message {
 }
 
 /// Role of a message sender
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MessageRole {
     User,
     Assistant,
@@ -98,10 +119,23 @@ impl SessionManager {
         }
     }
 
-    /// Create a new session and return its ID
-    pub fn create_session(&self) -> crate::Result<SessionId> {
+    /// Create a new session with specified working directory and return its ID
+    ///
+    /// # Arguments
+    /// * `cwd` - Working directory for the session (must be absolute path as per ACP spec)
+    ///
+    /// # Errors
+    /// Returns error if:
+    /// - Working directory validation fails
+    /// - Session storage write lock cannot be acquired
+    pub fn create_session(&self, cwd: PathBuf) -> crate::Result<SessionId> {
+        // Validate working directory before creating session
+        crate::session_validation::validate_working_directory(&cwd).map_err(|e| {
+            crate::AgentError::Session(format!("Working directory validation failed: {}", e))
+        })?;
+
         let session_id = Ulid::new();
-        let session = Session::new(session_id);
+        let session = Session::new(session_id, cwd);
 
         let mut sessions = self
             .sessions
@@ -243,9 +277,11 @@ mod tests {
     #[test]
     fn test_session_creation() {
         let session_id = Ulid::new();
-        let session = Session::new(session_id);
+        let cwd = std::env::current_dir().unwrap();
+        let session = Session::new(session_id, cwd.clone());
 
         assert_eq!(session.id, session_id);
+        assert_eq!(session.cwd, cwd);
         assert!(session.context.is_empty());
         assert!(session.client_capabilities.is_none());
         assert!(session.mcp_servers.is_empty());
@@ -262,7 +298,8 @@ mod tests {
     #[test]
     fn test_session_add_message() {
         let session_id = Ulid::new();
-        let mut session = Session::new(session_id);
+        let cwd = std::env::current_dir().unwrap();
+        let mut session = Session::new(session_id, cwd);
         let initial_time = session.last_accessed;
 
         // Small delay to ensure time difference
@@ -295,12 +332,15 @@ mod tests {
     #[test]
     fn test_create_and_get_session() {
         let manager = SessionManager::new();
+        let cwd = std::env::current_dir().unwrap();
 
-        let session_id = manager.create_session().unwrap();
+        let session_id = manager.create_session(cwd.clone()).unwrap();
         let session = manager.get_session(&session_id).unwrap();
 
         assert!(session.is_some());
-        assert_eq!(session.unwrap().id, session_id);
+        let session = session.unwrap();
+        assert_eq!(session.id, session_id);
+        assert_eq!(session.cwd, cwd);
     }
 
     #[test]
@@ -315,7 +355,8 @@ mod tests {
     #[test]
     fn test_update_session() {
         let manager = SessionManager::new();
-        let session_id = manager.create_session().unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let session_id = manager.create_session(cwd).unwrap();
 
         let message = Message::new(MessageRole::User, "Hello".to_string());
 
@@ -346,7 +387,8 @@ mod tests {
     #[test]
     fn test_remove_session() {
         let manager = SessionManager::new();
-        let session_id = manager.create_session().unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let session_id = manager.create_session(cwd).unwrap();
 
         // Verify session exists
         assert!(manager.get_session(&session_id).unwrap().is_some());
@@ -372,14 +414,15 @@ mod tests {
     #[test]
     fn test_list_sessions() {
         let manager = SessionManager::new();
+        let cwd = std::env::current_dir().unwrap();
 
         // Initially empty
         let sessions = manager.list_sessions().unwrap();
         assert_eq!(sessions.len(), 0);
 
         // Create some sessions
-        let id1 = manager.create_session().unwrap();
-        let id2 = manager.create_session().unwrap();
+        let id1 = manager.create_session(cwd.clone()).unwrap();
+        let id2 = manager.create_session(cwd).unwrap();
 
         let sessions = manager.list_sessions().unwrap();
         assert_eq!(sessions.len(), 2);
@@ -390,13 +433,14 @@ mod tests {
     #[test]
     fn test_session_count() {
         let manager = SessionManager::new();
+        let cwd = std::env::current_dir().unwrap();
 
         assert_eq!(manager.session_count().unwrap(), 0);
 
-        manager.create_session().unwrap();
+        manager.create_session(cwd.clone()).unwrap();
         assert_eq!(manager.session_count().unwrap(), 1);
 
-        manager.create_session().unwrap();
+        manager.create_session(cwd).unwrap();
         assert_eq!(manager.session_count().unwrap(), 2);
     }
 
@@ -409,7 +453,8 @@ mod tests {
         ));
 
         // Create a session
-        let session_id = manager.create_session().unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let session_id = manager.create_session(cwd).unwrap();
         assert_eq!(manager.session_count().unwrap(), 1);
 
         // Wait for session to expire
@@ -432,5 +477,155 @@ mod tests {
 
         // Give the task a moment to start
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    #[test]
+    #[should_panic(expected = "Session working directory must be absolute path")]
+    fn test_session_creation_with_relative_path_panics() {
+        let session_id = Ulid::new();
+        let relative_path = PathBuf::from("./relative/path");
+        let _session = Session::new(session_id, relative_path);
+    }
+
+    #[test]
+    fn test_create_session_with_invalid_working_directory() {
+        let manager = SessionManager::new();
+        let invalid_path = PathBuf::from("/nonexistent/directory");
+
+        let result = manager.create_session(invalid_path);
+        assert!(result.is_err());
+
+        if let Err(crate::AgentError::Session(msg)) = result {
+            assert!(msg.contains("Working directory validation failed"));
+        } else {
+            panic!("Expected Session error with working directory validation message");
+        }
+    }
+
+    #[test]
+    fn test_session_stores_working_directory() {
+        let manager = SessionManager::new();
+        let cwd = std::env::current_dir().unwrap();
+
+        let session_id = manager.create_session(cwd.clone()).unwrap();
+        let session = manager.get_session(&session_id).unwrap().unwrap();
+
+        assert_eq!(session.cwd, cwd);
+    }
+
+    #[test]
+    fn test_working_directory_validation_during_session_creation() {
+        let manager = SessionManager::new();
+        let non_absolute_path = PathBuf::from("relative/path");
+
+        let result = manager.create_session(non_absolute_path);
+        assert!(result.is_err());
+
+        if let Err(crate::AgentError::Session(msg)) = result {
+            assert!(msg.contains("Working directory validation failed"));
+            assert!(msg.contains("must be absolute"));
+        } else {
+            panic!("Expected Session error with absolute path requirement");
+        }
+    }
+
+    #[test]
+    fn test_working_directory_preserved_across_session_operations() {
+        let manager = SessionManager::new();
+        let cwd = std::env::current_dir().unwrap();
+
+        let session_id = manager.create_session(cwd.clone()).unwrap();
+
+        // Add a message to the session
+        manager
+            .update_session(&session_id, |session| {
+                session.add_message(Message::new(MessageRole::User, "test".to_string()));
+            })
+            .unwrap();
+
+        // Retrieve session and verify working directory is preserved
+        let session = manager.get_session(&session_id).unwrap().unwrap();
+        assert_eq!(session.cwd, cwd);
+        assert_eq!(session.context.len(), 1);
+    }
+
+    #[test]
+    fn test_different_sessions_can_have_different_working_directories() {
+        let manager = SessionManager::new();
+        let cwd1 = std::env::current_dir().unwrap();
+        let cwd2 = std::env::temp_dir();
+
+        let session_id1 = manager.create_session(cwd1.clone()).unwrap();
+        let session_id2 = manager.create_session(cwd2.clone()).unwrap();
+
+        let session1 = manager.get_session(&session_id1).unwrap().unwrap();
+        let session2 = manager.get_session(&session_id2).unwrap().unwrap();
+
+        assert_eq!(session1.cwd, cwd1);
+        assert_eq!(session2.cwd, cwd2);
+        assert_ne!(session1.cwd, session2.cwd);
+    }
+
+    #[test]
+    fn test_session_serialization_includes_working_directory() {
+        let session_id = Ulid::new();
+        let cwd = std::env::current_dir().unwrap();
+        let session = Session::new(session_id, cwd.clone());
+
+        // Test serialization
+        let serialized = serde_json::to_string(&session).unwrap();
+        assert!(serialized.contains(&cwd.to_string_lossy().to_string()));
+
+        // Test deserialization
+        let deserialized: Session = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.id, session_id);
+        assert_eq!(deserialized.cwd, cwd);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unix_absolute_path_validation() {
+        let manager = SessionManager::new();
+        let unix_absolute = PathBuf::from("/tmp");
+
+        let result = manager.create_session(unix_absolute.clone());
+        assert!(result.is_ok());
+
+        let session_id = result.unwrap();
+        let session = manager.get_session(&session_id).unwrap().unwrap();
+        assert_eq!(session.cwd, unix_absolute);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_absolute_path_validation() {
+        let manager = SessionManager::new();
+        let windows_absolute = PathBuf::from("C:\\temp");
+
+        // This test assumes C:\temp exists on Windows systems
+        // In real scenarios, we'd use a guaranteed existing path
+        if windows_absolute.exists() {
+            let result = manager.create_session(windows_absolute.clone());
+            assert!(result.is_ok());
+
+            let session_id = result.unwrap();
+            let session = manager.get_session(&session_id).unwrap().unwrap();
+            assert_eq!(session.cwd, windows_absolute);
+        }
+    }
+
+    #[test]
+    fn test_working_directory_must_exist() {
+        let manager = SessionManager::new();
+        let non_existent = PathBuf::from("/this/path/definitely/does/not/exist/nowhere");
+
+        let result = manager.create_session(non_existent);
+        assert!(result.is_err());
+
+        if let Err(crate::AgentError::Session(msg)) = result {
+            assert!(msg.contains("Working directory validation failed"));
+        } else {
+            panic!("Expected Session error for non-existent directory");
+        }
     }
 }

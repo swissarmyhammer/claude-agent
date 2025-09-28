@@ -1368,7 +1368,7 @@ impl Agent for ClaudeAgent {
 
         let session_id = self
             .session_manager
-            .create_session()
+            .create_session(request.cwd.clone())
             .map_err(|_e| agent_client_protocol::Error::internal_error())?;
 
         // Store MCP servers in the session if provided
@@ -1418,7 +1418,8 @@ impl Agent for ClaudeAgent {
             tracing::warn!("Session load requested but loadSession capability not supported");
             return Err(agent_client_protocol::Error {
                 code: -32601,
-                message: "Method not supported: agent does not support loadSession capability".to_string(),
+                message: "Method not supported: agent does not support loadSession capability"
+                    .to_string(),
                 data: Some(serde_json::json!({
                     "method": "session/load",
                     "requiredCapability": "loadSession",
@@ -1436,27 +1437,34 @@ impl Agent for ClaudeAgent {
 
         match session {
             Some(session) => {
-                tracing::info!("Loaded session: {} with {} historical messages", session_id, session.context.len());
-                
+                tracing::info!(
+                    "Loaded session: {} with {} historical messages",
+                    session_id,
+                    session.context.len()
+                );
+
                 // Step 2-3: Stream ALL historical messages via session/update notifications
                 // Maintain exact chronological order using message timestamps
                 if !session.context.is_empty() {
-                    tracing::info!("Replaying {} historical messages for session {}", session.context.len(), session_id);
-                    
+                    tracing::info!(
+                        "Replaying {} historical messages for session {}",
+                        session.context.len(),
+                        session_id
+                    );
+
                     for message in &session.context {
                         let session_update = match message.role {
-                            crate::session::MessageRole::User => {
-                                SessionUpdate::UserMessageChunk {
-                                    content: ContentBlock::Text(TextContent { 
-                                        text: message.content.clone(),
-                                        annotations: None,
-                                        meta: None,
-                                    }),
-                                }
-                            }
-                            crate::session::MessageRole::Assistant | crate::session::MessageRole::System => {
+                            crate::session::MessageRole::User => SessionUpdate::UserMessageChunk {
+                                content: ContentBlock::Text(TextContent {
+                                    text: message.content.clone(),
+                                    annotations: None,
+                                    meta: None,
+                                }),
+                            },
+                            crate::session::MessageRole::Assistant
+                            | crate::session::MessageRole::System => {
                                 SessionUpdate::AgentMessageChunk {
-                                    content: ContentBlock::Text(TextContent { 
+                                    content: ContentBlock::Text(TextContent {
                                         text: message.content.clone(),
                                         annotations: None,
                                         meta: None,
@@ -1478,7 +1486,10 @@ impl Agent for ClaudeAgent {
 
                         // Stream historical message via session/update notification
                         if let Err(e) = self.notification_sender.send_update(notification).await {
-                            tracing::error!("Failed to send historical message notification: {}", e);
+                            tracing::error!(
+                                "Failed to send historical message notification: {}",
+                                e
+                            );
                             // Continue with other messages even if one fails
                         }
                     }
@@ -1504,7 +1515,8 @@ impl Agent for ClaudeAgent {
                 tracing::warn!("Session not found: {}", session_id);
                 Err(agent_client_protocol::Error {
                     code: -32602,
-                    message: "Session not found: sessionId does not exist or has expired".to_string(),
+                    message: "Session not found: sessionId does not exist or has expired"
+                        .to_string(),
                     data: Some(serde_json::json!({
                         "sessionId": request.session_id,
                         "error": "session_not_found"
@@ -1880,7 +1892,7 @@ mod tests {
 
         let load_response = agent.load_session(load_request).await.unwrap();
         assert!(load_response.meta.is_some());
-        
+
         // Verify that message_count and history_replayed are present in meta
         let meta = load_response.meta.unwrap();
         assert!(meta.get("message_count").is_some());
@@ -1903,20 +1915,23 @@ mod tests {
         let session_id = agent.parse_session_id(&new_response.session_id).unwrap();
 
         // Add some messages to the session history
-        agent.session_manager.update_session(&session_id, |session| {
-            session.add_message(crate::session::Message::new(
-                crate::session::MessageRole::User, 
-                "Hello, world!".to_string()
-            ));
-            session.add_message(crate::session::Message::new(
-                crate::session::MessageRole::Assistant, 
-                "Hello! How can I help you?".to_string()
-            ));
-            session.add_message(crate::session::Message::new(
-                crate::session::MessageRole::User, 
-                "What's the weather like?".to_string()
-            ));
-        }).unwrap();
+        agent
+            .session_manager
+            .update_session(&session_id, |session| {
+                session.add_message(crate::session::Message::new(
+                    crate::session::MessageRole::User,
+                    "Hello, world!".to_string(),
+                ));
+                session.add_message(crate::session::Message::new(
+                    crate::session::MessageRole::Assistant,
+                    "Hello! How can I help you?".to_string(),
+                ));
+                session.add_message(crate::session::Message::new(
+                    crate::session::MessageRole::User,
+                    "What's the weather like?".to_string(),
+                ));
+            })
+            .unwrap();
 
         // Subscribe to notifications to verify history replay
         let mut notification_receiver = agent.notification_sender.sender.subscribe();
@@ -1930,7 +1945,7 @@ mod tests {
         };
 
         let load_response = agent.load_session(load_request).await.unwrap();
-        
+
         // Verify meta includes correct history information
         let meta = load_response.meta.unwrap();
         assert_eq!(meta.get("message_count").unwrap().as_u64().unwrap(), 3);
@@ -1941,42 +1956,69 @@ mod tests {
         let mut received_notifications = Vec::new();
         for _ in 0..3 {
             match tokio::time::timeout(
-                tokio::time::Duration::from_millis(100), 
-                notification_receiver.recv()
-            ).await {
+                tokio::time::Duration::from_millis(100),
+                notification_receiver.recv(),
+            )
+            .await
+            {
                 Ok(Ok(notification)) => {
                     received_notifications.push(notification);
-                },
+                }
                 Ok(Err(_)) => break, // Channel error
-                Err(_) => break, // Timeout
+                Err(_) => break,     // Timeout
             }
         }
 
-        assert_eq!(received_notifications.len(), 3, "Should receive 3 historical message notifications");
+        assert_eq!(
+            received_notifications.len(),
+            3,
+            "Should receive 3 historical message notifications"
+        );
 
         // Verify the content and order of notifications
         let first_notification = &received_notifications[0];
-        assert!(matches!(first_notification.update, SessionUpdate::UserMessageChunk { .. }));
-        if let SessionUpdate::UserMessageChunk { content: ContentBlock::Text(ref text_content) } = first_notification.update {
+        assert!(matches!(
+            first_notification.update,
+            SessionUpdate::UserMessageChunk { .. }
+        ));
+        if let SessionUpdate::UserMessageChunk {
+            content: ContentBlock::Text(ref text_content),
+        } = first_notification.update
+        {
             assert_eq!(text_content.text, "Hello, world!");
         }
 
         let second_notification = &received_notifications[1];
-        assert!(matches!(second_notification.update, SessionUpdate::AgentMessageChunk { .. }));
-        if let SessionUpdate::AgentMessageChunk { content: ContentBlock::Text(ref text_content) } = second_notification.update {
+        assert!(matches!(
+            second_notification.update,
+            SessionUpdate::AgentMessageChunk { .. }
+        ));
+        if let SessionUpdate::AgentMessageChunk {
+            content: ContentBlock::Text(ref text_content),
+        } = second_notification.update
+        {
             assert_eq!(text_content.text, "Hello! How can I help you?");
         }
 
         let third_notification = &received_notifications[2];
-        assert!(matches!(third_notification.update, SessionUpdate::UserMessageChunk { .. }));
-        if let SessionUpdate::UserMessageChunk { content: ContentBlock::Text(ref text_content) } = third_notification.update {
+        assert!(matches!(
+            third_notification.update,
+            SessionUpdate::UserMessageChunk { .. }
+        ));
+        if let SessionUpdate::UserMessageChunk {
+            content: ContentBlock::Text(ref text_content),
+        } = third_notification.update
+        {
             assert_eq!(text_content.text, "What's the weather like?");
         }
 
         // Verify all notifications have proper meta with historical_replay marker
         for notification in &received_notifications {
             let meta = notification.meta.as_ref().unwrap();
-            assert_eq!(meta.get("message_type").unwrap().as_str().unwrap(), "historical_replay");
+            assert_eq!(
+                meta.get("message_type").unwrap().as_str().unwrap(),
+                "historical_replay"
+            );
             assert!(meta.get("timestamp").is_some());
             assert!(meta.get("original_role").is_some());
         }
@@ -1987,7 +2029,10 @@ mod tests {
         let agent = create_test_agent().await;
 
         // The agent should have loadSession capability enabled by default
-        assert!(agent.capabilities.load_session, "loadSession capability should be enabled by default");
+        assert!(
+            agent.capabilities.load_session,
+            "loadSession capability should be enabled by default"
+        );
 
         // Test that the capability validation code path exists by verifying
         // that the agent properly declares the capability in initialize response
@@ -2006,7 +2051,10 @@ mod tests {
         };
 
         let init_response = agent.initialize(init_request).await.unwrap();
-        assert!(init_response.agent_capabilities.load_session, "Agent should declare loadSession capability in initialize response");
+        assert!(
+            init_response.agent_capabilities.load_session,
+            "Agent should declare loadSession capability in initialize response"
+        );
     }
 
     #[tokio::test]
@@ -2027,20 +2075,24 @@ mod tests {
         assert!(result.is_err(), "Loading nonexistent session should fail");
 
         let error = result.unwrap_err();
-        assert_eq!(error.code, -32602, "Should return invalid params error for nonexistent session");
-        
+        assert_eq!(
+            error.code, -32602,
+            "Should return invalid params error for nonexistent session"
+        );
+
         // The error should either be our custom "Session not found" message or generic invalid params
         // Both are acceptable as they indicate the session couldn't be loaded
         assert!(
             error.message.contains("Session not found") || error.message.contains("Invalid params"),
-            "Error message should indicate session issue, got: '{}'", error.message
+            "Error message should indicate session issue, got: '{}'",
+            error.message
         );
     }
 
     #[tokio::test]
     async fn test_load_session_invalid_ulid() {
         let agent = create_test_agent().await;
-        
+
         // Test with an invalid ULID format - should fail at parsing stage
         let request = LoadSessionRequest {
             session_id: SessionId("invalid_session_format".to_string().into()),
@@ -2050,10 +2102,16 @@ mod tests {
         };
 
         let result = agent.load_session(request).await;
-        assert!(result.is_err(), "Loading with invalid ULID format should fail");
+        assert!(
+            result.is_err(),
+            "Loading with invalid ULID format should fail"
+        );
 
         let error = result.unwrap_err();
-        assert_eq!(error.code, -32602, "Should return invalid params error for invalid ULID");
+        assert_eq!(
+            error.code, -32602,
+            "Should return invalid params error for invalid ULID"
+        );
         // This should fail at parse_session_id stage, so it won't have our custom error data
     }
 
@@ -3040,8 +3098,11 @@ mod tests {
         };
 
         let v1_response = agent.initialize(v1_request).await.unwrap();
-        assert_eq!(v1_response.protocol_version, agent_client_protocol::V1, 
-                  "Agent should respond with client's requested version when supported");
+        assert_eq!(
+            v1_response.protocol_version,
+            agent_client_protocol::V1,
+            "Agent should respond with client's requested version when supported"
+        );
 
         // Test client requests V0 -> agent should respond with V0
         let v0_request = InitializeRequest {
@@ -3059,8 +3120,11 @@ mod tests {
         };
 
         let v0_response = agent.initialize(v0_request).await.unwrap();
-        assert_eq!(v0_response.protocol_version, agent_client_protocol::V0, 
-                  "Agent should respond with client's requested version when supported");
+        assert_eq!(
+            v0_response.protocol_version,
+            agent_client_protocol::V0,
+            "Agent should respond with client's requested version when supported"
+        );
     }
 
     #[tokio::test]
@@ -3071,25 +3135,38 @@ mod tests {
 
         // Test that our negotiation method works correctly with supported versions
         let negotiated_v1 = agent.negotiate_protocol_version(&agent_client_protocol::V1);
-        assert_eq!(negotiated_v1, agent_client_protocol::V1, 
-                  "V1 should be negotiated to V1 when supported");
+        assert_eq!(
+            negotiated_v1,
+            agent_client_protocol::V1,
+            "V1 should be negotiated to V1 when supported"
+        );
 
         let negotiated_v0 = agent.negotiate_protocol_version(&agent_client_protocol::V0);
-        assert_eq!(negotiated_v0, agent_client_protocol::V0, 
-                  "V0 should be negotiated to V0 when supported");
+        assert_eq!(
+            negotiated_v0,
+            agent_client_protocol::V0,
+            "V0 should be negotiated to V0 when supported"
+        );
 
         // Verify that our SUPPORTED_PROTOCOL_VERSIONS contains both V0 and V1
-        assert!(ClaudeAgent::SUPPORTED_PROTOCOL_VERSIONS.contains(&agent_client_protocol::V0),
-                "Agent should support V0");
-        assert!(ClaudeAgent::SUPPORTED_PROTOCOL_VERSIONS.contains(&agent_client_protocol::V1),
-                "Agent should support V1");
+        assert!(
+            ClaudeAgent::SUPPORTED_PROTOCOL_VERSIONS.contains(&agent_client_protocol::V0),
+            "Agent should support V0"
+        );
+        assert!(
+            ClaudeAgent::SUPPORTED_PROTOCOL_VERSIONS.contains(&agent_client_protocol::V1),
+            "Agent should support V1"
+        );
 
         // Verify that the latest supported version is V1 (max of V0 and V1)
         let latest = ClaudeAgent::SUPPORTED_PROTOCOL_VERSIONS
             .iter()
             .max()
             .unwrap_or(&agent_client_protocol::V1);
-        assert_eq!(*latest, agent_client_protocol::V1, 
-                  "Latest supported version should be V1");
+        assert_eq!(
+            *latest,
+            agent_client_protocol::V1,
+            "Latest supported version should be V1"
+        );
     }
 }

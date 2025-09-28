@@ -4,8 +4,8 @@
 //! ensuring all ACP requirements are met with comprehensive error handling.
 
 use crate::session_errors::{SessionSetupError, SessionSetupResult};
-use std::fs;
 use reqwest::Url;
+use std::fs;
 use std::path::Path;
 
 /// Validate a working directory path for session setup
@@ -19,7 +19,7 @@ use std::path::Path;
 pub fn validate_working_directory(path: &Path) -> SessionSetupResult<()> {
     // ACP requires comprehensive error handling for session setup:
     // 1. Clear, actionable error messages for clients
-    // 2. Appropriate JSON-RPC error codes  
+    // 2. Appropriate JSON-RPC error codes
     // 3. Structured error data for programmatic handling
     // 4. Graceful degradation where possible
     // 5. Proper cleanup of partial session state on failures
@@ -42,7 +42,8 @@ pub fn validate_working_directory(path: &Path) -> SessionSetupResult<()> {
     if path_str.starts_with("\\\\") || path_str.starts_with("//") {
         return Err(SessionSetupError::WorkingDirectoryNetworkPath {
             path: path.to_path_buf(),
-            suggestion: "Copy files to a local directory and use the local path instead".to_string(),
+            suggestion: "Copy files to a local directory and use the local path instead"
+                .to_string(),
         });
     }
 
@@ -155,21 +156,15 @@ pub fn validate_mcp_server_config(
         crate::config::McpServerConfig::Stdio(stdio_config) => {
             validate_mcp_stdio_config(stdio_config)
         }
-        crate::config::McpServerConfig::Http(http_config) => {
-            validate_mcp_http_config(http_config)
-        }
-        crate::config::McpServerConfig::Sse(sse_config) => {
-            validate_mcp_sse_config(sse_config)
-        }
+        crate::config::McpServerConfig::Http(http_config) => validate_mcp_http_config(http_config),
+        crate::config::McpServerConfig::Sse(sse_config) => validate_mcp_sse_config(sse_config),
     }
 }
 
 /// Validate STDIO MCP server configuration
-fn validate_mcp_stdio_config(
-    config: &crate::config::StdioTransport,
-) -> SessionSetupResult<()> {
+fn validate_mcp_stdio_config(config: &crate::config::StdioTransport) -> SessionSetupResult<()> {
     let command_path = Path::new(&config.command);
-    
+
     // Check if command is absolute or relative
     if command_path.is_absolute() {
         // For absolute paths, check if executable exists
@@ -177,7 +172,8 @@ fn validate_mcp_stdio_config(
             return Err(SessionSetupError::McpServerExecutableNotFound {
                 server_name: config.name.clone(),
                 command: command_path.to_path_buf(),
-                suggestion: "Check that the server executable is installed and the path is correct".to_string(),
+                suggestion: "Check that the server executable is installed and the path is correct"
+                    .to_string(),
             });
         }
     } else {
@@ -195,9 +191,7 @@ fn validate_mcp_stdio_config(
 }
 
 /// Validate HTTP MCP server configuration
-fn validate_mcp_http_config(
-    config: &crate::config::HttpTransport,
-) -> SessionSetupResult<()> {
+fn validate_mcp_http_config(config: &crate::config::HttpTransport) -> SessionSetupResult<()> {
     // Validate URL format
     if Url::parse(&config.url).is_err() {
         return Err(SessionSetupError::McpServerConnectionFailed {
@@ -211,9 +205,7 @@ fn validate_mcp_http_config(
 }
 
 /// Validate SSE MCP server configuration  
-fn validate_mcp_sse_config(
-    config: &crate::config::SseTransport,
-) -> SessionSetupResult<()> {
+fn validate_mcp_sse_config(config: &crate::config::SseTransport) -> SessionSetupResult<()> {
     // Validate URL format
     if Url::parse(&config.url).is_err() {
         return Err(SessionSetupError::McpServerConnectionFailed {
@@ -242,7 +234,7 @@ mod tests {
     fn test_validate_working_directory_relative_path() {
         let relative_path = Path::new("./relative/path");
         let result = validate_working_directory(relative_path);
-        
+
         assert!(result.is_err());
         if let Err(SessionSetupError::WorkingDirectoryNotAbsolute { .. }) = result {
             // Expected error type
@@ -255,7 +247,7 @@ mod tests {
     fn test_validate_working_directory_nonexistent() {
         let nonexistent_path = Path::new("/nonexistent/directory");
         let result = validate_working_directory(nonexistent_path);
-        
+
         assert!(result.is_err());
         if let Err(SessionSetupError::WorkingDirectoryNotFound { .. }) = result {
             // Expected error type
@@ -271,7 +263,7 @@ mod tests {
         } else {
             Path::new("//server/share/path")
         };
-        
+
         let result = validate_working_directory(network_path);
         assert!(result.is_err());
         if let Err(SessionSetupError::WorkingDirectoryNetworkPath { .. }) = result {
@@ -303,7 +295,7 @@ mod tests {
     fn test_validate_session_id_invalid() {
         let invalid_id = "invalid-session-id";
         let result = validate_session_id(invalid_id);
-        
+
         assert!(result.is_err());
         if let Err(SessionSetupError::InvalidSessionId { .. }) = result {
             // Expected error type
@@ -321,10 +313,10 @@ mod tests {
             env: vec![],
             cwd: None,
         };
-        
+
         let server_config = crate::config::McpServerConfig::Stdio(config);
         let result = validate_mcp_server_config(&server_config);
-        
+
         assert!(result.is_err());
         if let Err(SessionSetupError::McpServerExecutableNotFound { .. }) = result {
             // Expected error type
@@ -341,10 +333,10 @@ mod tests {
             url: "not-a-valid-url".to_string(),
             headers: vec![],
         };
-        
+
         let server_config = crate::config::McpServerConfig::Http(config);
         let result = validate_mcp_server_config(&server_config);
-        
+
         assert!(result.is_err());
         if let Err(SessionSetupError::McpServerConnectionFailed { .. }) = result {
             // Expected error type

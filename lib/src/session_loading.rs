@@ -79,9 +79,14 @@ impl EnhancedSessionLoader {
         let session = match self.session_manager.get_session(&session_id) {
             Ok(session_option) => session_option,
             Err(e) => {
-                error!("Session storage failure while loading {}: {}", session_id, e);
+                error!(
+                    "Session storage failure while loading {}: {}",
+                    session_id, e
+                );
                 return Err(SessionSetupError::SessionStorageFailure {
-                    session_id: Some(agent_client_protocol::SessionId(session_id.to_string().into())),
+                    session_id: Some(agent_client_protocol::SessionId(
+                        session_id.to_string().into(),
+                    )),
                     storage_error: e.to_string(),
                     recovery_suggestion: "Check session storage backend and retry".to_string(),
                 });
@@ -93,10 +98,10 @@ impl EnhancedSessionLoader {
             Some(session) => session,
             None => {
                 warn!("Session not found: {}", session_id);
-                
+
                 // Get list of available sessions for better error reporting
                 let available_sessions = self.get_available_session_list()?;
-                
+
                 return Err(SessionSetupError::SessionNotFound {
                     session_id: agent_client_protocol::SessionId(session_id.to_string().into()),
                     available_sessions,
@@ -109,8 +114,9 @@ impl EnhancedSessionLoader {
         if let Ok(age) = now.duration_since(session.last_accessed) {
             if age > self.max_session_age {
                 warn!("Session expired: {} (age: {:?})", session_id, age);
-                
-                let expired_at = session.last_accessed
+
+                let expired_at = session
+                    .last_accessed
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
@@ -147,7 +153,7 @@ impl EnhancedSessionLoader {
     /// Validate session data integrity
     fn validate_session_integrity(&self, session: &Session) -> SessionSetupResult<()> {
         // Check for basic data corruption indicators
-        
+
         // Validate timestamps
         if session.created_at > SystemTime::now() {
             return Err(SessionSetupError::SessionCorrupted {
@@ -173,7 +179,10 @@ impl EnhancedSessionLoader {
         // Validate message integrity
         for (i, message) in session.context.iter().enumerate() {
             if message.content.is_empty() {
-                warn!("Empty message content found at index {} in session {}", i, session.id);
+                warn!(
+                    "Empty message content found at index {} in session {}",
+                    i, session.id
+                );
                 // Don't fail for empty messages, just log warning
             }
 
@@ -201,7 +210,10 @@ impl EnhancedSessionLoader {
     }
 
     /// Prepare history replay notifications with error handling
-    async fn prepare_history_replay(&self, session: &Session) -> SessionSetupResult<Vec<SessionNotification>> {
+    async fn prepare_history_replay(
+        &self,
+        session: &Session,
+    ) -> SessionSetupResult<Vec<SessionNotification>> {
         if session.context.is_empty() {
             return Ok(Vec::new());
         }
@@ -217,15 +229,13 @@ impl EnhancedSessionLoader {
         for (i, message) in session.context.iter().enumerate() {
             // Create session update based on message role
             let session_update = match message.role {
-                crate::session::MessageRole::User => {
-                    SessionUpdate::UserMessageChunk {
-                        content: ContentBlock::Text(TextContent {
-                            text: message.content.clone(),
-                            annotations: None,
-                            meta: None,
-                        }),
-                    }
-                }
+                crate::session::MessageRole::User => SessionUpdate::UserMessageChunk {
+                    content: ContentBlock::Text(TextContent {
+                        text: message.content.clone(),
+                        annotations: None,
+                        meta: None,
+                    }),
+                },
                 crate::session::MessageRole::Assistant | crate::session::MessageRole::System => {
                     SessionUpdate::AgentMessageChunk {
                         content: ContentBlock::Text(TextContent {
@@ -261,7 +271,11 @@ impl EnhancedSessionLoader {
 
             // Check for potential issues during replay preparation
             if i > 0 && i % 1000 == 0 {
-                info!("Prepared {} of {} history messages for replay", i, session.context.len());
+                info!(
+                    "Prepared {} of {} history messages for replay",
+                    i,
+                    session.context.len()
+                );
             }
         }
 
@@ -305,7 +319,11 @@ impl EnhancedSessionLoader {
     }
 
     /// Create enhanced LoadSessionResponse with proper metadata
-    pub fn create_load_response(&self, session: &Session, request: &LoadSessionRequest) -> LoadSessionResponse {
+    pub fn create_load_response(
+        &self,
+        session: &Session,
+        request: &LoadSessionRequest,
+    ) -> LoadSessionResponse {
         LoadSessionResponse {
             modes: None, // No specific modes for now
             meta: Some(serde_json::json!({
@@ -373,15 +391,13 @@ impl SessionHistoryReplayer {
 
         for (i, message) in session.context.iter().enumerate() {
             let session_update = match message.role {
-                crate::session::MessageRole::User => {
-                    SessionUpdate::UserMessageChunk {
-                        content: ContentBlock::Text(TextContent {
-                            text: message.content.clone(),
-                            annotations: None,
-                            meta: None,
-                        }),
-                    }
-                }
+                crate::session::MessageRole::User => SessionUpdate::UserMessageChunk {
+                    content: ContentBlock::Text(TextContent {
+                        text: message.content.clone(),
+                        annotations: None,
+                        meta: None,
+                    }),
+                },
                 crate::session::MessageRole::Assistant | crate::session::MessageRole::System => {
                     SessionUpdate::AgentMessageChunk {
                         content: ContentBlock::Text(TextContent {
@@ -421,12 +437,22 @@ impl SessionHistoryReplayer {
                 }
                 Err(e) => {
                     failure_count += 1;
-                    error!("Failed to send history message {} of {}: {}", i + 1, total_messages, e);
+                    error!(
+                        "Failed to send history message {} of {}: {}",
+                        i + 1,
+                        total_messages,
+                        e
+                    );
 
                     if failure_count >= self.max_replay_failures {
-                        error!("Too many replay failures ({}), aborting history replay", failure_count);
+                        error!(
+                            "Too many replay failures ({}), aborting history replay",
+                            failure_count
+                        );
                         return Err(SessionSetupError::SessionHistoryReplayFailed {
-                            session_id: agent_client_protocol::SessionId(session.id.to_string().into()),
+                            session_id: agent_client_protocol::SessionId(
+                                session.id.to_string().into(),
+                            ),
                             failed_at_message: i,
                             total_messages,
                             error_details: format!(
@@ -472,19 +498,17 @@ mod tests {
 
     fn create_test_session() -> Session {
         let session_id = ulid::Ulid::new();
-        let mut session = Session::new(session_id);
-        
+        let cwd = std::env::current_dir().unwrap();
+        let mut session = Session::new(session_id, cwd);
+
         // Add some test messages
-        session.add_message(Message::new(
-            MessageRole::User,
-            "Hello, world!".to_string(),
-        ));
-        
+        session.add_message(Message::new(MessageRole::User, "Hello, world!".to_string()));
+
         session.add_message(Message::new(
             MessageRole::Assistant,
             "Hello! How can I help you?".to_string(),
         ));
-        
+
         session
     }
 
@@ -501,7 +525,7 @@ mod tests {
         let session = create_test_session();
         let session_manager = SessionManager::new();
         let loader = EnhancedSessionLoader::new(session_manager);
-        
+
         let result = loader.validate_session_integrity(&session);
         assert!(result.is_ok());
     }
@@ -509,19 +533,20 @@ mod tests {
     #[test]
     fn test_validate_session_integrity_future_timestamp() {
         let session_id = ulid::Ulid::new();
-        let mut session = Session::new(session_id);
-        
+        let cwd = std::env::current_dir().unwrap();
+        let mut session = Session::new(session_id, cwd);
+
         // Add message with future timestamp
         let mut message = Message::new(MessageRole::User, "test".to_string());
         message.timestamp = SystemTime::now() + Duration::from_secs(3600);
         session.context.push(message);
-        
+
         let session_manager = SessionManager::new();
         let loader = EnhancedSessionLoader::new(session_manager);
-        
+
         let result = loader.validate_session_integrity(&session);
         assert!(result.is_err());
-        
+
         if let Err(SessionSetupError::SessionCorrupted { .. }) = result {
             // Expected error type
         } else {
@@ -534,10 +559,10 @@ mod tests {
         let session = create_test_session();
         let session_manager = SessionManager::new();
         let loader = EnhancedSessionLoader::new(session_manager);
-        
+
         let notifications = loader.prepare_history_replay(&session).await.unwrap();
         assert_eq!(notifications.len(), 2);
-        
+
         // Check that notifications contain proper metadata
         for notification in &notifications {
             assert!(notification.meta.is_some());
@@ -558,7 +583,7 @@ mod tests {
     fn test_validate_session_id_invalid() {
         let invalid_id = "not-a-valid-session-id";
         let result = validate_session_id(invalid_id);
-        
+
         assert!(result.is_err());
         if let Err(SessionSetupError::InvalidSessionId { .. }) = result {
             // Expected error type

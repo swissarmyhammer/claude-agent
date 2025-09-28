@@ -49,12 +49,12 @@ impl CapabilityValidator {
         requested_operations: &[String],
     ) -> SessionSetupResult<()> {
         // Validate loadSession capability if session loading is requested
-        if requested_operations.contains(&"session/load".to_string())
-            && !capabilities.load_session {
-                return Err(SessionSetupError::LoadSessionNotSupported {
-                    declared_capability: false,
-                });
-            }
+        if requested_operations.contains(&"session/load".to_string()) && !capabilities.load_session
+        {
+            return Err(SessionSetupError::LoadSessionNotSupported {
+                declared_capability: false,
+            });
+        }
 
         // Validate MCP transport capabilities if MCP servers are requested
         let has_mcp_request = requested_operations
@@ -99,18 +99,18 @@ impl CapabilityValidator {
     /// Get list of supported transport types from capabilities
     fn get_supported_transports(&self, capabilities: &AgentCapabilities) -> Vec<String> {
         let mut supported = Vec::new();
-        
+
         // STDIO is always supported (it's the base transport)
         supported.push("stdio".to_string());
-        
+
         if capabilities.mcp_capabilities.http {
             supported.push("http".to_string());
         }
-        
+
         if capabilities.mcp_capabilities.sse {
             supported.push("sse".to_string());
         }
-        
+
         supported
     }
 
@@ -198,7 +198,11 @@ impl CapabilityValidator {
                     if !self.known_agent_capabilities.contains(capability_name) {
                         return Err(SessionSetupError::UnknownCapability {
                             capability_name: capability_name.clone(),
-                            known_capabilities: self.known_agent_capabilities.iter().cloned().collect(),
+                            known_capabilities: self
+                                .known_agent_capabilities
+                                .iter()
+                                .cloned()
+                                .collect(),
                         });
                     }
                 }
@@ -309,10 +313,10 @@ impl CapabilityRequirementChecker {
         mcp_servers: &[crate::config::McpServerConfig],
     ) -> SessionSetupResult<()> {
         let validator = CapabilityValidator::new();
-        
+
         // Check transport requirements
         validator.validate_transport_requirements(agent_capabilities, mcp_servers)?;
-        
+
         Ok(())
     }
 
@@ -322,17 +326,17 @@ impl CapabilityRequirementChecker {
         mcp_servers: &[crate::config::McpServerConfig],
     ) -> SessionSetupResult<()> {
         let validator = CapabilityValidator::new();
-        
+
         // Check loadSession capability
         if !agent_capabilities.load_session {
             return Err(SessionSetupError::LoadSessionNotSupported {
                 declared_capability: false,
             });
         }
-        
+
         // Check transport requirements
         validator.validate_transport_requirements(agent_capabilities, mcp_servers)?;
-        
+
         Ok(())
     }
 }
@@ -365,7 +369,9 @@ mod tests {
         let validator = CapabilityValidator::new();
         assert!(validator.known_agent_capabilities.contains("load_session"));
         assert!(validator.known_agent_capabilities.contains("mcp"));
-        assert!(validator.known_client_capabilities.contains("notifications"));
+        assert!(validator
+            .known_client_capabilities
+            .contains("notifications"));
     }
 
     #[test]
@@ -373,7 +379,7 @@ mod tests {
         let validator = CapabilityValidator::new();
         let capabilities = create_test_agent_capabilities();
         let operations = vec!["session/load".to_string()];
-        
+
         let result = validator.validate_agent_capabilities(&capabilities, &operations);
         assert!(result.is_ok());
     }
@@ -384,10 +390,10 @@ mod tests {
         let mut capabilities = create_test_agent_capabilities();
         capabilities.load_session = false;
         let operations = vec!["session/load".to_string()];
-        
+
         let result = validator.validate_agent_capabilities(&capabilities, &operations);
         assert!(result.is_err());
-        
+
         if let Err(SessionSetupError::LoadSessionNotSupported { .. }) = result {
             // Expected error type
         } else {
@@ -400,7 +406,7 @@ mod tests {
         let validator = CapabilityValidator::new();
         let capabilities = create_test_agent_capabilities();
         let operations = vec!["mcp_http".to_string()];
-        
+
         let result = validator.validate_agent_capabilities(&capabilities, &operations);
         assert!(result.is_ok());
     }
@@ -410,10 +416,10 @@ mod tests {
         let validator = CapabilityValidator::new();
         let capabilities = create_test_agent_capabilities();
         let operations = vec!["mcp_sse".to_string()];
-        
+
         let result = validator.validate_agent_capabilities(&capabilities, &operations);
         assert!(result.is_err());
-        
+
         if let Err(SessionSetupError::TransportNotSupported { .. }) = result {
             // Expected error type
         } else {
@@ -425,7 +431,7 @@ mod tests {
     fn test_get_supported_transports() {
         let validator = CapabilityValidator::new();
         let capabilities = create_test_agent_capabilities();
-        
+
         let supported = validator.get_supported_transports(&capabilities);
         assert!(supported.contains(&"stdio".to_string()));
         assert!(supported.contains(&"http".to_string()));
@@ -437,9 +443,13 @@ mod tests {
         let validator = CapabilityValidator::new();
         let valid_bool = serde_json::json!(true);
         let invalid_bool = serde_json::json!("not_a_boolean");
-        
-        assert!(validator.validate_capability_format("test", &valid_bool, "boolean").is_ok());
-        assert!(validator.validate_capability_format("test", &invalid_bool, "boolean").is_err());
+
+        assert!(validator
+            .validate_capability_format("test", &valid_bool, "boolean")
+            .is_ok());
+        assert!(validator
+            .validate_capability_format("test", &invalid_bool, "boolean")
+            .is_err());
     }
 
     #[test]
@@ -447,9 +457,13 @@ mod tests {
         let validator = CapabilityValidator::new();
         let valid_object = serde_json::json!({"key": "value"});
         let invalid_object = serde_json::json!("not_an_object");
-        
-        assert!(validator.validate_capability_format("test", &valid_object, "object").is_ok());
-        assert!(validator.validate_capability_format("test", &invalid_object, "object").is_err());
+
+        assert!(validator
+            .validate_capability_format("test", &valid_object, "object")
+            .is_ok());
+        assert!(validator
+            .validate_capability_format("test", &invalid_object, "object")
+            .is_err());
     }
 
     #[test]
@@ -458,10 +472,10 @@ mod tests {
         let unknown_agent_caps = serde_json::json!({
             "unknown_capability": true
         });
-        
+
         let result = validator.validate_capability_names(Some(&unknown_agent_caps), None);
         assert!(result.is_err());
-        
+
         if let Err(SessionSetupError::UnknownCapability { .. }) = result {
             // Expected error type
         } else {
@@ -473,8 +487,10 @@ mod tests {
     fn test_check_capability_compatibility() {
         let validator = CapabilityValidator::new();
         let capabilities = create_test_agent_capabilities();
-        
-        let warnings = validator.check_capability_compatibility(&capabilities, None).unwrap();
+
+        let warnings = validator
+            .check_capability_compatibility(&capabilities, None)
+            .unwrap();
         assert!(!warnings.is_empty()); // Should have at least one warning about session loading
     }
 
@@ -482,8 +498,11 @@ mod tests {
     fn test_capability_requirement_checker_new_session() {
         let capabilities = create_test_agent_capabilities();
         let mcp_servers = vec![];
-        
-        let result = CapabilityRequirementChecker::check_new_session_requirements(&capabilities, &mcp_servers);
+
+        let result = CapabilityRequirementChecker::check_new_session_requirements(
+            &capabilities,
+            &mcp_servers,
+        );
         assert!(result.is_ok());
     }
 
@@ -491,8 +510,11 @@ mod tests {
     fn test_capability_requirement_checker_load_session_supported() {
         let capabilities = create_test_agent_capabilities();
         let mcp_servers = vec![];
-        
-        let result = CapabilityRequirementChecker::check_load_session_requirements(&capabilities, &mcp_servers);
+
+        let result = CapabilityRequirementChecker::check_load_session_requirements(
+            &capabilities,
+            &mcp_servers,
+        );
         assert!(result.is_ok());
     }
 
@@ -501,10 +523,13 @@ mod tests {
         let mut capabilities = create_test_agent_capabilities();
         capabilities.load_session = false;
         let mcp_servers = vec![];
-        
-        let result = CapabilityRequirementChecker::check_load_session_requirements(&capabilities, &mcp_servers);
+
+        let result = CapabilityRequirementChecker::check_load_session_requirements(
+            &capabilities,
+            &mcp_servers,
+        );
         assert!(result.is_err());
-        
+
         if let Err(SessionSetupError::LoadSessionNotSupported { .. }) = result {
             // Expected error type
         } else {
@@ -517,8 +542,12 @@ mod tests {
         let mut validator = CapabilityValidator::new();
         validator.add_known_agent_capability("custom_agent_cap".to_string());
         validator.add_known_client_capability("custom_client_cap".to_string());
-        
-        assert!(validator.known_agent_capabilities.contains("custom_agent_cap"));
-        assert!(validator.known_client_capabilities.contains("custom_client_cap"));
+
+        assert!(validator
+            .known_agent_capabilities
+            .contains("custom_agent_cap"));
+        assert!(validator
+            .known_client_capabilities
+            .contains("custom_client_cap"));
     }
 }

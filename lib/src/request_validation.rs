@@ -17,8 +17,9 @@ impl RequestValidator {
         // Validate working directory parameter (always present in ACP)
         Self::validate_working_directory_parameter(&request.cwd, "session/new")?;
 
-        // For now, we'll skip MCP server validation as the types don't match
-        // TODO: Add proper MCP server validation once types are aligned
+        // Note: MCP server validation is deferred due to type mismatch between
+        // ACP protocol types (Vec<String>) and internal config types (Vec<McpServerConfig>).
+        // This will be addressed when the protocol types are aligned with internal representation.
 
         // Validate meta parameter format if provided
         if let Some(meta) = &request.meta {
@@ -36,8 +37,9 @@ impl RequestValidator {
         // Validate working directory parameter (always present in ACP)
         Self::validate_working_directory_parameter(&request.cwd, "session/load")?;
 
-        // For now, we'll skip MCP server validation as the types don't match
-        // TODO: Add proper MCP server validation once types are aligned
+        // Note: MCP server validation is deferred due to type mismatch between
+        // ACP protocol types (Vec<String>) and internal config types (Vec<McpServerConfig>).
+        // This will be addressed when the protocol types are aligned with internal representation.
 
         // Validate meta parameter format if provided
         if let Some(meta) = &request.meta {
@@ -48,7 +50,10 @@ impl RequestValidator {
     }
 
     /// Validate session ID parameter format and content
-    fn validate_session_id_parameter(session_id: &SessionId, request_type: &str) -> SessionSetupResult<()> {
+    fn validate_session_id_parameter(
+        session_id: &SessionId,
+        request_type: &str,
+    ) -> SessionSetupResult<()> {
         if session_id.0.is_empty() {
             return Err(SessionSetupError::MissingRequiredParameter {
                 request_type: request_type.to_string(),
@@ -76,7 +81,7 @@ impl RequestValidator {
                     expected_type: "non-empty PathBuf".to_string(),
                     actual_type: "empty path".to_string(),
                     provided_value: serde_json::json!(cwd.display().to_string()),
-                }
+                },
             )));
         }
 
@@ -85,8 +90,6 @@ impl RequestValidator {
 
         Ok(())
     }
-
-
 
     /// Validate meta parameter format
     fn validate_meta_parameter(meta: &Value, request_type: &str) -> SessionSetupResult<()> {
@@ -107,9 +110,10 @@ impl RequestValidator {
                         "boolean"
                     } else {
                         "unknown"
-                    }.to_string(),
+                    }
+                    .to_string(),
                     provided_value: meta.clone(),
-                }
+                },
             )));
         }
 
@@ -128,7 +132,7 @@ impl RequestValidator {
                                 "reservedKey": reserved_key,
                                 "reservedKeys": reserved_keys
                             }),
-                        }
+                        },
                     )));
                 }
             }
@@ -146,7 +150,7 @@ impl RequestValidator {
                             "sizeBytes": meta_str.len(),
                             "maxSizeBytes": 100_000
                         }),
-                    }
+                    },
                 )));
             }
         }
@@ -160,13 +164,12 @@ impl RequestValidator {
         expected_method: &str,
     ) -> SessionSetupResult<Value> {
         // Parse JSON
-        let parsed: Value = serde_json::from_str(raw_json).map_err(|e| {
-            SessionSetupError::MalformedRequest {
+        let parsed: Value =
+            serde_json::from_str(raw_json).map_err(|e| SessionSetupError::MalformedRequest {
                 request_type: expected_method.to_string(),
                 details: format!("Invalid JSON format: {}", e),
                 example: Some(Self::get_example_request(expected_method)),
-            }
-        })?;
+            })?;
 
         // Validate JSON-RPC structure
         Self::validate_jsonrpc_structure(&parsed, expected_method)?;
@@ -175,14 +178,17 @@ impl RequestValidator {
     }
 
     /// Validate JSON-RPC request structure
-    fn validate_jsonrpc_structure(request: &Value, expected_method: &str) -> SessionSetupResult<()> {
-        let obj = request.as_object().ok_or_else(|| {
-            SessionSetupError::MalformedRequest {
+    fn validate_jsonrpc_structure(
+        request: &Value,
+        expected_method: &str,
+    ) -> SessionSetupResult<()> {
+        let obj = request
+            .as_object()
+            .ok_or_else(|| SessionSetupError::MalformedRequest {
                 request_type: expected_method.to_string(),
                 details: "Request must be a JSON object".to_string(),
                 example: Some(Self::get_example_request(expected_method)),
-            }
-        })?;
+            })?;
 
         // Check required JSON-RPC fields
         if !obj.contains_key("jsonrpc") {
@@ -219,7 +225,7 @@ impl RequestValidator {
                         expected_type: "string '2.0'".to_string(),
                         actual_type: "invalid version".to_string(),
                         provided_value: version.clone(),
-                    }
+                    },
                 )));
             }
         }
@@ -234,7 +240,7 @@ impl RequestValidator {
                         expected_type: format!("string '{}'", expected_method),
                         actual_type: "wrong method".to_string(),
                         provided_value: serde_json::json!(method),
-                    }
+                    },
                 )));
             }
         }
@@ -245,34 +251,30 @@ impl RequestValidator {
     /// Get example request for error messages
     fn get_example_request(method: &str) -> String {
         match method {
-            "session/new" => {
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": "1",
-                    "method": "session/new",
-                    "params": {
-                        "cwd": "/home/user/project",
-                        "mcpServers": [],
-                        "meta": {}
-                    }
-                })).unwrap_or_default()
-            }
-            "session/load" => {
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "jsonrpc": "2.0", 
-                    "id": "1",
-                    "method": "session/load",
-                    "params": {
-                        "sessionId": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-                        "cwd": "/home/user/project",
-                        "mcpServers": [],
-                        "meta": null
-                    }
-                })).unwrap_or_default()
-            }
-            _ => {
-                "See ACP documentation for proper request format".to_string()
-            }
+            "session/new" => serde_json::to_string_pretty(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "1",
+                "method": "session/new",
+                "params": {
+                    "cwd": "/home/user/project",
+                    "mcpServers": [],
+                    "meta": {}
+                }
+            }))
+            .unwrap_or_default(),
+            "session/load" => serde_json::to_string_pretty(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "1",
+                "method": "session/load",
+                "params": {
+                    "sessionId": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    "cwd": "/home/user/project",
+                    "mcpServers": [],
+                    "meta": null
+                }
+            }))
+            .unwrap_or_default(),
+            _ => "See ACP documentation for proper request format".to_string(),
         }
     }
 
@@ -290,7 +292,7 @@ impl RequestValidator {
                     expected_type: "object".to_string(),
                     actual_type: "not an object".to_string(),
                     provided_value: params.clone(),
-                }
+                },
             ))
         })?;
 
@@ -343,10 +345,11 @@ impl RequestValidator {
             "null" => param_value.is_null(),
             "PathBuf" => param_value.is_string(), // PathBuf serialized as string
             "SessionId" => param_value.is_string(), // SessionId serialized as string
-            _ => true, // Unknown types pass through
+            _ => true,                            // Unknown types pass through
         };
 
-        if !type_matches && !param_value.is_null() { // null is often acceptable
+        if !type_matches && !param_value.is_null() {
+            // null is often acceptable
             return Err(SessionSetupError::InvalidParameterType(Box::new(
                 crate::session_errors::InvalidParameterTypeDetails {
                     request_type: request_type.to_string(),
@@ -354,7 +357,7 @@ impl RequestValidator {
                     expected_type: expected_property.type_name.clone(),
                     actual_type,
                     provided_value: param_value.clone(),
-                }
+                },
             )));
         }
 
@@ -370,7 +373,7 @@ impl RequestValidator {
                                 expected_type: "valid ULID format".to_string(),
                                 actual_type: "invalid ULID".to_string(),
                                 provided_value: param_value.clone(),
-                            }
+                            },
                         )));
                     }
                 }
@@ -385,7 +388,7 @@ impl RequestValidator {
                                 expected_type: "non-empty path string".to_string(),
                                 actual_type: "empty string".to_string(),
                                 provided_value: param_value.clone(),
-                            }
+                            },
                         )));
                     }
                 }
@@ -429,21 +432,30 @@ impl ParameterSchema {
     /// Create schema for session/new request
     pub fn new_session_schema() -> Self {
         let mut properties = std::collections::HashMap::new();
-        
-        properties.insert("cwd".to_string(), PropertySchema {
-            type_name: "PathBuf".to_string(),
-            optional: true,
-        });
-        
-        properties.insert("mcpServers".to_string(), PropertySchema {
-            type_name: "array".to_string(),
-            optional: true,
-        });
-        
-        properties.insert("meta".to_string(), PropertySchema {
-            type_name: "object".to_string(),
-            optional: true,
-        });
+
+        properties.insert(
+            "cwd".to_string(),
+            PropertySchema {
+                type_name: "PathBuf".to_string(),
+                optional: true,
+            },
+        );
+
+        properties.insert(
+            "mcpServers".to_string(),
+            PropertySchema {
+                type_name: "array".to_string(),
+                optional: true,
+            },
+        );
+
+        properties.insert(
+            "meta".to_string(),
+            PropertySchema {
+                type_name: "object".to_string(),
+                optional: true,
+            },
+        );
 
         Self {
             properties,
@@ -454,26 +466,38 @@ impl ParameterSchema {
     /// Create schema for session/load request
     pub fn load_session_schema() -> Self {
         let mut properties = std::collections::HashMap::new();
-        
-        properties.insert("sessionId".to_string(), PropertySchema {
-            type_name: "SessionId".to_string(),
-            optional: false,
-        });
-        
-        properties.insert("cwd".to_string(), PropertySchema {
-            type_name: "PathBuf".to_string(),
-            optional: true,
-        });
-        
-        properties.insert("mcpServers".to_string(), PropertySchema {
-            type_name: "array".to_string(),
-            optional: true,
-        });
-        
-        properties.insert("meta".to_string(), PropertySchema {
-            type_name: "object".to_string(),
-            optional: true,
-        });
+
+        properties.insert(
+            "sessionId".to_string(),
+            PropertySchema {
+                type_name: "SessionId".to_string(),
+                optional: false,
+            },
+        );
+
+        properties.insert(
+            "cwd".to_string(),
+            PropertySchema {
+                type_name: "PathBuf".to_string(),
+                optional: true,
+            },
+        );
+
+        properties.insert(
+            "mcpServers".to_string(),
+            PropertySchema {
+                type_name: "array".to_string(),
+                optional: true,
+            },
+        );
+
+        properties.insert(
+            "meta".to_string(),
+            PropertySchema {
+                type_name: "object".to_string(),
+                optional: true,
+            },
+        );
 
         Self {
             properties,
@@ -486,7 +510,6 @@ impl ParameterSchema {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-
 
     fn create_test_new_session_request() -> NewSessionRequest {
         NewSessionRequest {
@@ -523,10 +546,10 @@ mod tests {
     fn test_validate_load_session_request_invalid_session_id() {
         let mut request = create_test_load_session_request();
         request.session_id = SessionId("invalid-session-id".to_string().into());
-        
+
         let result = RequestValidator::validate_load_session_request(&request);
         assert!(result.is_err());
-        
+
         if let Err(SessionSetupError::InvalidSessionId { .. }) = result {
             // Expected error type
         } else {
@@ -538,7 +561,7 @@ mod tests {
     fn test_validate_working_directory_parameter_empty() {
         let empty_path = PathBuf::from("");
         let result = RequestValidator::validate_working_directory_parameter(&empty_path, "test");
-        
+
         assert!(result.is_err());
         if let Err(SessionSetupError::InvalidParameterType(..)) = result {
             // Expected error type
@@ -551,7 +574,7 @@ mod tests {
     fn test_validate_meta_parameter_invalid_type() {
         let invalid_meta = serde_json::json!("not an object");
         let result = RequestValidator::validate_meta_parameter(&invalid_meta, "test");
-        
+
         assert!(result.is_err());
         if let Err(SessionSetupError::InvalidParameterType(..)) = result {
             // Expected error type
@@ -564,7 +587,7 @@ mod tests {
     fn test_validate_meta_parameter_reserved_key() {
         let meta_with_reserved = serde_json::json!({"_system": "reserved"});
         let result = RequestValidator::validate_meta_parameter(&meta_with_reserved, "test");
-        
+
         assert!(result.is_err());
         if let Err(SessionSetupError::InvalidParameterType(..)) = result {
             // Expected error type
@@ -581,7 +604,7 @@ mod tests {
             "method": "session/new",
             "params": {}
         }"#;
-        
+
         let result = RequestValidator::validate_raw_request_format(valid_json, "session/new");
         assert!(result.is_ok());
     }
@@ -590,7 +613,7 @@ mod tests {
     fn test_validate_raw_request_format_invalid_json() {
         let invalid_json = r#"{ invalid json }"#;
         let result = RequestValidator::validate_raw_request_format(invalid_json, "session/new");
-        
+
         assert!(result.is_err());
         if let Err(SessionSetupError::MalformedRequest { .. }) = result {
             // Expected error type
@@ -605,10 +628,11 @@ mod tests {
             "jsonrpc": "2.0",
             "id": "1"
         });
-        
-        let result = RequestValidator::validate_jsonrpc_structure(&request_without_method, "session/new");
+
+        let result =
+            RequestValidator::validate_jsonrpc_structure(&request_without_method, "session/new");
         assert!(result.is_err());
-        
+
         if let Err(SessionSetupError::MissingRequiredParameter { parameter_name, .. }) = result {
             assert_eq!(parameter_name, "method");
         } else {
@@ -623,10 +647,11 @@ mod tests {
             "id": "1",
             "method": "session/new"
         });
-        
-        let result = RequestValidator::validate_jsonrpc_structure(&request_wrong_version, "session/new");
+
+        let result =
+            RequestValidator::validate_jsonrpc_structure(&request_wrong_version, "session/new");
         assert!(result.is_err());
-        
+
         if let Err(SessionSetupError::InvalidParameterType(details)) = result {
             assert_eq!(details.parameter_name, "jsonrpc");
         } else {
@@ -641,7 +666,7 @@ mod tests {
         assert!(new_session_schema.properties.contains_key("mcpServers"));
         assert!(new_session_schema.properties.contains_key("meta"));
         assert!(new_session_schema.required.is_empty());
-        
+
         let load_session_schema = ParameterSchema::load_session_schema();
         assert!(load_session_schema.properties.contains_key("sessionId"));
         assert_eq!(load_session_schema.required, vec!["sessionId".to_string()]);
@@ -649,12 +674,30 @@ mod tests {
 
     #[test]
     fn test_get_json_value_type_name() {
-        assert_eq!(RequestValidator::get_json_value_type_name(&serde_json::json!(null)), "null");
-        assert_eq!(RequestValidator::get_json_value_type_name(&serde_json::json!(true)), "boolean");
-        assert_eq!(RequestValidator::get_json_value_type_name(&serde_json::json!(123)), "number");
-        assert_eq!(RequestValidator::get_json_value_type_name(&serde_json::json!("test")), "string");
-        assert_eq!(RequestValidator::get_json_value_type_name(&serde_json::json!([])), "array");
-        assert_eq!(RequestValidator::get_json_value_type_name(&serde_json::json!({})), "object");
+        assert_eq!(
+            RequestValidator::get_json_value_type_name(&serde_json::json!(null)),
+            "null"
+        );
+        assert_eq!(
+            RequestValidator::get_json_value_type_name(&serde_json::json!(true)),
+            "boolean"
+        );
+        assert_eq!(
+            RequestValidator::get_json_value_type_name(&serde_json::json!(123)),
+            "number"
+        );
+        assert_eq!(
+            RequestValidator::get_json_value_type_name(&serde_json::json!("test")),
+            "string"
+        );
+        assert_eq!(
+            RequestValidator::get_json_value_type_name(&serde_json::json!([])),
+            "array"
+        );
+        assert_eq!(
+            RequestValidator::get_json_value_type_name(&serde_json::json!({})),
+            "object"
+        );
     }
 
     #[test]
@@ -662,7 +705,7 @@ mod tests {
         let new_example = RequestValidator::get_example_request("session/new");
         assert!(new_example.contains("session/new"));
         assert!(new_example.contains("jsonrpc"));
-        
+
         let load_example = RequestValidator::get_example_request("session/load");
         assert!(load_example.contains("session/load"));
         assert!(load_example.contains("sessionId"));

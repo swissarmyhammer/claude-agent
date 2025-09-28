@@ -179,15 +179,15 @@ impl AgentError {
         match self {
             AgentError::Mcp(mcp_error) => mcp_error.to_json_rpc_error(),
             AgentError::PathValidation(_) => -32602, // Invalid params
-            AgentError::Protocol(_) => -32600, // Invalid Request
+            AgentError::Protocol(_) => -32600,       // Invalid Request
             AgentError::MethodNotFound(_) => -32601, // Method not found
             AgentError::InvalidRequest(_) => -32602, // Invalid params
-            AgentError::Internal(_) => -32603, // Internal error
+            AgentError::Internal(_) => -32603,       // Internal error
             AgentError::PermissionDenied(_) => -32000, // Server error
-            AgentError::ToolExecution(_) => -32000, // Server error
-            AgentError::Session(_) => -32000,  // Server error
-            AgentError::Config(_) => -32000,   // Server error
-            _ => -32603,                       // Internal error (default)
+            AgentError::ToolExecution(_) => -32000,  // Server error
+            AgentError::Session(_) => -32000,        // Server error
+            AgentError::Config(_) => -32000,         // Server error
+            _ => -32603,                             // Internal error (default)
         }
     }
 }
@@ -227,9 +227,13 @@ mod tests {
         assert_eq!(err.to_string(), "Internal error: internal error");
 
         // Test PathValidation error
-        let path_err = crate::path_validator::PathValidationError::NotAbsolute("relative/path".to_string());
+        let path_err =
+            crate::path_validator::PathValidationError::NotAbsolute("relative/path".to_string());
         let err = AgentError::PathValidation(path_err);
-        assert_eq!(err.to_string(), "Path validation error: Path is not absolute: relative/path");
+        assert_eq!(
+            err.to_string(),
+            "Path validation error: Path is not absolute: relative/path"
+        );
     }
 
     #[test]

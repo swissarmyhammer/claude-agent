@@ -1,10 +1,10 @@
 //! Enhanced MCP server connection error handling for ACP compliance
-//! 
+//!
 //! This module provides comprehensive error handling for MCP server connections
 //! following ACP specification requirements with detailed error reporting.
 
 use crate::{
-    config::McpServerConfig, 
+    config::McpServerConfig,
     mcp::{McpServerConnection, TransportConnection},
     session_errors::{SessionSetupError, SessionSetupResult},
     session_validation::validate_mcp_server_config,
@@ -58,14 +58,14 @@ impl EnhancedMcpServerManager {
     /// and provides detailed error information for each failure while continuing
     /// to connect to other servers.
     pub async fn connect_servers_with_validation(
-        &mut self, 
-        configs: Vec<McpServerConfig>
+        &mut self,
+        configs: Vec<McpServerConfig>,
     ) -> SessionSetupResult<HashMap<String, Result<String, SessionSetupError>>> {
         let mut results = HashMap::new();
-        
+
         for config in configs {
             let server_name = config.name().to_string();
-            
+
             // Step 1: Validate server configuration before attempting connection
             match validate_mcp_server_config(&config) {
                 Ok(()) => {
@@ -73,8 +73,8 @@ impl EnhancedMcpServerManager {
                     match self.connect_server_enhanced(config).await {
                         Ok(connection) => {
                             tracing::info!(
-                                "Successfully connected to MCP server: {} with {} tools", 
-                                connection.name, 
+                                "Successfully connected to MCP server: {} with {} tools",
+                                connection.name,
                                 connection.tools.len()
                             );
                             let mut connections = self.connections.write().await;
@@ -82,34 +82,48 @@ impl EnhancedMcpServerManager {
                             results.insert(server_name, Ok("Connected successfully".to_string()));
                         }
                         Err(e) => {
-                            tracing::error!("Failed to connect to MCP server {}: {}", server_name, e);
+                            tracing::error!(
+                                "Failed to connect to MCP server {}: {}",
+                                server_name,
+                                e
+                            );
                             results.insert(server_name, Err(e));
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Invalid MCP server configuration for {}: {}", server_name, e);
+                    tracing::error!(
+                        "Invalid MCP server configuration for {}: {}",
+                        server_name,
+                        e
+                    );
                     results.insert(server_name, Err(e));
                 }
             }
         }
-        
+
         Ok(results)
     }
 
     /// Connect to a single MCP server with enhanced error handling
-    async fn connect_server_enhanced(&self, config: McpServerConfig) -> SessionSetupResult<McpServerConnection> {
+    async fn connect_server_enhanced(
+        &self,
+        config: McpServerConfig,
+    ) -> SessionSetupResult<McpServerConnection> {
         let start_time = Instant::now();
-        
+
         match config.clone() {
             McpServerConfig::Stdio(stdio_config) => {
-                self.connect_stdio_server_enhanced(config, &stdio_config, start_time).await
+                self.connect_stdio_server_enhanced(config, &stdio_config, start_time)
+                    .await
             }
             McpServerConfig::Http(http_config) => {
-                self.connect_http_server_enhanced(config, &http_config, start_time).await
+                self.connect_http_server_enhanced(config, &http_config, start_time)
+                    .await
             }
             McpServerConfig::Sse(sse_config) => {
-                self.connect_sse_server_enhanced(config, &sse_config, start_time).await
+                self.connect_sse_server_enhanced(config, &sse_config, start_time)
+                    .await
             }
         }
     }
@@ -152,7 +166,7 @@ impl EnhancedMcpServerManager {
         // Configure process stdio
         command
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())  
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
         // Spawn the process with detailed error handling
@@ -165,27 +179,31 @@ impl EnhancedMcpServerManager {
                             server_name: stdio_config.name.clone(),
                             command: Path::new(&stdio_config.command).to_path_buf(),
                             suggestion: if Path::new(&stdio_config.command).is_absolute() {
-                                "Check that the executable exists and has proper permissions".to_string()
+                                "Check that the executable exists and has proper permissions"
+                                    .to_string()
                             } else {
-                                format!("Install {} or provide the full path to the executable", stdio_config.command)
+                                format!(
+                                    "Install {} or provide the full path to the executable",
+                                    stdio_config.command
+                                )
                             },
                         })
                     }
                     std::io::ErrorKind::PermissionDenied => {
                         Err(SessionSetupError::McpServerConnectionFailed {
                             server_name: stdio_config.name.clone(),
-                            error: "Permission denied: insufficient permissions to execute server".to_string(),
+                            error: "Permission denied: insufficient permissions to execute server"
+                                .to_string(),
                             transport_type: "stdio".to_string(),
                         })
                     }
-                    _ => {
-                        Err(SessionSetupError::McpServerStartupFailed {
-                            server_name: stdio_config.name.clone(),
-                            exit_code: -1,
-                            stderr: format!("Process spawn failed: {}", e),
-                            suggestion: "Check server installation, permissions, and system resources".to_string(),
-                        })
-                    }
+                    _ => Err(SessionSetupError::McpServerStartupFailed {
+                        server_name: stdio_config.name.clone(),
+                        exit_code: -1,
+                        stderr: format!("Process spawn failed: {}", e),
+                        suggestion: "Check server installation, permissions, and system resources"
+                            .to_string(),
+                    }),
                 }
             }
         };
@@ -212,21 +230,25 @@ impl EnhancedMcpServerManager {
         }
 
         // Get stdio handles
-        let stdin = child.stdin.take().ok_or_else(|| {
-            SessionSetupError::McpServerConnectionFailed {
-                server_name: stdio_config.name.clone(),
-                error: "Failed to get stdin handle from child process".to_string(),
-                transport_type: "stdio".to_string(),
-            }
-        })?;
+        let stdin =
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| SessionSetupError::McpServerConnectionFailed {
+                    server_name: stdio_config.name.clone(),
+                    error: "Failed to get stdin handle from child process".to_string(),
+                    transport_type: "stdio".to_string(),
+                })?;
 
-        let stdout = child.stdout.take().ok_or_else(|| {
-            SessionSetupError::McpServerConnectionFailed {
-                server_name: stdio_config.name.clone(),
-                error: "Failed to get stdout handle from child process".to_string(),
-                transport_type: "stdio".to_string(),
-            }
-        })?;
+        let stdout =
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| SessionSetupError::McpServerConnectionFailed {
+                    server_name: stdio_config.name.clone(),
+                    error: "Failed to get stdout handle from child process".to_string(),
+                    transport_type: "stdio".to_string(),
+                })?;
 
         let mut stdin_writer = BufWriter::new(stdin);
         let mut stdout_reader = BufReader::new(stdout);
@@ -239,7 +261,9 @@ impl EnhancedMcpServerManager {
                 &mut stdout_reader,
                 &stdio_config.name,
             ),
-        ).await {
+        )
+        .await
+        {
             Ok(Ok(tools)) => tools,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
@@ -301,24 +325,23 @@ impl EnhancedMcpServerManager {
         // Build HTTP client with headers
         let mut headers = reqwest::header::HeaderMap::new();
         for header in &http_config.headers {
-            let name = reqwest::header::HeaderName::from_bytes(header.name.as_bytes())
-                .map_err(|_| {
+            let name =
+                reqwest::header::HeaderName::from_bytes(header.name.as_bytes()).map_err(|_| {
                     SessionSetupError::McpServerConnectionFailed {
                         server_name: http_config.name.clone(),
                         error: format!("Invalid header name: {}", header.name),
                         transport_type: "http".to_string(),
                     }
                 })?;
-            
-            let value = reqwest::header::HeaderValue::from_str(&header.value)
-                .map_err(|_| {
-                    SessionSetupError::McpServerConnectionFailed {
-                        server_name: http_config.name.clone(),
-                        error: format!("Invalid header value: {}", header.value),
-                        transport_type: "http".to_string(),
-                    }
-                })?;
-            
+
+            let value = reqwest::header::HeaderValue::from_str(&header.value).map_err(|_| {
+                SessionSetupError::McpServerConnectionFailed {
+                    server_name: http_config.name.clone(),
+                    error: format!("Invalid header value: {}", header.value),
+                    transport_type: "http".to_string(),
+                }
+            })?;
+
             headers.insert(name, value);
         }
 
@@ -326,16 +349,16 @@ impl EnhancedMcpServerManager {
             .timeout(Duration::from_millis(self.connection_timeout_ms))
             .default_headers(headers)
             .build()
-            .map_err(|e| {
-                SessionSetupError::McpServerConnectionFailed {
-                    server_name: http_config.name.clone(),
-                    error: format!("Failed to create HTTP client: {}", e),
-                    transport_type: "http".to_string(),
-                }
+            .map_err(|e| SessionSetupError::McpServerConnectionFailed {
+                server_name: http_config.name.clone(),
+                error: format!("Failed to create HTTP client: {}", e),
+                transport_type: "http".to_string(),
             })?;
 
         // Test connection and initialize protocol
-        let tools = self.initialize_http_mcp_protocol_enhanced(&client, http_config).await?;
+        let tools = self
+            .initialize_http_mcp_protocol_enhanced(&client, http_config)
+            .await?;
 
         let transport = TransportConnection::Http {
             client: Arc::new(client),
@@ -367,12 +390,10 @@ impl EnhancedMcpServerManager {
         );
 
         // Validate URL format
-        Url::parse(&sse_config.url).map_err(|_| {
-            SessionSetupError::McpServerConnectionFailed {
-                server_name: sse_config.name.clone(),
-                error: "Invalid URL format".to_string(),
-                transport_type: "sse".to_string(),
-            }
+        Url::parse(&sse_config.url).map_err(|_| SessionSetupError::McpServerConnectionFailed {
+            server_name: sse_config.name.clone(),
+            error: "Invalid URL format".to_string(),
+            transport_type: "sse".to_string(),
         })?;
 
         // Create SSE connection channels
@@ -380,7 +401,9 @@ impl EnhancedMcpServerManager {
         let (response_tx, response_rx) = mpsc::unbounded_channel();
 
         // Initialize SSE connection
-        let tools = self.initialize_sse_mcp_protocol_enhanced(sse_config, response_tx).await?;
+        let tools = self
+            .initialize_sse_mcp_protocol_enhanced(sse_config, response_tx)
+            .await?;
 
         let transport = TransportConnection::Sse {
             url: sse_config.url.clone(),
@@ -427,22 +450,24 @@ impl EnhancedMcpServerManager {
         });
 
         let request_line = format!("{}\n", initialize_request);
-        
-        writer.write_all(request_line.as_bytes()).await.map_err(|e| {
-            SessionSetupError::McpServerConnectionFailed {
+
+        writer
+            .write_all(request_line.as_bytes())
+            .await
+            .map_err(|e| SessionSetupError::McpServerConnectionFailed {
                 server_name: server_name.to_string(),
                 error: format!("Failed to send initialize request: {}", e),
                 transport_type: "stdio".to_string(),
-            }
-        })?;
-        
-        writer.flush().await.map_err(|e| {
-            SessionSetupError::McpServerConnectionFailed {
+            })?;
+
+        writer
+            .flush()
+            .await
+            .map_err(|e| SessionSetupError::McpServerConnectionFailed {
                 server_name: server_name.to_string(),
                 error: format!("Failed to flush initialize request: {}", e),
                 transport_type: "stdio".to_string(),
-            }
-        })?;
+            })?;
 
         // Read initialize response
         let mut response_line = String::new();
@@ -486,21 +511,23 @@ impl EnhancedMcpServerManager {
         });
 
         let notification_line = format!("{}\n", initialized_notification);
-        writer.write_all(notification_line.as_bytes()).await.map_err(|e| {
-            SessionSetupError::McpServerConnectionFailed {
+        writer
+            .write_all(notification_line.as_bytes())
+            .await
+            .map_err(|e| SessionSetupError::McpServerConnectionFailed {
                 server_name: server_name.to_string(),
                 error: format!("Failed to send initialized notification: {}", e),
                 transport_type: "stdio".to_string(),
-            }
-        })?;
-        
-        writer.flush().await.map_err(|e| {
-            SessionSetupError::McpServerConnectionFailed {
+            })?;
+
+        writer
+            .flush()
+            .await
+            .map_err(|e| SessionSetupError::McpServerConnectionFailed {
                 server_name: server_name.to_string(),
                 error: format!("Failed to flush initialized notification: {}", e),
                 transport_type: "stdio".to_string(),
-            }
-        })?;
+            })?;
 
         // Request list of tools
         let tools_request = json!({
@@ -517,32 +544,35 @@ impl EnhancedMcpServerManager {
                 transport_type: "stdio".to_string(),
             }
         })?;
-        
-        writer.flush().await.map_err(|e| {
-            SessionSetupError::McpServerConnectionFailed {
+
+        writer
+            .flush()
+            .await
+            .map_err(|e| SessionSetupError::McpServerConnectionFailed {
                 server_name: server_name.to_string(),
                 error: format!("Failed to flush tools/list request: {}", e),
                 transport_type: "stdio".to_string(),
-            }
-        })?;
+            })?;
 
         // Read tools response
         let mut tools_response_line = String::new();
-        reader.read_line(&mut tools_response_line).await.map_err(|e| {
-            SessionSetupError::McpServerConnectionFailed {
+        reader
+            .read_line(&mut tools_response_line)
+            .await
+            .map_err(|e| SessionSetupError::McpServerConnectionFailed {
                 server_name: server_name.to_string(),
                 error: format!("Failed to read tools/list response: {}", e),
                 transport_type: "stdio".to_string(),
-            }
-        })?;
+            })?;
 
-        let tools_response: Value = serde_json::from_str(tools_response_line.trim()).map_err(|e| {
-            SessionSetupError::McpServerConnectionFailed {
-                server_name: server_name.to_string(),
-                error: format!("Invalid tools/list response JSON: {}", e),
-                transport_type: "stdio".to_string(),
-            }
-        })?;
+        let tools_response: Value =
+            serde_json::from_str(tools_response_line.trim()).map_err(|e| {
+                SessionSetupError::McpServerConnectionFailed {
+                    server_name: server_name.to_string(),
+                    error: format!("Invalid tools/list response JSON: {}", e),
+                    transport_type: "stdio".to_string(),
+                }
+            })?;
 
         // Extract tool names from response
         let tools = if let Some(result) = tools_response.get("result") {
@@ -571,24 +601,23 @@ impl EnhancedMcpServerManager {
     ) -> SessionSetupResult<Vec<String>> {
         // This is a placeholder implementation - HTTP MCP protocol would need actual specification
         tracing::warn!("HTTP MCP protocol initialization is not fully implemented");
-        
+
         // Test basic connectivity
-        let test_response = client
-            .get(&http_config.url)
-            .send()
-            .await
-            .map_err(|e| {
-                SessionSetupError::McpServerConnectionFailed {
-                    server_name: http_config.name.clone(),
-                    error: format!("HTTP connection failed: {}", e),
-                    transport_type: "http".to_string(),
-                }
-            })?;
+        let test_response = client.get(&http_config.url).send().await.map_err(|e| {
+            SessionSetupError::McpServerConnectionFailed {
+                server_name: http_config.name.clone(),
+                error: format!("HTTP connection failed: {}", e),
+                transport_type: "http".to_string(),
+            }
+        })?;
 
         if !test_response.status().is_success() {
             return Err(SessionSetupError::McpServerConnectionFailed {
                 server_name: http_config.name.clone(),
-                error: format!("HTTP connection failed with status: {}", test_response.status()),
+                error: format!(
+                    "HTTP connection failed with status: {}",
+                    test_response.status()
+                ),
                 transport_type: "http".to_string(),
             });
         }
@@ -604,7 +633,7 @@ impl EnhancedMcpServerManager {
     ) -> SessionSetupResult<Vec<String>> {
         // This is a placeholder implementation - SSE MCP protocol would need actual specification
         tracing::warn!("SSE MCP protocol initialization is not fully implemented");
-        
+
         // Basic URL validation was already done in connect_sse_server_enhanced
         Ok(vec!["sse_placeholder_tool".to_string()])
     }
@@ -624,7 +653,7 @@ mod tests {
     #[tokio::test]
     async fn test_connect_servers_with_invalid_config() {
         let mut manager = EnhancedMcpServerManager::new();
-        
+
         let invalid_config = McpServerConfig::Stdio(crate::config::StdioTransport {
             name: "invalid_server".to_string(),
             command: "/nonexistent/command".to_string(),
@@ -632,9 +661,12 @@ mod tests {
             env: vec![],
             cwd: None,
         });
-        
-        let results = manager.connect_servers_with_validation(vec![invalid_config]).await.unwrap();
-        
+
+        let results = manager
+            .connect_servers_with_validation(vec![invalid_config])
+            .await
+            .unwrap();
+
         assert_eq!(results.len(), 1);
         assert!(results.get("invalid_server").unwrap().is_err());
     }
@@ -642,7 +674,7 @@ mod tests {
     #[tokio::test]
     async fn test_stdio_server_nonexistent_command() {
         let manager = EnhancedMcpServerManager::new();
-        
+
         let config = McpServerConfig::Stdio(crate::config::StdioTransport {
             name: "test_server".to_string(),
             command: "/absolutely/nonexistent/command".to_string(),
@@ -650,10 +682,10 @@ mod tests {
             env: vec![],
             cwd: None,
         });
-        
+
         let result = manager.connect_server_enhanced(config).await;
         assert!(result.is_err());
-        
+
         if let Err(SessionSetupError::McpServerExecutableNotFound { .. }) = result {
             // Expected error type
         } else {
@@ -664,17 +696,17 @@ mod tests {
     #[tokio::test]
     async fn test_http_server_invalid_url() {
         let manager = EnhancedMcpServerManager::new();
-        
+
         let config = McpServerConfig::Http(crate::config::HttpTransport {
             transport_type: "http".to_string(),
             name: "test_server".to_string(),
             url: "not-a-valid-url".to_string(),
             headers: vec![],
         });
-        
+
         let result = manager.connect_server_enhanced(config).await;
         assert!(result.is_err());
-        
+
         if let Err(SessionSetupError::McpServerConnectionFailed { .. }) = result {
             // Expected error type
         } else {
