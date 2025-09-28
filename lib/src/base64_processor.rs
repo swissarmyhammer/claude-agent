@@ -18,6 +18,7 @@ pub enum Base64ProcessorError {
     MimeTypeNotAllowed(String),
 }
 
+#[derive(Clone)]
 pub struct Base64Processor {
     max_size: usize,
     allowed_image_mime_types: HashSet<String>,

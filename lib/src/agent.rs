@@ -4,6 +4,7 @@ use crate::{
     base64_processor::Base64Processor,
     claude::ClaudeClient,
     config::AgentConfig,
+    content_block_processor::ContentBlockProcessor,
     permissions::{FilePermissionStorage, PermissionPolicyEngine, PolicyEvaluation},
     plan::{PlanGenerator, PlanManager},
     session::SessionManager,
@@ -321,6 +322,7 @@ pub struct ClaudeAgent {
     plan_generator: Arc<PlanGenerator>,
     plan_manager: Arc<RwLock<PlanManager>>,
     base64_processor: Arc<Base64Processor>,
+    content_block_processor: Arc<ContentBlockProcessor>,
 }
 
 impl ClaudeAgent {
@@ -416,6 +418,13 @@ impl ClaudeAgent {
         // Initialize base64 processor with default size limits
         let base64_processor = Arc::new(Base64Processor::default());
 
+        // Initialize content block processor with base64 processor
+        let content_block_processor = Arc::new(ContentBlockProcessor::new(
+            (*base64_processor).clone(),
+            50 * 1024 * 1024, // 50MB max resource size
+            true,             // enable URI validation
+        ));
+
         let agent = Self {
             session_manager,
             claude_client,
@@ -430,6 +439,7 @@ impl ClaudeAgent {
             plan_generator,
             plan_manager,
             base64_processor,
+            content_block_processor,
         };
 
         Ok((agent, notification_receiver))
@@ -1133,66 +1143,17 @@ impl ClaudeAgent {
             }
         }
 
-        // Extract and process all content from the prompt
-        let mut prompt_text = String::new();
-        let mut has_binary_content = false;
+        // Process all content blocks using the comprehensive processor
+        let content_summary = self
+            .content_block_processor
+            .process_content_blocks(&request.prompt)
+            .map_err(|e| {
+                tracing::error!("Failed to process content blocks: {}", e);
+                agent_client_protocol::Error::invalid_params()
+            })?;
 
-        for content_block in &request.prompt {
-            match content_block {
-                ContentBlock::Text(text_content) => {
-                    prompt_text.push_str(&text_content.text);
-                }
-                ContentBlock::Image(image_content) => {
-                    // Process image data (already validated in validate_prompt_request)
-                    let _decoded = self
-                        .base64_processor
-                        .decode_image_data(&image_content.data, &image_content.mime_type)
-                        .map_err(|e| {
-                            tracing::error!("Failed to decode image data: {}", e);
-                            agent_client_protocol::Error::invalid_params()
-                        })?;
-
-                    // Add descriptive text for now until full multimodal support
-                    prompt_text.push_str(&format!(
-                        "\n[Image content: {} ({})]",
-                        image_content.mime_type,
-                        if let Some(ref uri) = image_content.uri {
-                            uri
-                        } else {
-                            "embedded data"
-                        }
-                    ));
-                    has_binary_content = true;
-                }
-                ContentBlock::Audio(audio_content) => {
-                    // Process audio data (already validated in validate_prompt_request)
-                    let _decoded = self
-                        .base64_processor
-                        .decode_audio_data(&audio_content.data, &audio_content.mime_type)
-                        .map_err(|e| {
-                            tracing::error!("Failed to decode audio data: {}", e);
-                            agent_client_protocol::Error::invalid_params()
-                        })?;
-
-                    // Add descriptive text for now until full multimodal support
-                    prompt_text.push_str(&format!(
-                        "\n[Audio content: {} (embedded data)]",
-                        audio_content.mime_type
-                    ));
-                    has_binary_content = true;
-                }
-                ContentBlock::Resource(_resource_content) => {
-                    // Add descriptive text for the resource
-                    prompt_text.push_str("\n[Embedded Resource]");
-                    has_binary_content = true;
-                }
-                ContentBlock::ResourceLink(resource_link) => {
-                    // Add descriptive text for the resource link
-                    prompt_text.push_str(&format!("\n[Resource Link: {}]", resource_link.uri));
-                    has_binary_content = true;
-                }
-            }
-        }
+        let prompt_text = content_summary.combined_text;
+        let has_binary_content = content_summary.has_binary_content;
 
         if has_binary_content {
             tracing::info!(

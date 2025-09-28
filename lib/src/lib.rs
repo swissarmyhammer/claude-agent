@@ -9,6 +9,7 @@ pub mod base64_processor;
 pub mod capability_validation;
 pub mod claude;
 pub mod config;
+pub mod content_block_processor;
 pub mod error;
 pub mod mcp;
 pub mod mcp_error_handling;
