@@ -618,7 +618,10 @@ mod tests {
                 required_for,
             }) => {
                 assert_eq!(capability_name, "terminal");
-                assert_eq!(required_for, "terminal capability is required for terminal operations");
+                assert_eq!(
+                    required_for,
+                    "terminal capability is required for terminal operations"
+                );
             }
             _ => panic!("Expected CapabilityNotSupported error"),
         }

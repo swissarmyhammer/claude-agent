@@ -1244,6 +1244,16 @@ impl ClaudeAgent {
             });
         }
 
+        // ACP requires specific stop reasons for all prompt turn completions:
+        // Check for refusal patterns in the complete streaming response
+        if self.is_response_refusal(&full_response) {
+            tracing::info!(
+                "Claude refused to respond in streaming for session: {}",
+                session_id
+            );
+            return Ok(self.create_refusal_response(&session_id.to_string(), true, Some(chunk_count)));
+        }
+
         tracing::info!("Completed streaming response with {} chunks", chunk_count);
 
         // Store complete response in session
@@ -1396,6 +1406,13 @@ impl ClaudeAgent {
             .await
             .map_err(|_| agent_client_protocol::Error::internal_error())?;
 
+        // ACP requires specific stop reasons for all prompt turn completions:
+        // Check for refusal patterns in Claude's response content
+        if self.is_response_refusal(&response_content) {
+            tracing::info!("Claude refused to respond for session: {}", session_id);
+            return Ok(self.create_refusal_response(&session_id.to_string(), false, None));
+        }
+
         // Check for cancellation after Claude API request but before storing
         if self
             .cancellation_manager
@@ -1498,6 +1515,92 @@ impl ClaudeAgent {
         }
 
         Ok(())
+    }
+
+    /// Check if Claude's response indicates a refusal to comply
+    ///
+    /// ACP requires detecting when the language model refuses to continue and
+    /// returning StopReason::Refusal for proper client communication.
+    fn is_response_refusal(&self, response_content: &str) -> bool {
+        let response_lower = response_content.to_lowercase();
+
+        // Common refusal patterns from Claude
+        let refusal_patterns = [
+            "i can't",
+            "i cannot",
+            "i'm unable to",
+            "i am unable to",
+            "i don't feel comfortable",
+            "i won't",
+            "i will not",
+            "that's not something i can",
+            "i'm not able to",
+            "i cannot assist",
+            "i can't help with",
+            "i'm not comfortable",
+            "this request goes against",
+            "i need to decline",
+            "i must decline",
+            "i shouldn't",
+            "i should not",
+            "that would be inappropriate",
+            "that's not appropriate",
+            "i'm designed not to",
+            "i'm programmed not to",
+            "i have to refuse",
+            "i must refuse",
+            "i cannot comply",
+            "i'm not allowed to",
+            "that's against my guidelines",
+            "my guidelines prevent me",
+            "i'm not permitted to",
+            "that violates",
+            "i cannot provide",
+            "i can't provide",
+        ];
+
+        // Check if response starts with refusal indicators (common pattern)
+        for pattern in &refusal_patterns {
+            if response_lower.trim_start().starts_with(pattern) {
+                tracing::debug!("Refusal pattern detected: '{}'", pattern);
+                return true;
+            }
+        }
+
+        // Check for refusal patterns anywhere in short responses (likely to be pure refusals)
+        if response_content.len() < 200 {
+            for pattern in &refusal_patterns {
+                if response_lower.contains(pattern) {
+                    tracing::debug!("Refusal pattern detected in short response: '{}'", pattern);
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Create a refusal response for ACP compliance
+    ///
+    /// Returns a PromptResponse with StopReason::Refusal and appropriate metadata
+    /// when Claude refuses to respond to a request.
+    fn create_refusal_response(&self, session_id: &str, is_streaming: bool, chunk_count: Option<usize>) -> PromptResponse {
+        let mut meta = serde_json::json!({
+            "refusal_detected": true,
+            "session_id": session_id
+        });
+
+        if is_streaming {
+            meta["streaming"] = serde_json::Value::Bool(true);
+            if let Some(count) = chunk_count {
+                meta["chunks_processed"] = serde_json::Value::Number(serde_json::Number::from(count));
+            }
+        }
+
+        PromptResponse {
+            stop_reason: StopReason::Refusal,
+            meta: Some(meta),
+        }
     }
 
     /// Send plan update notification via session/update for ACP compliance
@@ -2361,11 +2464,63 @@ impl Agent for ClaudeAgent {
             .map_err(|_| agent_client_protocol::Error::internal_error())?;
 
         // Get updated session for context
-        let updated_session = self
+        let mut updated_session = self
             .session_manager
             .get_session(&session_id)
             .map_err(|_| agent_client_protocol::Error::internal_error())?
             .ok_or_else(agent_client_protocol::Error::internal_error)?;
+
+        // ACP requires specific stop reasons for all prompt turn completions:
+        // 1. max_tokens: Token limit exceeded (configurable)
+        // 2. max_turn_requests: Too many LM requests in single turn
+        // Check limits before making Claude API calls
+
+        // Check turn request limit
+        let current_requests = updated_session.increment_turn_requests();
+        if current_requests > self.config.max_turn_requests {
+            tracing::info!(
+                "Turn request limit exceeded ({} > {}) for session: {}",
+                current_requests,
+                self.config.max_turn_requests,
+                session_id
+            );
+            return Ok(PromptResponse {
+                stop_reason: StopReason::MaxTurnRequests,
+                meta: Some(serde_json::json!({
+                    "turn_requests": current_requests,
+                    "max_turn_requests": self.config.max_turn_requests,
+                    "session_id": session_id.to_string()
+                })),
+            });
+        }
+
+        // Estimate token usage for the prompt (rough approximation: 4 chars per token)
+        let estimated_tokens = (prompt_text.len() as u64) / 4;
+        let current_tokens = updated_session.add_turn_tokens(estimated_tokens);
+        if current_tokens > self.config.max_tokens_per_turn {
+            tracing::info!(
+                "Token limit exceeded ({} > {}) for session: {}",
+                current_tokens,
+                self.config.max_tokens_per_turn,
+                session_id
+            );
+            return Ok(PromptResponse {
+                stop_reason: StopReason::MaxTokens,
+                meta: Some(serde_json::json!({
+                    "turn_tokens": current_tokens,
+                    "max_tokens_per_turn": self.config.max_tokens_per_turn,
+                    "session_id": session_id.to_string()
+                })),
+            });
+        }
+
+        // Update session with incremented counters
+        self.session_manager
+            .update_session(&session_id, |session| {
+                session.turn_request_count = updated_session.turn_request_count;
+                session.turn_token_count = updated_session.turn_token_count;
+            })
+            .map_err(|_| agent_client_protocol::Error::internal_error())?;
 
         // Check if streaming is supported and requested
         let response = if self.should_stream(&session, &request) {
@@ -4648,5 +4803,399 @@ mod tests {
             no_notification.is_err(),
             "Should not receive notification for unchanged commands"
         );
+    }
+
+    #[tokio::test]
+    async fn test_is_response_refusal_detects_clear_refusals() {
+        let agent = create_test_agent().await;
+
+        // Test clear refusal patterns at start of response
+        let clear_refusals = [
+            "I can't help with that request",
+            "I cannot assist with this task",
+            "I'm unable to provide that information",
+            "I am unable to complete this request",
+            "I don't feel comfortable doing this",
+            "I won't proceed with this request",
+            "I will not help with that",
+            "That's not something I can do",
+            "I'm not able to assist",
+            "I cannot comply with this request",
+            "I can't help with creating harmful content",
+            "I'm not comfortable with this request",
+            "This request goes against my guidelines",
+            "I need to decline this request",
+            "I must decline to help",
+            "I shouldn't provide that information",
+            "I should not assist with this",
+            "That would be inappropriate",
+            "That's not appropriate for me to do",
+            "I'm designed not to help with this",
+            "I'm programmed not to assist",
+            "I have to refuse this request",
+            "I must refuse to help",
+            "I'm not allowed to do that",
+            "That's against my guidelines",
+            "My guidelines prevent me from helping",
+            "I'm not permitted to assist",
+            "That violates my instructions",
+            "I cannot provide that type of content",
+            "I can't provide assistance with that",
+        ];
+
+        for refusal in &clear_refusals {
+            assert!(
+                agent.is_response_refusal(refusal),
+                "Should detect refusal in: '{}'",
+                refusal
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_is_response_refusal_detects_short_responses_with_refusal_patterns() {
+        let agent = create_test_agent().await;
+
+        // Test short responses (< 200 chars) that contain refusal patterns anywhere
+        let short_responses_with_refusals = [
+            "Sorry, but I can't help with that.",
+            "Unfortunately, I cannot assist with this request.",
+            "That's something I'm unable to do.",
+            "I need to decline - I won't help with that.",
+            "This is inappropriate, so I cannot provide assistance.",
+        ];
+
+        for response in &short_responses_with_refusals {
+            assert!(
+                response.len() < 200,
+                "Test case should be short: '{}'",
+                response
+            );
+            assert!(
+                agent.is_response_refusal(response),
+                "Should detect refusal in short response: '{}'",
+                response
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_is_response_refusal_ignores_refusal_patterns_in_long_responses() {
+        let agent = create_test_agent().await;
+
+        // Test long responses (>= 200 chars) that contain refusal patterns but are not refusals
+        let long_helpful_response = format!(
+            "I can help you understand this topic. While some people might say 'I can't do this' when facing challenges, \
+            the key is to break problems down into manageable steps. Here's how you can approach it: \
+            First, identify the core requirements. Second, research available solutions. Third, implement step by step. \
+            Remember, persistence is key - don't give up when things get difficult. {}",
+            "x".repeat(50) // Ensure > 200 chars
+        );
+
+        assert!(
+            long_helpful_response.len() >= 200,
+            "Test response should be long: {} chars",
+            long_helpful_response.len()
+        );
+        assert!(
+            !agent.is_response_refusal(&long_helpful_response),
+            "Should NOT detect refusal in long helpful response containing incidental refusal patterns"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_response_refusal_case_insensitive() {
+        let agent = create_test_agent().await;
+
+        // Test case variations
+        let case_variations = [
+            "I CAN'T help with that",
+            "I Cannot assist you",
+            "I'M UNABLE TO proceed",
+            "i won't do that",
+            "i will not help",
+            "I Don't Feel Comfortable",
+        ];
+
+        for variation in &case_variations {
+            assert!(
+                agent.is_response_refusal(variation),
+                "Should detect refusal regardless of case: '{}'",
+                variation
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_is_response_refusal_ignores_helpful_responses() {
+        let agent = create_test_agent().await;
+
+        // Test responses that should NOT be detected as refusals
+        let helpful_responses = [
+            "I can help you with that request",
+            "Here's how I can assist you",
+            "I'm able to provide that information",
+            "I will help you solve this problem",
+            "That's something I can definitely do",
+            "I'm comfortable helping with this",
+            "I'm designed to assist with these tasks",
+            "I can provide the information you need",
+            "I'm allowed to help with this type of request",
+            "This is within my guidelines to assist",
+            "I'm permitted to provide this assistance",
+            "Here's what I can do for you",
+            "", // Empty response
+            "   ", // Whitespace only
+        ];
+
+        for response in &helpful_responses {
+            assert!(
+                !agent.is_response_refusal(response),
+                "Should NOT detect refusal in helpful response: '{}'",
+                response
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_refusal_response_non_streaming() {
+        let agent = create_test_agent().await;
+        let session_id = "test-session-123";
+
+        let response = agent.create_refusal_response(session_id, false, None);
+
+        assert_eq!(response.stop_reason, StopReason::Refusal);
+        assert!(response.meta.is_some());
+
+        let meta = response.meta.unwrap();
+        assert_eq!(meta["refusal_detected"], serde_json::Value::Bool(true));
+        assert_eq!(meta["session_id"], serde_json::Value::String(session_id.to_string()));
+        assert!(!meta.as_object().unwrap().contains_key("streaming"));
+        assert!(!meta.as_object().unwrap().contains_key("chunks_processed"));
+    }
+
+    #[tokio::test]
+    async fn test_create_refusal_response_streaming_without_chunks() {
+        let agent = create_test_agent().await;
+        let session_id = "test-session-456";
+
+        let response = agent.create_refusal_response(session_id, true, None);
+
+        assert_eq!(response.stop_reason, StopReason::Refusal);
+        assert!(response.meta.is_some());
+
+        let meta = response.meta.unwrap();
+        assert_eq!(meta["refusal_detected"], serde_json::Value::Bool(true));
+        assert_eq!(meta["session_id"], serde_json::Value::String(session_id.to_string()));
+        assert_eq!(meta["streaming"], serde_json::Value::Bool(true));
+        assert!(!meta.as_object().unwrap().contains_key("chunks_processed"));
+    }
+
+    #[tokio::test]
+    async fn test_create_refusal_response_streaming_with_chunks() {
+        let agent = create_test_agent().await;
+        let session_id = "test-session-789";
+        let chunk_count = 42;
+
+        let response = agent.create_refusal_response(session_id, true, Some(chunk_count));
+
+        assert_eq!(response.stop_reason, StopReason::Refusal);
+        assert!(response.meta.is_some());
+
+        let meta = response.meta.unwrap();
+        assert_eq!(meta["refusal_detected"], serde_json::Value::Bool(true));
+        assert_eq!(meta["session_id"], serde_json::Value::String(session_id.to_string()));
+        assert_eq!(meta["streaming"], serde_json::Value::Bool(true));
+        assert_eq!(meta["chunks_processed"], serde_json::Value::Number(serde_json::Number::from(chunk_count)));
+    }
+
+    #[tokio::test]
+    async fn test_session_turn_request_counting() {
+        use crate::session::{Session, SessionId};
+        use std::path::PathBuf;
+        
+        let session_id = SessionId::new();
+        let cwd = PathBuf::from("/test");
+        let mut session = Session::new(session_id, cwd);
+        
+        // Initial state
+        assert_eq!(session.get_turn_request_count(), 0);
+        
+        // First increment
+        let count1 = session.increment_turn_requests();
+        assert_eq!(count1, 1);
+        assert_eq!(session.get_turn_request_count(), 1);
+        
+        // Second increment
+        let count2 = session.increment_turn_requests();
+        assert_eq!(count2, 2);
+        assert_eq!(session.get_turn_request_count(), 2);
+        
+        // Reset turn counters
+        session.reset_turn_counters();
+        assert_eq!(session.get_turn_request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_session_turn_token_counting() {
+        use crate::session::{Session, SessionId};
+        use std::path::PathBuf;
+        
+        let session_id = SessionId::new();
+        let cwd = PathBuf::from("/test");
+        let mut session = Session::new(session_id, cwd);
+        
+        // Initial state
+        assert_eq!(session.get_turn_token_count(), 0);
+        
+        // Add tokens
+        let total1 = session.add_turn_tokens(100);
+        assert_eq!(total1, 100);
+        assert_eq!(session.get_turn_token_count(), 100);
+        
+        // Add more tokens
+        let total2 = session.add_turn_tokens(250);
+        assert_eq!(total2, 350);
+        assert_eq!(session.get_turn_token_count(), 350);
+        
+        // Reset turn counters
+        session.reset_turn_counters();
+        assert_eq!(session.get_turn_token_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_max_turn_requests_limit_enforcement() {
+        // This test verifies that the session properly counts and limits turn requests
+        // by testing the session methods directly rather than going through the full agent flow
+        
+        use crate::session::{Session, SessionId};
+        use std::path::PathBuf;
+        
+        let session_id = SessionId::new();
+        let cwd = PathBuf::from("/test");
+        let mut session = Session::new(session_id, cwd);
+        
+        let max_requests = 3;
+        
+        // Test that we can increment up to the limit
+        for i in 1..=max_requests {
+            let count = session.increment_turn_requests();
+            assert_eq!(count, i, "Request count should be {}", i);
+            assert_eq!(session.get_turn_request_count(), i, "Session should track {} requests", i);
+        }
+        
+        // Test that incrementing beyond limit still works (the limit check is done in agent.rs)
+        let count = session.increment_turn_requests();
+        assert_eq!(count, max_requests + 1);
+        assert_eq!(session.get_turn_request_count(), max_requests + 1);
+        
+        // Test reset
+        session.reset_turn_counters();
+        assert_eq!(session.get_turn_request_count(), 0);
+        
+        // Verify we can count again after reset
+        let count = session.increment_turn_requests();
+        assert_eq!(count, 1);
+        assert_eq!(session.get_turn_request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_max_tokens_per_turn_limit_enforcement() {
+        // This test verifies that the session properly counts and limits tokens
+        // by testing the session methods directly rather than going through the full agent flow
+        
+        use crate::session::{Session, SessionId};
+        use std::path::PathBuf;
+        
+        let session_id = SessionId::new();
+        let cwd = PathBuf::from("/test");
+        let mut session = Session::new(session_id, cwd);
+        
+        let _max_tokens = 100;
+        
+        // Test that we can add tokens up to the limit
+        let tokens1 = session.add_turn_tokens(50);
+        assert_eq!(tokens1, 50);
+        assert_eq!(session.get_turn_token_count(), 50);
+        
+        let tokens2 = session.add_turn_tokens(30);
+        assert_eq!(tokens2, 80);
+        assert_eq!(session.get_turn_token_count(), 80);
+        
+        // Test that we can add tokens beyond the limit (the limit check is done in agent.rs)
+        let tokens3 = session.add_turn_tokens(50);
+        assert_eq!(tokens3, 130); // 80 + 50 = 130, which exceeds max_tokens
+        assert_eq!(session.get_turn_token_count(), 130);
+        
+        // Test reset
+        session.reset_turn_counters();
+        assert_eq!(session.get_turn_token_count(), 0);
+        
+        // Verify we can count tokens again after reset
+        let tokens = session.add_turn_tokens(25);
+        assert_eq!(tokens, 25);
+        assert_eq!(session.get_turn_token_count(), 25);
+    }
+
+    #[tokio::test]
+    async fn test_token_estimation_accuracy() {
+        use crate::session::{Session, SessionId};
+        use std::path::PathBuf;
+        
+        let session_id = SessionId::new();
+        let cwd = PathBuf::from("/test");
+        let mut session = Session::new(session_id, cwd);
+        
+        // Test the token estimation logic (4 chars per token)
+        let repeated_16 = "a".repeat(16);
+        let repeated_20 = "a".repeat(20);
+        
+        let test_cases = [
+            ("test", 1),        // 4 chars = 1 token
+            ("test test", 2),   // 9 chars = 2 tokens (9/4 = 2.25 -> 2)  
+            (repeated_16.as_str(), 4), // 16 chars = 4 tokens
+            (repeated_20.as_str(), 5), // 20 chars = 5 tokens
+            ("", 0),            // empty = 0 tokens
+        ];
+        
+        for (text, expected_tokens) in &test_cases {
+            session.reset_turn_counters();
+            let estimated = (text.len() as u64) / 4;
+            assert_eq!(estimated, *expected_tokens, "Token estimation failed for: '{}'", text);
+            
+            let total = session.add_turn_tokens(estimated);
+            assert_eq!(total, *expected_tokens);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_turn_counter_reset_behavior() {
+        use crate::session::{Session, SessionId};
+        use std::path::PathBuf;
+        
+        let session_id = SessionId::new();
+        let cwd = PathBuf::from("/test");
+        let mut session = Session::new(session_id, cwd);
+        
+        // Add some data
+        session.increment_turn_requests();
+        session.increment_turn_requests();
+        session.add_turn_tokens(500);
+        session.add_turn_tokens(300);
+        
+        // Verify state before reset
+        assert_eq!(session.get_turn_request_count(), 2);
+        assert_eq!(session.get_turn_token_count(), 800);
+        
+        // Reset and verify
+        session.reset_turn_counters();
+        assert_eq!(session.get_turn_request_count(), 0);
+        assert_eq!(session.get_turn_token_count(), 0);
+        
+        // Verify we can increment again after reset
+        session.increment_turn_requests();
+        session.add_turn_tokens(100);
+        assert_eq!(session.get_turn_request_count(), 1);
+        assert_eq!(session.get_turn_token_count(), 100);
     }
 }

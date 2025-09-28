@@ -23,6 +23,10 @@ pub struct Session {
     pub cwd: PathBuf,
     /// Available commands that can be invoked during this session
     pub available_commands: Vec<agent_client_protocol::AvailableCommand>,
+    /// Number of language model requests made in the current turn
+    pub turn_request_count: u64,
+    /// Total tokens consumed in the current turn (input + output)
+    pub turn_token_count: u64,
 }
 
 impl Session {
@@ -54,6 +58,8 @@ impl Session {
             mcp_servers: Vec::new(),
             cwd,
             available_commands: Vec::new(),
+            turn_request_count: 0,
+            turn_token_count: 0,
         }
     }
 
@@ -94,6 +100,37 @@ impl Session {
         }
 
         false
+    }
+
+    /// Reset turn counters for a new turn
+    pub fn reset_turn_counters(&mut self) {
+        self.turn_request_count = 0;
+        self.turn_token_count = 0;
+        self.last_accessed = SystemTime::now();
+    }
+
+    /// Increment the turn request count and return the new value
+    pub fn increment_turn_requests(&mut self) -> u64 {
+        self.turn_request_count += 1;
+        self.last_accessed = SystemTime::now();
+        self.turn_request_count
+    }
+
+    /// Add tokens to the current turn count and return the new total
+    pub fn add_turn_tokens(&mut self, tokens: u64) -> u64 {
+        self.turn_token_count += tokens;
+        self.last_accessed = SystemTime::now();
+        self.turn_token_count
+    }
+
+    /// Get the current turn request count
+    pub fn get_turn_request_count(&self) -> u64 {
+        self.turn_request_count
+    }
+
+    /// Get the current turn token count
+    pub fn get_turn_token_count(&self) -> u64 {
+        self.turn_token_count
     }
 }
 

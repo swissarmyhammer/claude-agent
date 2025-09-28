@@ -17,6 +17,16 @@ fn default_cancellation_buffer_size() -> usize {
     100
 }
 
+/// Default value for max_tokens_per_turn (100k tokens)
+fn default_max_tokens_per_turn() -> u64 {
+    100_000
+}
+
+/// Default value for max_turn_requests (50 requests)
+fn default_max_turn_requests() -> u64 {
+    50
+}
+
 /// Main configuration structure for the Claude Agent
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentConfig {
@@ -33,6 +43,12 @@ pub struct AgentConfig {
     /// Buffer size for cancellation broadcast channel (default: 100)
     #[serde(default = "default_cancellation_buffer_size")]
     pub cancellation_buffer_size: usize,
+    /// Maximum tokens allowed per turn (default: 100,000) - triggers MaxTokens stop reason
+    #[serde(default = "default_max_tokens_per_turn")]
+    pub max_tokens_per_turn: u64,
+    /// Maximum language model requests per turn (default: 50) - triggers MaxTurnRequests stop reason
+    #[serde(default = "default_max_turn_requests")]
+    pub max_turn_requests: u64,
 }
 
 /// Configuration for Claude SDK integration
@@ -341,6 +357,8 @@ impl Default for AgentConfig {
             max_prompt_length: 100_000,
             notification_buffer_size: 1000,
             cancellation_buffer_size: 100,
+            max_tokens_per_turn: default_max_tokens_per_turn(),
+            max_turn_requests: default_max_turn_requests(),
         }
     }
 }
