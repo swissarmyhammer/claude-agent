@@ -5,6 +5,7 @@
 //! to interact with Claude Code.
 
 pub mod agent;
+pub mod base64_processor;
 pub mod capability_validation;
 pub mod claude;
 pub mod config;

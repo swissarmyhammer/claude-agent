@@ -1,6 +1,7 @@
 //! Agent Client Protocol implementation for Claude Agent
 
 use crate::{
+    base64_processor::Base64Processor,
     claude::ClaudeClient,
     config::AgentConfig,
     permissions::{FilePermissionStorage, PermissionPolicyEngine, PolicyEvaluation},
@@ -318,6 +319,7 @@ pub struct ClaudeAgent {
     permission_engine: Arc<PermissionPolicyEngine>,
     plan_generator: Arc<PlanGenerator>,
     plan_manager: Arc<RwLock<PlanManager>>,
+    base64_processor: Arc<Base64Processor>,
 }
 
 impl ClaudeAgent {
@@ -407,6 +409,9 @@ impl ClaudeAgent {
         let plan_generator = Arc::new(PlanGenerator::new());
         let plan_manager = Arc::new(RwLock::new(PlanManager::new()));
 
+        // Initialize base64 processor with default size limits
+        let base64_processor = Arc::new(Base64Processor::default());
+
         let agent = Self {
             session_manager,
             claude_client,
@@ -419,6 +424,7 @@ impl ClaudeAgent {
             permission_engine,
             plan_generator,
             plan_manager,
+            base64_processor,
         };
 
         Ok((agent, notification_receiver))
@@ -989,26 +995,49 @@ impl ClaudeAgent {
         // Validate session ID format
         self.parse_session_id(&request.session_id)?;
 
-        // Extract text content from the prompt
+        // Process all content blocks and validate
         let mut prompt_text = String::new();
+        let mut has_content = false;
+
         for content_block in &request.prompt {
             match content_block {
                 agent_client_protocol::ContentBlock::Text(text_content) => {
                     prompt_text.push_str(&text_content.text);
+                    if !text_content.text.trim().is_empty() {
+                        has_content = true;
+                    }
                 }
-                _ => {
-                    // For now, we only support text content blocks
-                    return Err(agent_client_protocol::Error::invalid_params());
+                agent_client_protocol::ContentBlock::Image(image_content) => {
+                    // Validate image data through base64 processor
+                    self.base64_processor
+                        .decode_image_data(&image_content.data, &image_content.mime_type)
+                        .map_err(|_| agent_client_protocol::Error::invalid_params())?;
+                    has_content = true;
+                }
+                agent_client_protocol::ContentBlock::Audio(audio_content) => {
+                    // Validate audio data through base64 processor
+                    self.base64_processor
+                        .decode_audio_data(&audio_content.data, &audio_content.mime_type)
+                        .map_err(|_| agent_client_protocol::Error::invalid_params())?;
+                    has_content = true;
+                }
+                agent_client_protocol::ContentBlock::Resource(_resource_content) => {
+                    // Resource content blocks are valid content
+                    has_content = true;
+                }
+                agent_client_protocol::ContentBlock::ResourceLink(_resource_link) => {
+                    // Resource link content blocks are valid content
+                    has_content = true;
                 }
             }
         }
 
-        // Check if prompt is empty
-        if prompt_text.trim().is_empty() {
+        // Check if prompt has any content
+        if !has_content {
             return Err(agent_client_protocol::Error::invalid_params());
         }
 
-        // Check if prompt is too long (configurable limit)
+        // Check if text portion is too long (configurable limit)
         if prompt_text.len() > self.config.max_prompt_length {
             return Err(agent_client_protocol::Error::invalid_params());
         }
@@ -1046,17 +1075,66 @@ impl ClaudeAgent {
             .send_agent_thought(&request.session_id, &execution_thought)
             .await;
 
-        // Extract text content from the prompt
+        // Extract and process all content from the prompt
         let mut prompt_text = String::new();
+        let mut has_binary_content = false;
+        
         for content_block in &request.prompt {
             match content_block {
                 ContentBlock::Text(text_content) => {
                     prompt_text.push_str(&text_content.text);
                 }
-                _ => {
-                    return Err(agent_client_protocol::Error::invalid_params());
+                ContentBlock::Image(image_content) => {
+                    // Process image data (already validated in validate_prompt_request)
+                    let _decoded = self.base64_processor
+                        .decode_image_data(&image_content.data, &image_content.mime_type)
+                        .map_err(|e| {
+                            tracing::error!("Failed to decode image data: {}", e);
+                            agent_client_protocol::Error::invalid_params()
+                        })?;
+                    
+                    // Add descriptive text for now until full multimodal support
+                    prompt_text.push_str(&format!(
+                        "\n[Image content: {} ({})]", 
+                        image_content.mime_type, 
+                        if let Some(ref uri) = image_content.uri { uri } else { "embedded data" }
+                    ));
+                    has_binary_content = true;
+                }
+                ContentBlock::Audio(audio_content) => {
+                    // Process audio data (already validated in validate_prompt_request)
+                    let _decoded = self.base64_processor
+                        .decode_audio_data(&audio_content.data, &audio_content.mime_type)
+                        .map_err(|e| {
+                            tracing::error!("Failed to decode audio data: {}", e);
+                            agent_client_protocol::Error::invalid_params()
+                        })?;
+                    
+                    // Add descriptive text for now until full multimodal support
+                    prompt_text.push_str(&format!(
+                        "\n[Audio content: {} (embedded data)]", 
+                        audio_content.mime_type
+                    ));
+                    has_binary_content = true;
+                }
+                ContentBlock::Resource(_resource_content) => {
+                    // Add descriptive text for the resource
+                    prompt_text.push_str("\n[Embedded Resource]");
+                    has_binary_content = true;
+                }
+                ContentBlock::ResourceLink(resource_link) => {
+                    // Add descriptive text for the resource link
+                    prompt_text.push_str(&format!(
+                        "\n[Resource Link: {}]", 
+                        resource_link.uri
+                    ));
+                    has_binary_content = true;
                 }
             }
+        }
+
+        if has_binary_content {
+            tracing::info!("Processing prompt with binary content for session: {}", session_id);
         }
 
         let context: crate::claude::SessionContext = session.into();
@@ -1201,17 +1279,66 @@ impl ClaudeAgent {
             .send_agent_thought(&request.session_id, &execution_thought)
             .await;
 
-        // Extract text content from the prompt
+        // Extract and process all content from the prompt
         let mut prompt_text = String::new();
+        let mut has_binary_content = false;
+        
         for content_block in &request.prompt {
             match content_block {
                 ContentBlock::Text(text_content) => {
                     prompt_text.push_str(&text_content.text);
                 }
-                _ => {
-                    return Err(agent_client_protocol::Error::invalid_params());
+                ContentBlock::Image(image_content) => {
+                    // Process image data (already validated in validate_prompt_request)
+                    let _decoded = self.base64_processor
+                        .decode_image_data(&image_content.data, &image_content.mime_type)
+                        .map_err(|e| {
+                            tracing::error!("Failed to decode image data: {}", e);
+                            agent_client_protocol::Error::invalid_params()
+                        })?;
+                    
+                    // Add descriptive text for now until full multimodal support
+                    prompt_text.push_str(&format!(
+                        "\n[Image content: {} ({})]", 
+                        image_content.mime_type, 
+                        if let Some(ref uri) = image_content.uri { uri } else { "embedded data" }
+                    ));
+                    has_binary_content = true;
+                }
+                ContentBlock::Audio(audio_content) => {
+                    // Process audio data (already validated in validate_prompt_request)
+                    let _decoded = self.base64_processor
+                        .decode_audio_data(&audio_content.data, &audio_content.mime_type)
+                        .map_err(|e| {
+                            tracing::error!("Failed to decode audio data: {}", e);
+                            agent_client_protocol::Error::invalid_params()
+                        })?;
+                    
+                    // Add descriptive text for now until full multimodal support
+                    prompt_text.push_str(&format!(
+                        "\n[Audio content: {} (embedded data)]", 
+                        audio_content.mime_type
+                    ));
+                    has_binary_content = true;
+                }
+                ContentBlock::Resource(_resource_content) => {
+                    // Add descriptive text for the resource
+                    prompt_text.push_str("\n[Embedded Resource]");
+                    has_binary_content = true;
+                }
+                ContentBlock::ResourceLink(resource_link) => {
+                    // Add descriptive text for the resource link
+                    prompt_text.push_str(&format!(
+                        "\n[Resource Link: {}]", 
+                        resource_link.uri
+                    ));
+                    has_binary_content = true;
                 }
             }
+        }
+
+        if has_binary_content {
+            tracing::info!("Processing prompt with binary content for session: {}", session_id);
         }
 
         let context: crate::claude::SessionContext = session.into();
@@ -2062,18 +2189,50 @@ impl Agent for ClaudeAgent {
             });
         }
 
-        // Extract text content from the prompt
+        // Extract and process all content from the prompt
         let mut prompt_text = String::new();
+        let mut has_binary_content = false;
+        
         for content_block in &request.prompt {
             match content_block {
                 ContentBlock::Text(text_content) => {
                     prompt_text.push_str(&text_content.text);
                 }
-                _ => {
-                    // Already validated in validate_prompt_request
-                    return Err(agent_client_protocol::Error::invalid_params());
+                ContentBlock::Image(image_content) => {
+                    // Add descriptive text for plan analysis
+                    prompt_text.push_str(&format!(
+                        "\n[Image content: {} ({})]", 
+                        image_content.mime_type, 
+                        if let Some(ref uri) = image_content.uri { uri } else { "embedded data" }
+                    ));
+                    has_binary_content = true;
+                }
+                ContentBlock::Audio(audio_content) => {
+                    // Add descriptive text for plan analysis
+                    prompt_text.push_str(&format!(
+                        "\n[Audio content: {} (embedded data)]", 
+                        audio_content.mime_type
+                    ));
+                    has_binary_content = true;
+                }
+                ContentBlock::Resource(_resource_content) => {
+                    // Add descriptive text for the resource
+                    prompt_text.push_str("\n[Embedded Resource]");
+                    has_binary_content = true;
+                }
+                ContentBlock::ResourceLink(resource_link) => {
+                    // Add descriptive text for the resource link
+                    prompt_text.push_str(&format!(
+                        "\n[Resource Link: {}]", 
+                        resource_link.uri
+                    ));
+                    has_binary_content = true;
                 }
             }
+        }
+
+        if has_binary_content {
+            tracing::info!("Processing prompt with binary content for plan analysis in session: {}", session_id);
         }
 
         // ACP requires agent plan reporting for transparency and progress tracking:
@@ -4289,14 +4448,13 @@ mod tests {
         let phases: Vec<ReasoningPhase> = thought_notifications
             .iter()
             .filter_map(|notification| match &notification.update {
-                SessionUpdate::AgentThoughtChunk { content } => match content {
-                    ContentBlock::Text(text_content) => text_content
-                        .meta
-                        .as_ref()
-                        .and_then(|meta| meta.get("reasoning_phase"))
-                        .and_then(|phase| serde_json::from_value(phase.clone()).ok()),
-                    _ => None,
-                },
+                SessionUpdate::AgentThoughtChunk { 
+                    content: ContentBlock::Text(text_content) 
+                } => text_content
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("reasoning_phase"))
+                    .and_then(|phase| serde_json::from_value(phase.clone()).ok()),
                 _ => None,
             })
             .collect();
