@@ -53,7 +53,7 @@
 //! These errors are mapped to appropriate JSON-RPC error codes for client communication.
 
 use crate::path_validator::{PathValidationError, PathValidator};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::process::{Child, Command};
@@ -830,7 +830,10 @@ impl ToolCallHandler {
     }
 
     /// Generate ACP-compliant permission options for a tool request
-    pub fn generate_permission_options(&self, request: &InternalToolRequest) -> Vec<PermissionOption> {
+    pub fn generate_permission_options(
+        &self,
+        request: &InternalToolRequest,
+    ) -> Vec<PermissionOption> {
         // ACP requires comprehensive permission system with user choice:
         // 1. Multiple permission options: allow/reject with once/always variants
         // 2. Permission persistence: Remember "always" decisions across sessions
@@ -839,9 +842,9 @@ impl ToolCallHandler {
         // 5. Context awareness: Generate appropriate options for different tools
         //
         // Advanced permissions provide user control while maintaining security.
-        
+
         let tool_risk_level = self.assess_tool_risk(&request.name, &request.arguments);
-        
+
         match tool_risk_level {
             ToolRiskLevel::Safe => {
                 vec![
@@ -923,28 +926,34 @@ impl ToolCallHandler {
         match tool_name {
             // File read operations are generally safe
             "fs_read" | "fs_list" => ToolRiskLevel::Safe,
-            
+
             // File write operations have moderate risk
             "fs_write" => {
                 // Check if writing to sensitive locations
                 if let Ok(args) = self.parse_tool_args(arguments) {
                     if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
                         let sensitive_patterns = ["/etc", "/usr", "/bin", "/sys", "/proc"];
-                        if sensitive_patterns.iter().any(|&pattern| path.starts_with(pattern)) {
+                        if sensitive_patterns
+                            .iter()
+                            .any(|&pattern| path.starts_with(pattern))
+                        {
                             return ToolRiskLevel::High;
                         }
                         // Configuration files are moderate risk
-                        if path.ends_with(".conf") || path.ends_with(".config") || path.contains("config") {
+                        if path.ends_with(".conf")
+                            || path.ends_with(".config")
+                            || path.contains("config")
+                        {
                             return ToolRiskLevel::Moderate;
                         }
                     }
                 }
                 ToolRiskLevel::Moderate
             }
-            
+
             // Terminal operations are high risk
             "terminal_create" | "terminal_write" => ToolRiskLevel::High,
-            
+
             // Unknown tools are treated as moderate risk
             _ => ToolRiskLevel::Moderate,
         }
@@ -957,7 +966,7 @@ enum ToolRiskLevel {
     /// Safe operations with minimal risk
     Safe,
     /// Moderate risk operations requiring caution
-    Moderate,  
+    Moderate,
     /// High-risk operations requiring careful consideration
     High,
 }
@@ -1685,7 +1694,7 @@ mod tests {
     #[test]
     fn test_generate_permission_options_terminal_tool() {
         let handler = create_test_handler();
-        
+
         let request = InternalToolRequest {
             id: "test-id".to_string(),
             name: "terminal_write".to_string(),
@@ -1693,10 +1702,10 @@ mod tests {
         };
 
         let options = handler.generate_permission_options(&request);
-        
+
         // Terminal operations should be treated as high-risk
         assert_eq!(options.len(), 4);
-        
+
         // Verify option IDs follow ACP pattern
         let option_ids: Vec<&str> = options.iter().map(|o| o.option_id.as_str()).collect();
         assert!(option_ids.contains(&"allow-once"));

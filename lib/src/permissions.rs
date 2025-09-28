@@ -95,19 +95,19 @@ pub enum PolicyEvaluation {
 pub trait PermissionStorage: Send + Sync {
     /// Store a permission decision
     async fn store_permission(&self, permission: StoredPermission) -> Result<()>;
-    
+
     /// Lookup stored permission for a tool
     async fn lookup_permission(&self, tool_name: &str) -> Result<Option<StoredPermission>>;
-    
+
     /// List all stored permissions
     async fn list_permissions(&self) -> Result<Vec<StoredPermission>>;
-    
+
     /// Remove expired permissions
     async fn cleanup_expired(&self) -> Result<usize>;
-    
+
     /// Remove a specific permission
     async fn remove_permission(&self, tool_pattern: &str) -> Result<bool>;
-    
+
     /// Clear all permissions
     async fn clear_all(&self) -> Result<()>;
 }
@@ -123,38 +123,41 @@ impl FilePermissionStorage {
     pub fn new(storage_path: PathBuf) -> Self {
         Self { storage_path }
     }
-    
+
     /// Get the path to the permissions file
     fn permissions_file_path(&self) -> PathBuf {
         self.storage_path.join("permissions.json")
     }
-    
+
     /// Load permissions from disk
     async fn load_permissions(&self) -> Result<HashMap<String, StoredPermission>> {
         let file_path = self.permissions_file_path();
-        
+
         if !file_path.exists() {
             debug!("Permissions file does not exist, starting with empty storage");
             return Ok(HashMap::new());
         }
-        
+
         let content = fs::read_to_string(&file_path).await.map_err(|e| {
             error!("Failed to read permissions file: {}", e);
             AgentError::Config(format!("Failed to read permissions file: {}", e))
         })?;
-        
+
         let permissions: HashMap<String, StoredPermission> = serde_json::from_str(&content)
             .map_err(|e| {
                 error!("Failed to parse permissions file: {}", e);
                 AgentError::Config(format!("Failed to parse permissions file: {}", e))
             })?;
-        
+
         debug!("Loaded {} permissions from storage", permissions.len());
         Ok(permissions)
     }
-    
+
     /// Save permissions to disk
-    async fn save_permissions(&self, permissions: &HashMap<String, StoredPermission>) -> Result<()> {
+    async fn save_permissions(
+        &self,
+        permissions: &HashMap<String, StoredPermission>,
+    ) -> Result<()> {
         // Ensure the storage directory exists
         if let Some(parent) = self.storage_path.parent() {
             fs::create_dir_all(parent).await.map_err(|e| {
@@ -166,18 +169,18 @@ impl FilePermissionStorage {
             error!("Failed to create storage directory: {}", e);
             AgentError::Config(format!("Failed to create storage directory: {}", e))
         })?;
-        
+
         let file_path = self.permissions_file_path();
         let content = serde_json::to_string_pretty(permissions).map_err(|e| {
             error!("Failed to serialize permissions: {}", e);
             AgentError::Config(format!("Failed to serialize permissions: {}", e))
         })?;
-        
+
         fs::write(&file_path, content).await.map_err(|e| {
             error!("Failed to write permissions file: {}", e);
             AgentError::Config(format!("Failed to write permissions file: {}", e))
         })?;
-        
+
         debug!("Saved {} permissions to storage", permissions.len());
         Ok(())
     }
@@ -189,40 +192,46 @@ impl PermissionStorage for FilePermissionStorage {
         let mut permissions = self.load_permissions().await?;
         permissions.insert(permission.tool_pattern.clone(), permission);
         self.save_permissions(&permissions).await?;
-        info!("Stored permission for tool pattern: {}", permissions.keys().last().unwrap());
+        info!(
+            "Stored permission for tool pattern: {}",
+            permissions.keys().last().unwrap()
+        );
         Ok(())
     }
-    
+
     async fn lookup_permission(&self, tool_name: &str) -> Result<Option<StoredPermission>> {
         let permissions = self.load_permissions().await?;
-        
+
         // First try exact match
         if let Some(permission) = permissions.get(tool_name) {
             return Ok(Some(permission.clone()));
         }
-        
+
         // Try pattern matching
         for (pattern, permission) in permissions {
             if matches_tool_pattern(&pattern, tool_name) {
-                debug!("Found matching permission pattern '{}' for tool '{}'", pattern, tool_name);
+                debug!(
+                    "Found matching permission pattern '{}' for tool '{}'",
+                    pattern, tool_name
+                );
                 return Ok(Some(permission));
             }
         }
-        
+
         debug!("No stored permission found for tool: {}", tool_name);
         Ok(None)
     }
-    
+
     async fn list_permissions(&self) -> Result<Vec<StoredPermission>> {
         let permissions = self.load_permissions().await?;
         Ok(permissions.into_values().collect())
     }
-    
+
     async fn cleanup_expired(&self) -> Result<usize> {
         let mut permissions = self.load_permissions().await?;
         let now = current_timestamp();
         let original_count = permissions.len();
-        
+
         permissions.retain(|_, perm| {
             if let Some(expires_at) = perm.expires_at {
                 expires_at > now
@@ -230,16 +239,16 @@ impl PermissionStorage for FilePermissionStorage {
                 true
             }
         });
-        
+
         let removed_count = original_count - permissions.len();
         if removed_count > 0 {
             self.save_permissions(&permissions).await?;
             info!("Cleaned up {} expired permissions", removed_count);
         }
-        
+
         Ok(removed_count)
     }
-    
+
     async fn remove_permission(&self, tool_pattern: &str) -> Result<bool> {
         let mut permissions = self.load_permissions().await?;
         let removed = permissions.remove(tool_pattern).is_some();
@@ -249,7 +258,7 @@ impl PermissionStorage for FilePermissionStorage {
         }
         Ok(removed)
     }
-    
+
     async fn clear_all(&self) -> Result<()> {
         let file_path = self.permissions_file_path();
         if file_path.exists() {
@@ -275,14 +284,21 @@ impl PermissionPolicyEngine {
         let policies = default_permission_policies();
         Self { storage, policies }
     }
-    
+
     /// Create with custom policies
-    pub fn with_policies(storage: Box<dyn PermissionStorage>, policies: Vec<PermissionPolicy>) -> Self {
+    pub fn with_policies(
+        storage: Box<dyn PermissionStorage>,
+        policies: Vec<PermissionPolicy>,
+    ) -> Self {
         Self { storage, policies }
     }
-    
+
     /// Evaluate a tool call against stored permissions and policies
-    pub async fn evaluate_tool_call(&self, tool_name: &str, args: &serde_json::Value) -> Result<PolicyEvaluation> {
+    pub async fn evaluate_tool_call(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> Result<PolicyEvaluation> {
         // First check if we have a stored permission for this tool
         if let Some(stored) = self.storage.lookup_permission(tool_name).await? {
             // Check if stored permission is still valid
@@ -306,22 +322,28 @@ impl PermissionPolicyEngine {
                 });
             }
         }
-        
+
         // Evaluate against policies
         for policy in &self.policies {
             if matches_tool_pattern(&policy.tool_pattern, tool_name) {
-                debug!("Applying policy '{}' to tool '{}'", policy.tool_pattern, tool_name);
+                debug!(
+                    "Applying policy '{}' to tool '{}'",
+                    policy.tool_pattern, tool_name
+                );
                 return Ok(self.apply_policy(policy, tool_name, args));
             }
         }
-        
+
         // Default policy: require user consent for unknown tools
-        debug!("No matching policy found for '{}', requiring user consent", tool_name);
+        debug!(
+            "No matching policy found for '{}', requiring user consent",
+            tool_name
+        );
         Ok(PolicyEvaluation::RequireUserConsent {
             options: self.generate_permission_options(tool_name, RiskLevel::Medium),
         })
     }
-    
+
     /// Store a permission decision
     pub async fn store_permission_decision(
         &self,
@@ -331,7 +353,7 @@ impl PermissionPolicyEngine {
     ) -> Result<()> {
         let now = current_timestamp();
         let expires_at = expires_in.map(|d| now + d.as_secs());
-        
+
         let stored_permission = StoredPermission {
             tool_pattern: tool_name.to_string(),
             decision,
@@ -339,12 +361,17 @@ impl PermissionPolicyEngine {
             expires_at,
             context: HashMap::new(),
         };
-        
+
         self.storage.store_permission(stored_permission).await
     }
-    
+
     /// Apply a specific policy to a tool call
-    fn apply_policy(&self, policy: &PermissionPolicy, tool_name: &str, _args: &serde_json::Value) -> PolicyEvaluation {
+    fn apply_policy(
+        &self,
+        policy: &PermissionPolicy,
+        tool_name: &str,
+        _args: &serde_json::Value,
+    ) -> PolicyEvaluation {
         match policy.default_action {
             PolicyAction::Allow => PolicyEvaluation::Allowed,
             PolicyAction::Deny => PolicyEvaluation::Denied {
@@ -353,7 +380,8 @@ impl PermissionPolicyEngine {
             PolicyAction::AskUser => {
                 if policy.require_user_consent {
                     PolicyEvaluation::RequireUserConsent {
-                        options: self.generate_permission_options(tool_name, policy.risk_level.clone()),
+                        options: self
+                            .generate_permission_options(tool_name, policy.risk_level.clone()),
                     }
                 } else {
                     PolicyEvaluation::Allowed
@@ -361,9 +389,13 @@ impl PermissionPolicyEngine {
             }
         }
     }
-    
+
     /// Generate permission options based on tool and risk level
-    fn generate_permission_options(&self, tool_name: &str, risk_level: RiskLevel) -> Vec<PermissionOption> {
+    fn generate_permission_options(
+        &self,
+        tool_name: &str,
+        risk_level: RiskLevel,
+    ) -> Vec<PermissionOption> {
         let mut options = vec![
             PermissionOption {
                 option_id: "allow-once".to_string(),
@@ -376,24 +408,30 @@ impl PermissionPolicyEngine {
                 kind: PermissionOptionKind::RejectOnce,
             },
         ];
-        
+
         // Add "always" options based on risk level
         match risk_level {
             RiskLevel::Low => {
                 // Low risk tools can have allow always
-                options.insert(1, PermissionOption {
-                    option_id: "allow-always".to_string(),
-                    name: "Allow always".to_string(),
-                    kind: PermissionOptionKind::AllowAlways,
-                });
+                options.insert(
+                    1,
+                    PermissionOption {
+                        option_id: "allow-always".to_string(),
+                        name: "Allow always".to_string(),
+                        kind: PermissionOptionKind::AllowAlways,
+                    },
+                );
             }
             RiskLevel::Medium => {
                 // Medium risk tools get both always options but with warnings
-                options.insert(1, PermissionOption {
-                    option_id: "allow-always".to_string(),
-                    name: format!("Allow always ({})", tool_name),
-                    kind: PermissionOptionKind::AllowAlways,
-                });
+                options.insert(
+                    1,
+                    PermissionOption {
+                        option_id: "allow-always".to_string(),
+                        name: format!("Allow always ({})", tool_name),
+                        kind: PermissionOptionKind::AllowAlways,
+                    },
+                );
                 options.push(PermissionOption {
                     option_id: "reject-always".to_string(),
                     name: format!("Reject always ({})", tool_name),
@@ -409,7 +447,7 @@ impl PermissionPolicyEngine {
                 });
             }
         }
-        
+
         options
     }
 }
@@ -419,17 +457,17 @@ fn matches_tool_pattern(pattern: &str, tool_name: &str) -> bool {
     if pattern == "*" || pattern == tool_name {
         return true;
     }
-    
+
     // Support prefix wildcards like "fs_*"
     if let Some(prefix) = pattern.strip_suffix('*') {
         return tool_name.starts_with(prefix);
     }
-    
+
     // Support suffix wildcards like "*_read"
     if let Some(suffix) = pattern.strip_prefix('*') {
         return tool_name.ends_with(suffix);
     }
-    
+
     false
 }
 
@@ -491,7 +529,6 @@ fn default_permission_policies() -> Vec<PermissionPolicy> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
-    use std::path::Path;
 
     fn create_test_storage() -> FilePermissionStorage {
         let temp_dir = tempdir().unwrap();
@@ -501,7 +538,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_storage_store_and_lookup() {
         let storage = create_test_storage();
-        
+
         let permission = StoredPermission {
             tool_pattern: "test_tool".to_string(),
             decision: PermissionDecision::AllowAlways,
@@ -509,15 +546,18 @@ mod tests {
             expires_at: None,
             context: HashMap::new(),
         };
-        
+
         storage.store_permission(permission.clone()).await.unwrap();
-        
+
         let retrieved = storage.lookup_permission("test_tool").await.unwrap();
         assert!(retrieved.is_some());
-        
+
         let retrieved = retrieved.unwrap();
         assert_eq!(retrieved.tool_pattern, "test_tool");
-        assert!(matches!(retrieved.decision, PermissionDecision::AllowAlways));
+        assert!(matches!(
+            retrieved.decision,
+            PermissionDecision::AllowAlways
+        ));
     }
 
     #[tokio::test]
@@ -527,7 +567,7 @@ mod tests {
         assert!(matches_tool_pattern("fs_*", "fs_write"));
         assert!(matches_tool_pattern("*_read", "fs_read"));
         assert!(matches_tool_pattern("exact_match", "exact_match"));
-        
+
         assert!(!matches_tool_pattern("fs_*", "terminal_create"));
         assert!(!matches_tool_pattern("*_read", "fs_write"));
     }
@@ -535,7 +575,7 @@ mod tests {
     #[tokio::test]
     async fn test_permission_cleanup() {
         let storage = create_test_storage();
-        
+
         // Add expired permission
         let expired_permission = StoredPermission {
             tool_pattern: "expired_tool".to_string(),
@@ -544,7 +584,7 @@ mod tests {
             expires_at: Some(current_timestamp() - 1800), // expired 30 min ago
             context: HashMap::new(),
         };
-        
+
         // Add valid permission
         let valid_permission = StoredPermission {
             tool_pattern: "valid_tool".to_string(),
@@ -553,17 +593,17 @@ mod tests {
             expires_at: Some(current_timestamp() + 3600), // expires in 1 hour
             context: HashMap::new(),
         };
-        
+
         storage.store_permission(expired_permission).await.unwrap();
         storage.store_permission(valid_permission).await.unwrap();
-        
+
         let removed_count = storage.cleanup_expired().await.unwrap();
         assert_eq!(removed_count, 1);
-        
+
         // Verify expired permission is gone
         let result = storage.lookup_permission("expired_tool").await.unwrap();
         assert!(result.is_none());
-        
+
         // Verify valid permission remains
         let result = storage.lookup_permission("valid_tool").await.unwrap();
         assert!(result.is_some());
@@ -573,30 +613,51 @@ mod tests {
     async fn test_policy_engine_evaluation() {
         let storage = create_test_storage();
         let engine = PermissionPolicyEngine::new(Box::new(storage));
-        
+
         // Test fs_read (should be allowed by default policy)
-        let result = engine.evaluate_tool_call("fs_read_file", &serde_json::json!({})).await.unwrap();
+        let result = engine
+            .evaluate_tool_call("fs_read_file", &serde_json::json!({}))
+            .await
+            .unwrap();
         assert!(matches!(result, PolicyEvaluation::Allowed));
-        
+
         // Test fs_write (should require user consent)
-        let result = engine.evaluate_tool_call("fs_write_file", &serde_json::json!({})).await.unwrap();
-        assert!(matches!(result, PolicyEvaluation::RequireUserConsent { .. }));
-        
+        let result = engine
+            .evaluate_tool_call("fs_write_file", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            PolicyEvaluation::RequireUserConsent { .. }
+        ));
+
         // Test terminal (should require user consent)
-        let result = engine.evaluate_tool_call("terminal_create", &serde_json::json!({})).await.unwrap();
-        assert!(matches!(result, PolicyEvaluation::RequireUserConsent { .. }));
+        let result = engine
+            .evaluate_tool_call("terminal_create", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            PolicyEvaluation::RequireUserConsent { .. }
+        ));
     }
 
     #[tokio::test]
     async fn test_stored_permission_override() {
         let storage = create_test_storage();
         let engine = PermissionPolicyEngine::new(Box::new(storage));
-        
+
         // Store a deny-always permission for fs_write
-        engine.store_permission_decision("fs_write_file", PermissionDecision::DenyAlways, None).await.unwrap();
-        
+        engine
+            .store_permission_decision("fs_write_file", PermissionDecision::DenyAlways, None)
+            .await
+            .unwrap();
+
         // Should be denied even though policy would ask user
-        let result = engine.evaluate_tool_call("fs_write_file", &serde_json::json!({})).await.unwrap();
+        let result = engine
+            .evaluate_tool_call("fs_write_file", &serde_json::json!({}))
+            .await
+            .unwrap();
         assert!(matches!(result, PolicyEvaluation::Denied { .. }));
     }
 }

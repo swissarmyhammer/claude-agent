@@ -13,6 +13,7 @@ pub mod mcp;
 pub mod mcp_error_handling;
 pub mod path_validator;
 pub mod permissions;
+pub mod plan;
 pub mod request_validation;
 pub mod server;
 pub mod session;
@@ -24,6 +25,7 @@ pub mod tools;
 pub use agent::ClaudeAgent;
 pub use config::AgentConfig;
 pub use error::{AgentError, Result};
+pub use plan::{AgentPlan, PlanEntry, PlanEntryStatus, PlanGenerator, PlanManager, Priority};
 pub use server::ClaudeAgentServer;
 pub use tools::{ToolCallHandler, ToolCallResult, ToolPermissions};
 
