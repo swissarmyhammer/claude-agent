@@ -300,6 +300,7 @@ impl CancellationManager {
 /// Manages the broadcasting of session update notifications to multiple receivers.
 /// This allows the agent to send real-time updates about session state changes,
 /// streaming content, and tool execution results to interested subscribers.
+#[derive(Debug, Clone)]
 pub struct NotificationSender {
     /// The broadcast sender for distributing notifications
     sender: broadcast::Sender<SessionNotification>,

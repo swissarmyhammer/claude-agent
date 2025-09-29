@@ -12,15 +12,15 @@ use tokio::sync::RwLock;
 /// Manages terminal sessions for command execution
 #[derive(Debug, Clone)]
 pub struct TerminalManager {
-    terminals: Arc<RwLock<HashMap<String, TerminalSession>>>,
+    pub terminals: Arc<RwLock<HashMap<String, TerminalSession>>>,
 }
 
 /// Represents a terminal session with working directory and environment
 #[derive(Debug)]
 pub struct TerminalSession {
-    process: Option<Child>,
-    working_dir: std::path::PathBuf,
-    environment: HashMap<String, String>,
+    pub process: Option<Child>,
+    pub working_dir: std::path::PathBuf,
+    pub environment: HashMap<String, String>,
     // ACP-compliant fields for terminal/create method
     pub command: Option<String>,
     pub args: Vec<String>,
@@ -188,7 +188,7 @@ impl TerminalManager {
     }
 
     /// Resolve working directory from session or parameter
-    async fn resolve_working_directory(
+    pub async fn resolve_working_directory(
         &self,
         session_manager: &crate::session::SessionManager,
         session_id: &str,
@@ -219,7 +219,7 @@ impl TerminalManager {
     }
 
     /// Prepare environment variables by merging custom with system environment
-    fn prepare_environment(
+    pub fn prepare_environment(
         &self,
         env_vars: Vec<EnvVariable>,
     ) -> crate::Result<HashMap<String, String>> {

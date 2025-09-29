@@ -55,11 +55,14 @@
 use crate::path_validator::{PathValidationError, PathValidator};
 use crate::terminal_manager::{TerminalManager, TerminalSession, TerminalCreateParams, EnvVariable, TerminalCreateResponse};
 use crate::tool_types::{ToolKind, ToolCallStatus, ToolCallContent, ToolCallLocation, ToolCallReport};
-use serde::{Deserialize, Serialize};
+
+
 use serde_json::Value;
+use agent_client_protocol::SessionId;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
 
 /// Internal representation of a tool request from an LLM
 #[derive(Debug, Clone)]
@@ -78,136 +81,9 @@ pub struct InternalToolRequest {
 
 
 
-/// Tool call classification system for mapping tool names to kinds
-impl ToolKind {
-    /// Classify a tool by its name and parameters to determine the appropriate kind
-    pub fn classify_tool(tool_name: &str, _arguments: &serde_json::Value) -> Self {
-        // ACP requires comprehensive tool call reporting with rich metadata:
-        // 1. toolCallId: Unique identifier for correlation across updates
-        // 2. title: Human-readable description of tool operation
-        // 3. kind: Classification for UI optimization and icon selection
-        // 4. status: Lifecycle state (pending, in_progress, completed, failed)
-        // 5. content: Output content produced by tool execution
-        // 6. locations: File paths for follow-along features
-        // 7. rawInput/rawOutput: Detailed I/O data for debugging
-        //
-        // Complete reporting enables rich client experiences and debugging.
 
-        match tool_name {
-            // File system read operations
-            "fs_read_text_file" | "fs_read" | "read_file" => ToolKind::Read,
-            
-            // File system write and modification operations
-            "fs_write_text_file" | "fs_write" | "write_file" | "fs_edit" | "edit_file" => ToolKind::Edit,
-            
-            // File deletion operations
-            "fs_delete" | "delete_file" | "remove_file" => ToolKind::Delete,
-            
-            // File move and rename operations  
-            "fs_move" | "move_file" | "rename_file" => ToolKind::Move,
-            
-            // Search and grep operations
-            "fs_search" | "search" | "grep" | "find" => ToolKind::Search,
-            
-            // Terminal and command execution
-            "terminal_create" | "terminal_write" | "terminal_read" | "execute" | "run" => ToolKind::Execute,
-            
-            // External data fetching
-            "fetch" | "http_get" | "download" | "curl" | "wget" => ToolKind::Fetch,
-            
-            // MCP tools - classify by prefix pattern
-            tool if tool.contains("mcp__") => {
-                if tool.contains("read") || tool.contains("get") || tool.contains("show") || tool.contains("list") {
-                    ToolKind::Read
-                } else if tool.contains("write") || tool.contains("create") || tool.contains("edit") || tool.contains("update") {
-                    ToolKind::Edit  
-                } else if tool.contains("delete") || tool.contains("remove") {
-                    ToolKind::Delete
-                } else if tool.contains("search") || tool.contains("grep") || tool.contains("find") {
-                    ToolKind::Search
-                } else if tool.contains("execute") || tool.contains("shell") || tool.contains("terminal") {
-                    ToolKind::Execute
-                } else if tool.contains("fetch") || tool.contains("web") || tool.contains("http") {
-                    ToolKind::Fetch
-                } else {
-                    ToolKind::Other
-                }
-            }
-            
-            // Default fallback for unknown tools
-            _ => ToolKind::Other,
-        }
-    }
-}
 
-/// Tool title generation system for human-readable descriptions
-impl ToolCallReport {
-    /// Generate a context-aware human-readable title based on tool name and parameters
-    pub fn generate_title(tool_name: &str, arguments: &serde_json::Value) -> String {
-        match tool_name {
-            "fs_read_text_file" | "fs_read" => {
-                if let Some(path) = arguments.get("path").and_then(|v| v.as_str()) {
-                    format!("Reading {}", std::path::Path::new(path).file_name()
-                        .and_then(|n| n.to_str()).unwrap_or(path))
-                } else {
-                    "Reading file".to_string()
-                }
-            }
-            "fs_write_text_file" | "fs_write" => {
-                if let Some(path) = arguments.get("path").and_then(|v| v.as_str()) {
-                    format!("Writing to {}", std::path::Path::new(path).file_name()
-                        .and_then(|n| n.to_str()).unwrap_or(path))
-                } else {
-                    "Writing file".to_string()
-                }
-            }
-            "terminal_create" => {
-                if let Some(command) = arguments.get("command").and_then(|v| v.as_str()) {
-                    format!("Running {}", command)
-                } else {
-                    "Creating terminal session".to_string()
-                }
-            }
-            "fs_delete" => {
-                if let Some(path) = arguments.get("path").and_then(|v| v.as_str()) {
-                    format!("Deleting {}", std::path::Path::new(path).file_name()
-                        .and_then(|n| n.to_str()).unwrap_or(path))
-                } else {
-                    "Deleting file".to_string()
-                }
-            }
-            "search" | "grep" => {
-                if let Some(pattern) = arguments.get("pattern").and_then(|v| v.as_str()) {
-                    format!("Searching for '{}'", pattern)
-                } else {
-                    "Searching files".to_string()
-                }
-            }
-            // MCP tools - generate titles based on tool name and parameters
-            tool if tool.starts_with("mcp__") => {
-                let clean_name = tool.strip_prefix("mcp__")
-                    .unwrap_or(tool)
-                    .replace('_', " ");
-                
-                // Capitalize first letter
-                let mut chars = clean_name.chars();
-                match chars.next() {
-                    None => tool.to_string(),
-                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                }
-            }
-            // Default case - convert snake_case to Title Case
-            _ => {
-                let clean_name = tool_name.replace('_', " ");
-                let mut chars = clean_name.chars();
-                match chars.next() {
-                    None => "Unknown tool".to_string(),
-                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                }
-            }
-        }
-    }
-}
+
 
 /// Handles tool request execution with permission management and security validation
 #[derive(Debug, Clone)]
@@ -219,6 +95,8 @@ pub struct ToolCallHandler {
     client_capabilities: Option<agent_client_protocol::ClientCapabilities>,
     /// Active tool calls tracked by unique ID for session-scoped correlation
     active_tool_calls: Arc<RwLock<HashMap<String, ToolCallReport>>>,
+    /// Notification sender for ACP-compliant session updates
+    notification_sender: Option<crate::agent::NotificationSender>,
 }
 
 /// Configuration for tool permissions and security policies
@@ -314,358 +192,7 @@ pub struct PermissionRequest {
     pub arguments: Value,
 }
 
-impl TerminalManager {
-    /// Create a new terminal manager
-    pub fn new() -> Self {
-        Self {
-            terminals: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
 
-    /// Generate ACP-compliant terminal ID with "term_" prefix
-    fn generate_terminal_id(&self) -> String {
-        format!("term_{}", ulid::Ulid::new())
-    }
-
-    /// Create a new terminal session
-    pub async fn create_terminal(&self, working_dir: Option<String>) -> crate::Result<String> {
-        let terminal_id = self.generate_terminal_id();
-        let working_dir = working_dir
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-            });
-
-        let session = TerminalSession {
-            process: None,
-            working_dir,
-            environment: std::env::vars().collect(),
-            command: None,
-            args: Vec::new(),
-            session_id: None,
-            output_byte_limit: 1_048_576, // 1MB default
-            output_buffer: Vec::new(),
-            buffer_truncated: false,
-        };
-
-        let mut terminals = self.terminals.write().await;
-        terminals.insert(terminal_id.clone(), session);
-
-        tracing::info!("Created terminal session: {}", terminal_id);
-        Ok(terminal_id)
-    }
-
-    /// Create ACP-compliant terminal session with command and all parameters
-    ///
-    /// This method creates a new terminal session following the Anthropic Computer Protocol
-    /// specification. It validates the session ID, resolves the working directory,
-    /// prepares environment variables, and creates the terminal with proper output buffering.
-    ///
-    /// # Arguments
-    /// * `session_manager` - Manager for session validation and retrieval
-    /// * `params` - Terminal creation parameters including command, args, env, etc.
-    ///
-    /// # Returns
-    /// * `Ok(String)` - The unique terminal ID (ULID format) on success
-    /// * `Err(AgentError)` - Protocol error for invalid parameters or session issues
-    ///
-    /// # Examples
-    /// ```
-    /// let params = TerminalCreateParams {
-    ///     session_id: "01HKQM85501ECE8XJGNZKNJQW".to_string(),
-    ///     command: "echo".to_string(),
-    ///     args: Some(vec!["Hello".to_string(), "World".to_string()]),
-    ///     env: None,
-    ///     cwd: None,
-    ///     output_byte_limit: Some(1024),
-    /// };
-    /// let terminal_id = handler.create_terminal_with_command(&session_manager, params).await?;
-    /// ```
-    pub async fn create_terminal_with_command(
-        &self,
-        session_manager: &crate::session::SessionManager,
-        params: TerminalCreateParams,
-    ) -> crate::Result<String> {
-        // 1. Validate session ID
-        self.validate_session_id(session_manager, &params.session_id)
-            .await?;
-
-        // 2. Generate ACP-compliant terminal ID
-        let terminal_id = self.generate_terminal_id();
-
-        // 3. Resolve working directory (use session cwd if not specified)
-        let working_dir = self
-            .resolve_working_directory(session_manager, &params.session_id, params.cwd.as_deref())
-            .await?;
-
-        // 4. Prepare environment variables
-        let environment = self.prepare_environment(params.env.unwrap_or_default())?;
-
-        // 5. Create enhanced terminal session
-        let session = TerminalSession {
-            process: None,
-            working_dir,
-            environment,
-            command: Some(params.command),
-            args: params.args.unwrap_or_default(),
-            session_id: Some(params.session_id),
-            output_byte_limit: params.output_byte_limit.unwrap_or(1_048_576), // 1MB default
-            output_buffer: Vec::new(),
-            buffer_truncated: false,
-        };
-
-        // 6. Register terminal
-        let mut terminals = self.terminals.write().await;
-        terminals.insert(terminal_id.clone(), session);
-
-        tracing::info!("Created ACP terminal session: {}", terminal_id);
-        Ok(terminal_id)
-    }
-
-    /// Validate session ID exists and is properly formatted
-    ///
-    /// Ensures the session ID is a valid ULID format and corresponds to an existing session.
-    ///
-    /// # Arguments
-    /// * `session_manager` - Manager for session validation
-    /// * `session_id` - Session ID string to validate
-    ///
-    /// # Returns
-    /// * `Ok(())` - Session is valid and exists
-    /// * `Err(AgentError::Protocol)` - Invalid format or session not found
-    async fn validate_session_id(
-        &self,
-        session_manager: &crate::session::SessionManager,
-        session_id: &str,
-    ) -> crate::Result<()> {
-        let session_ulid = session_id.parse::<ulid::Ulid>().map_err(|_| {
-            crate::AgentError::Protocol(format!("Invalid session ID format: {}", session_id))
-        })?;
-
-        session_manager.get_session(&session_ulid)?.ok_or_else(|| {
-            crate::AgentError::Protocol(format!("Session not found: {}", session_id))
-        })?;
-
-        Ok(())
-    }
-
-    /// Resolve working directory from session or parameter
-    ///
-    /// Determines the working directory for the terminal session. If a working directory
-    /// parameter is provided, it must be an absolute path. Otherwise, uses the session's
-    /// current working directory.
-    ///
-    /// # Arguments
-    /// * `session_manager` - Manager for session retrieval
-    /// * `session_id` - Valid session ID
-    /// * `cwd_param` - Optional working directory parameter (must be absolute if provided)
-    ///
-    /// # Returns
-    /// * `Ok(PathBuf)` - Resolved absolute path for working directory
-    /// * `Err(AgentError::Protocol)` - Invalid path or session not found
-    async fn resolve_working_directory(
-        &self,
-        session_manager: &crate::session::SessionManager,
-        session_id: &str,
-        cwd_param: Option<&str>,
-    ) -> crate::Result<std::path::PathBuf> {
-        if let Some(cwd) = cwd_param {
-            // Use provided working directory, validate it's absolute
-            let path = std::path::PathBuf::from(cwd);
-            if !path.is_absolute() {
-                return Err(crate::AgentError::Protocol(format!(
-                    "Working directory must be absolute path: {}",
-                    cwd
-                )));
-            }
-            Ok(path)
-        } else {
-            // Use session's working directory
-            let session_ulid = session_id.parse::<ulid::Ulid>().map_err(|_| {
-                crate::AgentError::Protocol(format!("Invalid session ID format: {}", session_id))
-            })?;
-
-            let session = session_manager.get_session(&session_ulid)?.ok_or_else(|| {
-                crate::AgentError::Protocol(format!("Session not found: {}", session_id))
-            })?;
-
-            Ok(session.cwd)
-        }
-    }
-
-    /// Prepare environment variables by merging custom with system environment
-    ///
-    /// Creates a complete environment variable map by starting with system environment
-    /// variables and applying custom overrides. Custom variables take precedence over
-    /// system variables with the same name.
-    ///
-    /// # Arguments
-    /// * `env_vars` - Vector of custom environment variables to apply
-    ///
-    /// # Returns
-    /// * `Ok(HashMap)` - Complete environment variable map
-    /// * `Err(AgentError::Protocol)` - Empty environment variable name detected
-    fn prepare_environment(
-        &self,
-        env_vars: Vec<EnvVariable>,
-    ) -> crate::Result<HashMap<String, String>> {
-        let mut environment: HashMap<String, String> = std::env::vars().collect();
-
-        // Apply custom environment variables, overriding system ones
-        for env_var in env_vars {
-            if env_var.name.is_empty() {
-                return Err(crate::AgentError::Protocol(
-                    "Environment variable name cannot be empty".to_string(),
-                ));
-            }
-            environment.insert(env_var.name, env_var.value);
-        }
-
-        Ok(environment)
-    }
-
-    /// Execute a command in the specified terminal session
-    pub async fn execute_command(&self, terminal_id: &str, command: &str) -> crate::Result<String> {
-        let mut terminals = self.terminals.write().await;
-        let session = terminals.get_mut(terminal_id).ok_or_else(|| {
-            crate::AgentError::ToolExecution(format!("Terminal {} not found", terminal_id))
-        })?;
-
-        tracing::info!("Executing command in terminal {}: {}", terminal_id, command);
-
-        // Parse command and arguments
-        let parts: Vec<&str> = command.split_whitespace().collect();
-        if parts.is_empty() {
-            return Err(crate::AgentError::ToolExecution(
-                "Empty command".to_string(),
-            ));
-        }
-
-        let program = parts[0];
-        let args = &parts[1..];
-
-        // Execute command
-        let output = Command::new(program)
-            .args(args)
-            .current_dir(&session.working_dir)
-            .envs(&session.environment)
-            .output()
-            .await
-            .map_err(|e| {
-                crate::AgentError::ToolExecution(format!("Failed to execute command: {}", e))
-            })?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        let result = if output.status.success() {
-            if stdout.is_empty() {
-                "Command completed successfully (exit code: 0)".to_string()
-            } else {
-                format!("Command output:\n{}", stdout)
-            }
-        } else {
-            let exit_code = output.status.code().unwrap_or(-1);
-            if stderr.is_empty() {
-                format!("Command failed (exit code: {})", exit_code)
-            } else {
-                format!("Command failed (exit code: {}):\n{}", exit_code, stderr)
-            }
-        };
-
-        tracing::info!(
-            "Command completed with exit code: {:?}",
-            output.status.code()
-        );
-        Ok(result)
-    }
-
-    /// Change the working directory for a terminal session
-    pub async fn change_directory(&self, terminal_id: &str, path: &str) -> crate::Result<String> {
-        let mut terminals = self.terminals.write().await;
-        let session = terminals.get_mut(terminal_id).ok_or_else(|| {
-            crate::AgentError::ToolExecution(format!("Terminal {} not found", terminal_id))
-        })?;
-
-        let new_path = if std::path::Path::new(path).is_absolute() {
-            std::path::PathBuf::from(path)
-        } else {
-            session.working_dir.join(path)
-        };
-
-        if new_path.exists() && new_path.is_dir() {
-            session.working_dir = new_path.canonicalize().map_err(|e| {
-                crate::AgentError::ToolExecution(format!("Failed to resolve path: {}", e))
-            })?;
-
-            tracing::info!("Changed directory to: {}", session.working_dir.display());
-            Ok(format!(
-                "Changed directory to: {}",
-                session.working_dir.display()
-            ))
-        } else {
-            Err(crate::AgentError::ToolExecution(format!(
-                "Directory does not exist: {}",
-                path
-            )))
-        }
-    }
-
-    /// Remove a terminal session
-    pub async fn remove_terminal(&self, terminal_id: &str) -> crate::Result<()> {
-        let mut terminals = self.terminals.write().await;
-        if let Some(mut session) = terminals.remove(terminal_id) {
-            if let Some(mut process) = session.process.take() {
-                let _ = process.kill().await;
-            }
-            tracing::info!("Removed terminal session: {}", terminal_id);
-        }
-        Ok(())
-    }
-}
-
-impl Default for TerminalManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TerminalSession {
-    /// Add output data to the buffer, enforcing byte limits
-    pub fn add_output(&mut self, data: &[u8]) {
-        // Always append the new data first
-        self.output_buffer.extend_from_slice(data);
-
-        // Then truncate from beginning if we exceed the limit
-        let limit = self.output_byte_limit as usize;
-        if self.output_buffer.len() > limit {
-            let excess = self.output_buffer.len() - limit;
-            self.output_buffer.drain(0..excess);
-            self.buffer_truncated = true;
-        }
-    }
-
-    /// Get output as UTF-8 string
-    pub fn get_output_string(&self) -> String {
-        String::from_utf8_lossy(&self.output_buffer).to_string()
-    }
-
-    /// Check if output buffer has been truncated
-    pub fn is_output_truncated(&self) -> bool {
-        self.buffer_truncated
-    }
-
-    /// Get current buffer size in bytes
-    pub fn get_buffer_size(&self) -> usize {
-        self.output_buffer.len()
-    }
-
-    /// Clear the output buffer
-    pub fn clear_output(&mut self) {
-        self.output_buffer.clear();
-        self.buffer_truncated = false;
-    }
-}
 
 impl ToolCallHandler {
     /// Create a new tool call handler with the given permissions
@@ -676,6 +203,7 @@ impl ToolCallHandler {
             mcp_manager: None,
             client_capabilities: None,
             active_tool_calls: Arc::new(RwLock::new(HashMap::new())),
+            notification_sender: None,
         }
     }
 
@@ -690,6 +218,7 @@ impl ToolCallHandler {
             mcp_manager: None,
             client_capabilities: None,
             active_tool_calls: Arc::new(RwLock::new(HashMap::new())),
+            notification_sender: None,
         }
     }
 
@@ -726,9 +255,10 @@ impl ToolCallHandler {
         }
     }
 
-    /// Create and track a new tool call report
+    /// Create and track a new tool call report with ACP-compliant session notification
     pub async fn create_tool_call_report(
         &self,
+        session_id: &agent_client_protocol::SessionId,
         tool_name: &str,
         arguments: &serde_json::Value,
     ) -> ToolCallReport {
@@ -744,47 +274,200 @@ impl ToolCallHandler {
             let mut active_calls = self.active_tool_calls.write().await;
             active_calls.insert(tool_call_id.clone(), report.clone());
         }
+
+        // ACP requires complete tool call status lifecycle reporting:
+        // 1. Initial tool_call notification with pending status
+        // 2. tool_call_update to in_progress when execution starts
+        // 3. Optional progress updates during long-running operations
+        // 4. Final tool_call_update with completed/failed/cancelled status
+        // 5. Include results/errors in final update content
+        //
+        // Status updates provide transparency and enable client UI updates.
+        
+        // Send initial tool_call notification
+        if let Some(sender) = &self.notification_sender {
+            let notification = agent_client_protocol::SessionNotification {
+                session_id: session_id.clone(),
+                update: agent_client_protocol::SessionUpdate::ToolCall(report.to_acp_tool_call()),
+                meta: None,
+            };
+            
+            if let Err(e) = sender.send_update(notification).await {
+                tracing::warn!(
+                    tool_call_id = %tool_call_id,
+                    session_id = %session_id.0,
+                    error = %e,
+                    "Failed to send initial tool call notification"
+                );
+            }
+        }
         
         report
     }
 
-    /// Update a tracked tool call report
-    pub async fn update_tool_call_report(&self, tool_call_id: &str, update_fn: impl FnOnce(&mut ToolCallReport)) -> Option<ToolCallReport> {
-        let mut active_calls = self.active_tool_calls.write().await;
-        if let Some(report) = active_calls.get_mut(tool_call_id) {
-            update_fn(report);
-            Some(report.clone())
-        } else {
-            None
+    /// Update a tracked tool call report with ACP-compliant session notification
+    pub async fn update_tool_call_report(
+        &self, 
+        session_id: &agent_client_protocol::SessionId,
+        tool_call_id: &str, 
+        update_fn: impl FnOnce(&mut ToolCallReport)
+    ) -> Option<ToolCallReport> {
+        let updated_report = {
+            let mut active_calls = self.active_tool_calls.write().await;
+            if let Some(report) = active_calls.get_mut(tool_call_id) {
+                update_fn(report);
+                Some(report.clone())
+            } else {
+                None
+            }
+        };
+
+        // Send tool_call_update notification for status changes
+        if let Some(report) = &updated_report {
+            if let Some(sender) = &self.notification_sender {
+                let notification = agent_client_protocol::SessionNotification {
+                    session_id: session_id.clone(),
+                    update: agent_client_protocol::SessionUpdate::ToolCallUpdate(report.to_acp_tool_call_update()),
+                    meta: None,
+                };
+                
+                if let Err(e) = sender.send_update(notification).await {
+                    tracing::warn!(
+                        tool_call_id = %tool_call_id,
+                        session_id = %session_id.0,
+                        error = %e,
+                        "Failed to send tool call update notification"
+                    );
+                }
+            }
         }
+
+        updated_report
     }
 
-    /// Complete and remove a tool call from tracking
-    pub async fn complete_tool_call_report(&self, tool_call_id: &str, raw_output: Option<serde_json::Value>) -> Option<ToolCallReport> {
-        let mut active_calls = self.active_tool_calls.write().await;
-        if let Some(mut report) = active_calls.remove(tool_call_id) {
-            report.update_status(ToolCallStatus::Completed);
-            if let Some(output) = raw_output {
-                report.set_raw_output(output);
+    /// Complete and remove a tool call from tracking with ACP-compliant session notification
+    pub async fn complete_tool_call_report(
+        &self, 
+        session_id: &agent_client_protocol::SessionId,
+        tool_call_id: &str, 
+        raw_output: Option<serde_json::Value>
+    ) -> Option<ToolCallReport> {
+        let completed_report = {
+            let mut active_calls = self.active_tool_calls.write().await;
+            if let Some(mut report) = active_calls.remove(tool_call_id) {
+                report.update_status(ToolCallStatus::Completed);
+                if let Some(output) = raw_output {
+                    report.set_raw_output(output);
+                }
+                Some(report)
+            } else {
+                None
             }
-            Some(report)
-        } else {
-            None
+        };
+
+        // Send final tool_call_update notification with completed status and results
+        if let Some(report) = &completed_report {
+            if let Some(sender) = &self.notification_sender {
+                let notification = agent_client_protocol::SessionNotification {
+                    session_id: session_id.clone(),
+                    update: agent_client_protocol::SessionUpdate::ToolCallUpdate(report.to_acp_tool_call_update()),
+                    meta: None,
+                };
+                
+                if let Err(e) = sender.send_update(notification).await {
+                    tracing::warn!(
+                        tool_call_id = %tool_call_id,
+                        session_id = %session_id.0,
+                        error = %e,
+                        "Failed to send tool call completion notification"
+                    );
+                }
+            }
         }
+
+        completed_report
     }
 
-    /// Fail and remove a tool call from tracking  
-    pub async fn fail_tool_call_report(&self, tool_call_id: &str, error_output: Option<serde_json::Value>) -> Option<ToolCallReport> {
-        let mut active_calls = self.active_tool_calls.write().await;
-        if let Some(mut report) = active_calls.remove(tool_call_id) {
-            report.update_status(ToolCallStatus::Failed);
-            if let Some(output) = error_output {
-                report.set_raw_output(output);
+    /// Fail and remove a tool call from tracking with ACP-compliant session notification
+    pub async fn fail_tool_call_report(
+        &self, 
+        session_id: &agent_client_protocol::SessionId,
+        tool_call_id: &str, 
+        error_output: Option<serde_json::Value>
+    ) -> Option<ToolCallReport> {
+        let failed_report = {
+            let mut active_calls = self.active_tool_calls.write().await;
+            if let Some(mut report) = active_calls.remove(tool_call_id) {
+                report.update_status(ToolCallStatus::Failed);
+                if let Some(output) = error_output {
+                    report.set_raw_output(output);
+                }
+                Some(report)
+            } else {
+                None
             }
-            Some(report)
-        } else {
-            None
+        };
+
+        // Send final tool_call_update notification with failed status and error details
+        if let Some(report) = &failed_report {
+            if let Some(sender) = &self.notification_sender {
+                let notification = agent_client_protocol::SessionNotification {
+                    session_id: session_id.clone(),
+                    update: agent_client_protocol::SessionUpdate::ToolCallUpdate(report.to_acp_tool_call_update()),
+                    meta: None,
+                };
+                
+                if let Err(e) = sender.send_update(notification).await {
+                    tracing::warn!(
+                        tool_call_id = %tool_call_id,
+                        session_id = %session_id.0,
+                        error = %e,
+                        "Failed to send tool call failure notification"
+                    );
+                }
+            }
         }
+
+        failed_report
+    }
+
+    /// Cancel and remove a tool call from tracking with ACP-compliant session notification
+    pub async fn cancel_tool_call_report(
+        &self, 
+        session_id: &agent_client_protocol::SessionId,
+        tool_call_id: &str
+    ) -> Option<ToolCallReport> {
+        let cancelled_report = {
+            let mut active_calls = self.active_tool_calls.write().await;
+            if let Some(mut report) = active_calls.remove(tool_call_id) {
+                report.update_status(ToolCallStatus::Cancelled);
+                Some(report)
+            } else {
+                None
+            }
+        };
+
+        // Send final tool_call_update notification with cancelled status
+        if let Some(report) = &cancelled_report {
+            if let Some(sender) = &self.notification_sender {
+                let notification = agent_client_protocol::SessionNotification {
+                    session_id: session_id.clone(),
+                    update: agent_client_protocol::SessionUpdate::ToolCallUpdate(report.to_acp_tool_call_update()),
+                    meta: None,
+                };
+                
+                if let Err(e) = sender.send_update(notification).await {
+                    tracing::warn!(
+                        tool_call_id = %tool_call_id,
+                        session_id = %session_id.0,
+                        error = %e,
+                        "Failed to send tool call cancellation notification"
+                    );
+                }
+            }
+        }
+
+        cancelled_report
     }
 
     /// Create a new tool call handler with MCP manager
@@ -798,6 +481,7 @@ impl ToolCallHandler {
             mcp_manager: Some(mcp_manager),
             client_capabilities: None,
             active_tool_calls: Arc::new(RwLock::new(HashMap::new())),
+            notification_sender: None,
         }
     }
 
@@ -813,6 +497,7 @@ impl ToolCallHandler {
             mcp_manager: Some(mcp_manager),
             client_capabilities: None,
             active_tool_calls: Arc::new(RwLock::new(HashMap::new())),
+            notification_sender: None,
         }
     }
 
@@ -822,6 +507,11 @@ impl ToolCallHandler {
         capabilities: agent_client_protocol::ClientCapabilities,
     ) {
         self.client_capabilities = Some(capabilities);
+    }
+
+    /// Set the notification sender for session updates
+    pub fn set_notification_sender(&mut self, sender: crate::agent::NotificationSender) {
+        self.notification_sender = Some(sender);
     }
 
     /// Check if client has declared the required file system read capability
@@ -873,12 +563,13 @@ impl ToolCallHandler {
     /// Handle an incoming tool request, checking permissions and executing if allowed
     pub async fn handle_tool_request(
         &self,
+        session_id: &agent_client_protocol::SessionId,
         request: InternalToolRequest,
     ) -> crate::Result<ToolCallResult> {
         tracing::info!("Handling tool request: {}", request.name);
 
         // Create tool call report for tracking
-        let tool_report = self.create_tool_call_report(&request.name, &request.arguments).await;
+        let tool_report = self.create_tool_call_report(session_id, &request.name, &request.arguments).await;
         tracing::debug!("Created tool call report: {}", tool_report.tool_call_id);
 
         // Check if permission is required for this tool
@@ -888,7 +579,7 @@ impl ToolCallHandler {
         }
 
         // Update status to in_progress and execute the tool request
-        self.update_tool_call_report(&tool_report.tool_call_id, |report| {
+        self.update_tool_call_report(session_id, &tool_report.tool_call_id, |report| {
             report.update_status(ToolCallStatus::InProgress);
         }).await;
 
@@ -896,6 +587,7 @@ impl ToolCallHandler {
             Ok(response) => {
                 // Complete the tool call with success
                 let completed_report = self.complete_tool_call_report(
+                    session_id,
                     &tool_report.tool_call_id, 
                     Some(serde_json::json!({"response": response}))
                 ).await;
@@ -909,6 +601,7 @@ impl ToolCallHandler {
             Err(e) => {
                 // Fail the tool call with error
                 let failed_report = self.fail_tool_call_report(
+                    session_id,
                     &tool_report.tool_call_id, 
                     Some(serde_json::json!({"error": e.to_string()}))
                 ).await;
@@ -1609,9 +1302,14 @@ mod tests {
         handler
     }
 
+    fn create_test_session_id() -> SessionId {
+        SessionId(std::sync::Arc::from("test_session_123"))
+    }
+
     #[tokio::test]
     async fn test_fs_read_tool() {
         let handler = create_test_handler();
+        let session_id = create_test_session_id();
 
         let request = InternalToolRequest {
             id: "test-id".to_string(),
@@ -1621,7 +1319,7 @@ mod tests {
             }),
         };
 
-        let result = handler.handle_tool_request(request).await;
+        let result = handler.handle_tool_request(&session_id, request).await;
 
         // The file doesn't exist, so we expect an error
         match result {
@@ -1650,6 +1348,7 @@ mod tests {
     #[tokio::test]
     async fn test_permission_required() {
         let handler = create_test_handler();
+        let session_id = create_test_session_id();
 
         let request = InternalToolRequest {
             id: "test-id".to_string(),
@@ -1660,7 +1359,7 @@ mod tests {
             }),
         };
 
-        let result = handler.handle_tool_request(request).await.unwrap();
+        let result = handler.handle_tool_request(&session_id, request).await.unwrap();
 
         match result {
             ToolCallResult::PermissionRequired(perm_req) => {
@@ -1675,6 +1374,7 @@ mod tests {
     #[tokio::test]
     async fn test_path_validation() {
         let handler = create_test_handler();
+        let session_id = create_test_session_id();
 
         let request = InternalToolRequest {
             id: "test-id".to_string(),
@@ -1684,7 +1384,7 @@ mod tests {
             }),
         };
 
-        let result = handler.handle_tool_request(request).await.unwrap();
+        let result = handler.handle_tool_request(&session_id, request).await.unwrap();
 
         match result {
             ToolCallResult::Error(msg) => {
@@ -1853,6 +1553,7 @@ mod tests {
             forbidden_paths: vec![],
         };
         let handler = create_test_handler_with_permissions(permissions);
+        let session_id = create_test_session_id();
 
         // Test write
         let write_request = InternalToolRequest {
@@ -1864,7 +1565,7 @@ mod tests {
             }),
         };
 
-        let write_result = handler.handle_tool_request(write_request).await.unwrap();
+        let write_result = handler.handle_tool_request(&session_id, write_request).await.unwrap();
         match write_result {
             ToolCallResult::Success(msg) => {
                 assert!(msg.contains("Successfully wrote"));
@@ -1882,7 +1583,7 @@ mod tests {
             }),
         };
 
-        let read_result = handler.handle_tool_request(read_request).await.unwrap();
+        let read_result = handler.handle_tool_request(&session_id, read_request).await.unwrap();
         match read_result {
             ToolCallResult::Success(content) => {
                 assert_eq!(content, "Hello, World! This is a test.");
@@ -1909,6 +1610,7 @@ mod tests {
             forbidden_paths: vec![],
         };
         let handler = create_test_handler_with_permissions(permissions);
+        let session_id = create_test_session_id();
 
         let list_request = InternalToolRequest {
             id: "list-test".to_string(),
@@ -1918,7 +1620,7 @@ mod tests {
             }),
         };
 
-        let list_result = handler.handle_tool_request(list_request).await.unwrap();
+        let list_result = handler.handle_tool_request(&session_id, list_request).await.unwrap();
         match list_result {
             ToolCallResult::Success(content) => {
                 assert!(content.contains("Contents of"));
@@ -1939,6 +1641,7 @@ mod tests {
             forbidden_paths: vec![],
         };
         let handler = create_test_handler_with_permissions(permissions);
+        let session_id = create_test_session_id();
 
         // Create terminal
         let create_request = InternalToolRequest {
@@ -1947,7 +1650,7 @@ mod tests {
             arguments: json!({}),
         };
 
-        let create_result = handler.handle_tool_request(create_request).await.unwrap();
+        let create_result = handler.handle_tool_request(&session_id, create_request).await.unwrap();
         let terminal_id = match create_result {
             ToolCallResult::Success(msg) => {
                 assert!(msg.contains("Created terminal session:"));
@@ -1967,7 +1670,7 @@ mod tests {
             }),
         };
 
-        let write_result = handler.handle_tool_request(write_request).await.unwrap();
+        let write_result = handler.handle_tool_request(&session_id, write_request).await.unwrap();
         match write_result {
             ToolCallResult::Success(output) => {
                 assert!(
@@ -1991,6 +1694,7 @@ mod tests {
             forbidden_paths: vec![],
         };
         let handler = create_test_handler_with_permissions(permissions);
+        let session_id = create_test_session_id();
 
         // Create terminal
         let create_request = InternalToolRequest {
@@ -1999,7 +1703,7 @@ mod tests {
             arguments: json!({}),
         };
 
-        let create_result = handler.handle_tool_request(create_request).await.unwrap();
+        let create_result = handler.handle_tool_request(&session_id, create_request).await.unwrap();
         let terminal_id = match create_result {
             ToolCallResult::Success(msg) => msg.split_whitespace().last().unwrap().to_string(),
             _ => panic!("Terminal creation should succeed"),
@@ -2015,7 +1719,7 @@ mod tests {
             }),
         };
 
-        let cd_result = handler.handle_tool_request(cd_request).await.unwrap();
+        let cd_result = handler.handle_tool_request(&session_id, cd_request).await.unwrap();
         match cd_result {
             ToolCallResult::Success(output) => {
                 assert!(output.contains("Changed directory to:"));
@@ -2032,6 +1736,7 @@ mod tests {
             forbidden_paths: vec![],
         };
         let handler = create_test_handler_with_permissions(permissions);
+        let session_id = create_test_session_id();
 
         // Test relative paths are rejected with proper ACP error messages
         let relative_paths = vec![
@@ -2051,7 +1756,7 @@ mod tests {
                 }),
             };
 
-            let result = handler.handle_tool_request(read_request).await.unwrap();
+            let result = handler.handle_tool_request(&session_id, read_request).await.unwrap();
             match result {
                 ToolCallResult::Error(msg) => {
                     // With capability validation now happening first, we expect either:
@@ -2092,6 +1797,7 @@ mod tests {
             forbidden_paths: vec![],
         };
         let handler = create_test_handler_with_permissions(permissions);
+        let session_id = create_test_session_id();
 
         // Test that absolute path is accepted
         let read_request = InternalToolRequest {
@@ -2102,7 +1808,7 @@ mod tests {
             }),
         };
 
-        let result = handler.handle_tool_request(read_request).await.unwrap();
+        let result = handler.handle_tool_request(&session_id, read_request).await.unwrap();
         match result {
             ToolCallResult::Success(content) => {
                 assert_eq!(content, "ACP test content");
@@ -2120,6 +1826,7 @@ mod tests {
             forbidden_paths: vec![],
         };
         let handler = create_test_handler_with_permissions(permissions);
+        let session_id = create_test_session_id();
 
         // Test path traversal attempts are blocked
         let traversal_paths = vec![
@@ -2136,7 +1843,7 @@ mod tests {
                 }),
             };
 
-            let result = handler.handle_tool_request(read_request).await.unwrap();
+            let result = handler.handle_tool_request(&session_id, read_request).await.unwrap();
             match result {
                 ToolCallResult::Error(msg) => {
                     // With capability validation first, we expect either capability errors or path errors
@@ -2163,6 +1870,7 @@ mod tests {
             forbidden_paths: vec![],
         };
         let handler = create_test_handler_with_permissions(permissions);
+        let session_id = create_test_session_id();
 
         // Test that error messages include proper ACP examples
         let read_request = InternalToolRequest {
@@ -2173,7 +1881,7 @@ mod tests {
             }),
         };
 
-        let result = handler.handle_tool_request(read_request).await.unwrap();
+        let result = handler.handle_tool_request(&session_id, read_request).await.unwrap();
         match result {
             ToolCallResult::Error(msg) => {
                 // With capability validation first, we expect either capability errors or path errors
@@ -2362,6 +2070,7 @@ mod tests {
             forbidden_paths: vec![],
         };
         let mut handler = ToolCallHandler::new(permissions);
+        let session_id = create_test_session_id();
         let caps_no_read = agent_client_protocol::ClientCapabilities {
             fs: agent_client_protocol::FileSystemCapability {
                 read_text_file: false,
@@ -2379,7 +2088,7 @@ mod tests {
             arguments: json!({"path": "/test/file.txt"}),
         };
 
-        let result = handler.handle_tool_request(read_request).await.unwrap();
+        let result = handler.handle_tool_request(&session_id, read_request).await.unwrap();
         match result {
             ToolCallResult::Error(msg) => {
                 assert!(msg.contains("fs.read_text_file capability"));
@@ -2398,6 +2107,7 @@ mod tests {
             forbidden_paths: vec![],
         };
         let mut handler = ToolCallHandler::new(permissions);
+        let session_id = create_test_session_id();
         let caps_no_terminal = agent_client_protocol::ClientCapabilities {
             fs: agent_client_protocol::FileSystemCapability {
                 read_text_file: true,
@@ -2415,7 +2125,7 @@ mod tests {
             arguments: json!({}),
         };
 
-        let result = handler.handle_tool_request(terminal_request).await.unwrap();
+        let result = handler.handle_tool_request(&session_id, terminal_request).await.unwrap();
         match result {
             ToolCallResult::Error(msg) => {
                 assert!(msg.contains("terminal capability"));
@@ -2433,6 +2143,7 @@ mod tests {
             forbidden_paths: vec![],
         };
         let mut handler = ToolCallHandler::new(permissions);
+        let session_id = create_test_session_id();
         let caps_enabled = agent_client_protocol::ClientCapabilities {
             fs: agent_client_protocol::FileSystemCapability {
                 read_text_file: true,
@@ -2451,7 +2162,7 @@ mod tests {
             arguments: json!({"path": "/test/file.txt"}),
         };
 
-        let result = handler.handle_tool_request(read_request).await.unwrap();
+        let result = handler.handle_tool_request(&session_id, read_request).await.unwrap();
         if let ToolCallResult::Error(msg) = result {
             // Should be a file I/O error, not a capability error
             assert!(!msg.contains("capability"));
@@ -2465,7 +2176,7 @@ mod tests {
             arguments: json!({}),
         };
 
-        let result = handler.handle_tool_request(terminal_request).await.unwrap();
+        let result = handler.handle_tool_request(&session_id, terminal_request).await.unwrap();
         match result {
             ToolCallResult::Success(msg) => {
                 assert!(msg.contains("Created terminal session"));
@@ -2875,6 +2586,7 @@ mod tests {
             require_permission_for: vec![],
             forbidden_paths: vec![],
         });
+        let session_id = create_test_session_id();
 
         // Test with terminal capability explicitly disabled
         let caps_disabled = agent_client_protocol::ClientCapabilities {
@@ -2895,7 +2607,7 @@ mod tests {
             arguments: json!({}),
         };
 
-        let result = handler.handle_tool_request(terminal_request).await.unwrap();
+        let result = handler.handle_tool_request(&session_id, terminal_request).await.unwrap();
         match result {
             ToolCallResult::Error(msg) => {
                 assert!(msg.contains("Method not supported"));
@@ -2912,7 +2624,7 @@ mod tests {
         });
 
         let result_no_caps = handler_no_caps
-            .handle_tool_request(InternalToolRequest {
+            .handle_tool_request(&session_id, InternalToolRequest {
                 id: "test".to_string(),
                 name: "terminal_create".to_string(),
                 arguments: json!({}),
@@ -3033,9 +2745,10 @@ mod tests {
     #[tokio::test]
     async fn test_tool_call_report_lifecycle() {
         let handler = create_test_handler();
+        let session_id = agent_client_protocol::SessionId("test_session".into());
         
         // Create a tool call report
-        let report = handler.create_tool_call_report("fs_read_text_file", &json!({
+        let report = handler.create_tool_call_report(&session_id, "fs_read_text_file", &json!({
             "path": "/test/file.txt"
         })).await;
         
@@ -3046,7 +2759,7 @@ mod tests {
         assert!(report.raw_output.is_none());
         
         // Update the report status
-        let updated = handler.update_tool_call_report(&report.tool_call_id, |r| {
+        let updated = handler.update_tool_call_report(&session_id, &report.tool_call_id, |r| {
             r.update_status(ToolCallStatus::InProgress);
             r.add_content(ToolCallContent::Content {
                 content: agent_client_protocol::ContentBlock::Text(
@@ -3066,6 +2779,7 @@ mod tests {
         
         // Complete the tool call
         let completed = handler.complete_tool_call_report(
+            &session_id,
             &report.tool_call_id,
             Some(json!({"content": "file contents"}))
         ).await;
@@ -3076,7 +2790,7 @@ mod tests {
         assert!(completed.raw_output.is_some());
         
         // Try to update a completed (removed) tool call - should return None
-        let not_found = handler.update_tool_call_report(&report.tool_call_id, |r| {
+        let not_found = handler.update_tool_call_report(&session_id, &report.tool_call_id, |r| {
             r.update_status(ToolCallStatus::Failed);
         }).await;
         
@@ -3086,15 +2800,17 @@ mod tests {
     #[tokio::test]
     async fn test_tool_call_report_failure() {
         let handler = create_test_handler();
+        let session_id = agent_client_protocol::SessionId("test_session".into());
         
         // Create a tool call report
-        let report = handler.create_tool_call_report("fs_write_text_file", &json!({
+        let report = handler.create_tool_call_report(&session_id, "fs_write_text_file", &json!({
             "path": "/readonly/file.txt",
             "content": "test"
         })).await;
         
         // Fail the tool call
         let failed = handler.fail_tool_call_report(
+            &session_id,
             &report.tool_call_id,
             Some(json!({"error": "Permission denied", "code": "EACCES"}))
         ).await;

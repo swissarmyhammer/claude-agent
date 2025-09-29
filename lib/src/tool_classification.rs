@@ -4,7 +4,7 @@
 //! human-readable titles based on tool names and parameters.
 
 use crate::tool_types::{ToolKind, ToolCallReport};
-use serde_json::Value;
+
 
 impl ToolKind {
     /// Classify a tool by its name and parameters to determine the appropriate kind

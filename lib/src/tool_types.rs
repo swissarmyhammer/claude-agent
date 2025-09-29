@@ -47,6 +47,8 @@ pub enum ToolCallStatus {
     Completed,
     /// The tool call failed with an error
     Failed,
+    /// The tool call was cancelled before completion
+    Cancelled,
 }
 
 /// Content produced by a tool call execution
@@ -159,5 +161,106 @@ impl ToolCallReport {
     /// Set the raw output for this tool call
     pub fn set_raw_output(&mut self, output: serde_json::Value) {
         self.raw_output = Some(output);
+    }
+
+    /// Convert to agent_client_protocol::ToolCall for session notifications
+    pub fn to_acp_tool_call(&self) -> agent_client_protocol::ToolCall {
+        agent_client_protocol::ToolCall {
+            id: agent_client_protocol::ToolCallId(self.tool_call_id.clone().into()),
+            title: self.title.clone(),
+            kind: self.kind.to_acp_kind(),
+            status: self.status.to_acp_status(),
+            content: self.content.iter().map(|c| c.to_acp_content()).collect(),
+            locations: self.locations.iter().map(|l| l.to_acp_location()).collect(),
+            raw_input: self.raw_input.clone(),
+            raw_output: self.raw_output.clone(),
+            meta: None,
+        }
+    }
+
+    /// Convert to agent_client_protocol::ToolCallUpdate for status updates
+    pub fn to_acp_tool_call_update(&self) -> agent_client_protocol::ToolCallUpdate {
+        agent_client_protocol::ToolCallUpdate {
+            id: agent_client_protocol::ToolCallId(self.tool_call_id.clone().into()),
+            fields: agent_client_protocol::ToolCallUpdateFields {
+                kind: Some(self.kind.to_acp_kind()),
+                status: Some(self.status.to_acp_status()),
+                title: Some(self.title.clone()),
+                content: Some(self.content.iter().map(|c| c.to_acp_content()).collect()),
+                locations: Some(self.locations.iter().map(|l| l.to_acp_location()).collect()),
+                raw_input: self.raw_input.clone(),
+                raw_output: self.raw_output.clone(),
+            },
+            meta: None,
+        }
+    }
+}
+
+impl ToolKind {
+    /// Convert to agent_client_protocol::ToolKind
+    pub fn to_acp_kind(&self) -> agent_client_protocol::ToolKind {
+        match self {
+            ToolKind::Read => agent_client_protocol::ToolKind::Read,
+            ToolKind::Edit => agent_client_protocol::ToolKind::Edit,
+            ToolKind::Delete => agent_client_protocol::ToolKind::Delete,
+            ToolKind::Move => agent_client_protocol::ToolKind::Move,
+            ToolKind::Search => agent_client_protocol::ToolKind::Search,
+            ToolKind::Execute => agent_client_protocol::ToolKind::Execute,
+            ToolKind::Think => agent_client_protocol::ToolKind::Think,
+            ToolKind::Fetch => agent_client_protocol::ToolKind::Fetch,
+            ToolKind::Other => agent_client_protocol::ToolKind::Other,
+        }
+    }
+}
+
+impl ToolCallStatus {
+    /// Convert to agent_client_protocol::ToolCallStatus
+    pub fn to_acp_status(&self) -> agent_client_protocol::ToolCallStatus {
+        match self {
+            ToolCallStatus::Pending => agent_client_protocol::ToolCallStatus::Pending,
+            ToolCallStatus::InProgress => agent_client_protocol::ToolCallStatus::InProgress,
+            ToolCallStatus::Completed => agent_client_protocol::ToolCallStatus::Completed,
+            ToolCallStatus::Failed => agent_client_protocol::ToolCallStatus::Failed,
+            // ACP doesn't have Cancelled status, map to Failed
+            ToolCallStatus::Cancelled => agent_client_protocol::ToolCallStatus::Failed,
+        }
+    }
+}
+
+impl ToolCallContent {
+    /// Convert to agent_client_protocol::ToolCallContent
+    pub fn to_acp_content(&self) -> agent_client_protocol::ToolCallContent {
+        match self {
+            ToolCallContent::Content { content } => {
+                agent_client_protocol::ToolCallContent::Content { content: content.clone() }
+            }
+            ToolCallContent::Diff { path, old_text, new_text } => {
+                // ACP expects a diff field with a Diff struct
+                agent_client_protocol::ToolCallContent::Diff {
+                    diff: agent_client_protocol::Diff {
+                        path: path.clone().into(),
+                        old_text: old_text.clone(),
+                        new_text: new_text.clone(),
+                        meta: None,
+                    }
+                }
+            }
+            ToolCallContent::Terminal { terminal_id } => {
+                agent_client_protocol::ToolCallContent::Terminal {
+                    terminal_id: agent_client_protocol::TerminalId(terminal_id.clone().into()),
+                }
+            }
+        }
+    }
+}
+
+impl ToolCallLocation {
+    /// Convert to agent_client_protocol::ToolCallLocation
+    pub fn to_acp_location(&self) -> agent_client_protocol::ToolCallLocation {
+        agent_client_protocol::ToolCallLocation {
+            path: self.path.clone().into(),
+            line: self.line.map(|l| l as u32),
+            meta: None,
+        }
     }
 }
