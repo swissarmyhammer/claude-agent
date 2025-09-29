@@ -53,11 +53,12 @@
 //! These errors are mapped to appropriate JSON-RPC error codes for client communication.
 
 use crate::path_validator::{PathValidationError, PathValidator};
+use crate::terminal_manager::{TerminalManager, TerminalSession, TerminalCreateParams, EnvVariable, TerminalCreateResponse};
+use crate::tool_types::{ToolKind, ToolCallStatus, ToolCallContent, ToolCallLocation, ToolCallReport};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
 
 /// Internal representation of a tool request from an LLM
@@ -71,70 +72,141 @@ pub struct InternalToolRequest {
     pub arguments: Value,
 }
 
-/// Manages terminal sessions for command execution
-#[derive(Debug, Clone)]
-pub struct TerminalManager {
-    terminals: Arc<RwLock<HashMap<String, TerminalSession>>>,
+
+
+
+
+
+
+/// Tool call classification system for mapping tool names to kinds
+impl ToolKind {
+    /// Classify a tool by its name and parameters to determine the appropriate kind
+    pub fn classify_tool(tool_name: &str, _arguments: &serde_json::Value) -> Self {
+        // ACP requires comprehensive tool call reporting with rich metadata:
+        // 1. toolCallId: Unique identifier for correlation across updates
+        // 2. title: Human-readable description of tool operation
+        // 3. kind: Classification for UI optimization and icon selection
+        // 4. status: Lifecycle state (pending, in_progress, completed, failed)
+        // 5. content: Output content produced by tool execution
+        // 6. locations: File paths for follow-along features
+        // 7. rawInput/rawOutput: Detailed I/O data for debugging
+        //
+        // Complete reporting enables rich client experiences and debugging.
+
+        match tool_name {
+            // File system read operations
+            "fs_read_text_file" | "fs_read" | "read_file" => ToolKind::Read,
+            
+            // File system write and modification operations
+            "fs_write_text_file" | "fs_write" | "write_file" | "fs_edit" | "edit_file" => ToolKind::Edit,
+            
+            // File deletion operations
+            "fs_delete" | "delete_file" | "remove_file" => ToolKind::Delete,
+            
+            // File move and rename operations  
+            "fs_move" | "move_file" | "rename_file" => ToolKind::Move,
+            
+            // Search and grep operations
+            "fs_search" | "search" | "grep" | "find" => ToolKind::Search,
+            
+            // Terminal and command execution
+            "terminal_create" | "terminal_write" | "terminal_read" | "execute" | "run" => ToolKind::Execute,
+            
+            // External data fetching
+            "fetch" | "http_get" | "download" | "curl" | "wget" => ToolKind::Fetch,
+            
+            // MCP tools - classify by prefix pattern
+            tool if tool.contains("mcp__") => {
+                if tool.contains("read") || tool.contains("get") || tool.contains("show") || tool.contains("list") {
+                    ToolKind::Read
+                } else if tool.contains("write") || tool.contains("create") || tool.contains("edit") || tool.contains("update") {
+                    ToolKind::Edit  
+                } else if tool.contains("delete") || tool.contains("remove") {
+                    ToolKind::Delete
+                } else if tool.contains("search") || tool.contains("grep") || tool.contains("find") {
+                    ToolKind::Search
+                } else if tool.contains("execute") || tool.contains("shell") || tool.contains("terminal") {
+                    ToolKind::Execute
+                } else if tool.contains("fetch") || tool.contains("web") || tool.contains("http") {
+                    ToolKind::Fetch
+                } else {
+                    ToolKind::Other
+                }
+            }
+            
+            // Default fallback for unknown tools
+            _ => ToolKind::Other,
+        }
+    }
 }
 
-/// Represents a terminal session with working directory and environment
-#[derive(Debug)]
-pub struct TerminalSession {
-    process: Option<Child>,
-    working_dir: std::path::PathBuf,
-    environment: HashMap<String, String>,
-    // ACP-compliant fields for terminal/create method
-    pub command: Option<String>,
-    pub args: Vec<String>,
-    pub session_id: Option<String>,
-    pub output_byte_limit: u64,
-    pub output_buffer: Vec<u8>,
-    pub buffer_truncated: bool,
-}
-
-/// ACP-compliant request parameters for terminal/create method
-///
-/// This struct defines all the parameters needed to create a new terminal session
-/// following the Anthropic Computer Protocol (ACP) specification.
-#[derive(Debug, Deserialize)]
-pub struct TerminalCreateParams {
-    /// Session identifier that must exist and be a valid ULID format
-    #[serde(rename = "sessionId")]
-    pub session_id: String,
-    /// Command to execute in the terminal (e.g., "bash", "python", "echo")
-    pub command: String,
-    /// Optional command line arguments as a vector of strings
-    pub args: Option<Vec<String>>,
-    /// Optional environment variables to set for the terminal session
-    pub env: Option<Vec<EnvVariable>>,
-    /// Optional working directory path (must be absolute if provided)
-    pub cwd: Option<String>,
-    /// Optional byte limit for terminal output buffering (defaults to system limit)
-    #[serde(rename = "outputByteLimit")]
-    pub output_byte_limit: Option<u64>,
-}
-
-/// Environment variable specification for terminal creation
-///
-/// Represents a single environment variable to be set in the terminal session.
-/// Environment variables override system defaults when names conflict.
-#[derive(Debug, Deserialize)]
-pub struct EnvVariable {
-    /// Environment variable name (cannot be empty)
-    pub name: String,
-    /// Environment variable value
-    pub value: String,
-}
-
-/// ACP-compliant response for terminal/create method
-///
-/// Returns the unique identifier for the newly created terminal session.
-/// This terminal ID can be used for subsequent terminal operations.
-#[derive(Debug, Serialize)]
-pub struct TerminalCreateResponse {
-    /// Unique terminal identifier (ULID format)
-    #[serde(rename = "terminalId")]
-    pub terminal_id: String,
+/// Tool title generation system for human-readable descriptions
+impl ToolCallReport {
+    /// Generate a context-aware human-readable title based on tool name and parameters
+    pub fn generate_title(tool_name: &str, arguments: &serde_json::Value) -> String {
+        match tool_name {
+            "fs_read_text_file" | "fs_read" => {
+                if let Some(path) = arguments.get("path").and_then(|v| v.as_str()) {
+                    format!("Reading {}", std::path::Path::new(path).file_name()
+                        .and_then(|n| n.to_str()).unwrap_or(path))
+                } else {
+                    "Reading file".to_string()
+                }
+            }
+            "fs_write_text_file" | "fs_write" => {
+                if let Some(path) = arguments.get("path").and_then(|v| v.as_str()) {
+                    format!("Writing to {}", std::path::Path::new(path).file_name()
+                        .and_then(|n| n.to_str()).unwrap_or(path))
+                } else {
+                    "Writing file".to_string()
+                }
+            }
+            "terminal_create" => {
+                if let Some(command) = arguments.get("command").and_then(|v| v.as_str()) {
+                    format!("Running {}", command)
+                } else {
+                    "Creating terminal session".to_string()
+                }
+            }
+            "fs_delete" => {
+                if let Some(path) = arguments.get("path").and_then(|v| v.as_str()) {
+                    format!("Deleting {}", std::path::Path::new(path).file_name()
+                        .and_then(|n| n.to_str()).unwrap_or(path))
+                } else {
+                    "Deleting file".to_string()
+                }
+            }
+            "search" | "grep" => {
+                if let Some(pattern) = arguments.get("pattern").and_then(|v| v.as_str()) {
+                    format!("Searching for '{}'", pattern)
+                } else {
+                    "Searching files".to_string()
+                }
+            }
+            // MCP tools - generate titles based on tool name and parameters
+            tool if tool.starts_with("mcp__") => {
+                let clean_name = tool.strip_prefix("mcp__")
+                    .unwrap_or(tool)
+                    .replace('_', " ");
+                
+                // Capitalize first letter
+                let mut chars = clean_name.chars();
+                match chars.next() {
+                    None => tool.to_string(),
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                }
+            }
+            // Default case - convert snake_case to Title Case
+            _ => {
+                let clean_name = tool_name.replace('_', " ");
+                let mut chars = clean_name.chars();
+                match chars.next() {
+                    None => "Unknown tool".to_string(),
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                }
+            }
+        }
+    }
 }
 
 /// Handles tool request execution with permission management and security validation
@@ -145,6 +217,8 @@ pub struct ToolCallHandler {
     mcp_manager: Option<Arc<crate::mcp::McpServerManager>>,
     /// Client capabilities negotiated during initialization - required for ACP compliance
     client_capabilities: Option<agent_client_protocol::ClientCapabilities>,
+    /// Active tool calls tracked by unique ID for session-scoped correlation
+    active_tool_calls: Arc<RwLock<HashMap<String, ToolCallReport>>>,
 }
 
 /// Configuration for tool permissions and security policies
@@ -601,6 +675,7 @@ impl ToolCallHandler {
             terminal_manager: Arc::new(TerminalManager::new()),
             mcp_manager: None,
             client_capabilities: None,
+            active_tool_calls: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -614,6 +689,101 @@ impl ToolCallHandler {
             terminal_manager,
             mcp_manager: None,
             client_capabilities: None,
+            active_tool_calls: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Generate a unique tool call ID using ULID with collision detection
+    pub async fn generate_tool_call_id(&self) -> String {
+        let mut attempt = 0;
+        const MAX_ATTEMPTS: u32 = 10;
+
+        loop {
+            let id = format!("call_{}", ulid::Ulid::new());
+            
+            // Check for collision in active tool calls
+            {
+                let active_calls = self.active_tool_calls.read().await;
+                if !active_calls.contains_key(&id) {
+                    return id;
+                }
+            }
+
+            attempt += 1;
+            if attempt >= MAX_ATTEMPTS {
+                // Fallback with timestamp and random component for extremely rare collision cases
+                return format!("call_{}_{}", 
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos(),
+                    ulid::Ulid::new()
+                );
+            }
+            
+            // Short delay before retry (should be extremely rare)
+            tokio::time::sleep(tokio::time::Duration::from_nanos(1)).await;
+        }
+    }
+
+    /// Create and track a new tool call report
+    pub async fn create_tool_call_report(
+        &self,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> ToolCallReport {
+        let tool_call_id = self.generate_tool_call_id().await;
+        let title = ToolCallReport::generate_title(tool_name, arguments);
+        let kind = ToolKind::classify_tool(tool_name, arguments);
+        
+        let mut report = ToolCallReport::new(tool_call_id.clone(), title, kind);
+        report.set_raw_input(arguments.clone());
+        
+        // Track the active tool call
+        {
+            let mut active_calls = self.active_tool_calls.write().await;
+            active_calls.insert(tool_call_id.clone(), report.clone());
+        }
+        
+        report
+    }
+
+    /// Update a tracked tool call report
+    pub async fn update_tool_call_report(&self, tool_call_id: &str, update_fn: impl FnOnce(&mut ToolCallReport)) -> Option<ToolCallReport> {
+        let mut active_calls = self.active_tool_calls.write().await;
+        if let Some(report) = active_calls.get_mut(tool_call_id) {
+            update_fn(report);
+            Some(report.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Complete and remove a tool call from tracking
+    pub async fn complete_tool_call_report(&self, tool_call_id: &str, raw_output: Option<serde_json::Value>) -> Option<ToolCallReport> {
+        let mut active_calls = self.active_tool_calls.write().await;
+        if let Some(mut report) = active_calls.remove(tool_call_id) {
+            report.update_status(ToolCallStatus::Completed);
+            if let Some(output) = raw_output {
+                report.set_raw_output(output);
+            }
+            Some(report)
+        } else {
+            None
+        }
+    }
+
+    /// Fail and remove a tool call from tracking  
+    pub async fn fail_tool_call_report(&self, tool_call_id: &str, error_output: Option<serde_json::Value>) -> Option<ToolCallReport> {
+        let mut active_calls = self.active_tool_calls.write().await;
+        if let Some(mut report) = active_calls.remove(tool_call_id) {
+            report.update_status(ToolCallStatus::Failed);
+            if let Some(output) = error_output {
+                report.set_raw_output(output);
+            }
+            Some(report)
+        } else {
+            None
         }
     }
 
@@ -627,6 +797,7 @@ impl ToolCallHandler {
             terminal_manager: Arc::new(TerminalManager::new()),
             mcp_manager: Some(mcp_manager),
             client_capabilities: None,
+            active_tool_calls: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -641,6 +812,7 @@ impl ToolCallHandler {
             terminal_manager,
             mcp_manager: Some(mcp_manager),
             client_capabilities: None,
+            active_tool_calls: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -705,16 +877,48 @@ impl ToolCallHandler {
     ) -> crate::Result<ToolCallResult> {
         tracing::info!("Handling tool request: {}", request.name);
 
+        // Create tool call report for tracking
+        let tool_report = self.create_tool_call_report(&request.name, &request.arguments).await;
+        tracing::debug!("Created tool call report: {}", tool_report.tool_call_id);
+
         // Check if permission is required for this tool
         if self.requires_permission(&request.name) {
             let permission_request = self.create_permission_request(&request)?;
             return Ok(ToolCallResult::PermissionRequired(permission_request));
         }
 
-        // Execute the tool request
+        // Update status to in_progress and execute the tool request
+        self.update_tool_call_report(&tool_report.tool_call_id, |report| {
+            report.update_status(ToolCallStatus::InProgress);
+        }).await;
+
         match self.execute_tool_request(&request).await {
-            Ok(response) => Ok(ToolCallResult::Success(response)),
-            Err(e) => Ok(ToolCallResult::Error(e.to_string())),
+            Ok(response) => {
+                // Complete the tool call with success
+                let completed_report = self.complete_tool_call_report(
+                    &tool_report.tool_call_id, 
+                    Some(serde_json::json!({"response": response}))
+                ).await;
+                
+                if let Some(report) = completed_report {
+                    tracing::debug!("Completed tool call: {} with status {:?}", report.tool_call_id, report.status);
+                }
+                
+                Ok(ToolCallResult::Success(response))
+            },
+            Err(e) => {
+                // Fail the tool call with error
+                let failed_report = self.fail_tool_call_report(
+                    &tool_report.tool_call_id, 
+                    Some(serde_json::json!({"error": e.to_string()}))
+                ).await;
+                
+                if let Some(report) = failed_report {
+                    tracing::debug!("Failed tool call: {} with error: {}", report.tool_call_id, e);
+                }
+                
+                Ok(ToolCallResult::Error(e.to_string()))
+            },
         }
     }
 
@@ -2722,6 +2926,261 @@ mod tests {
                 assert!(msg.contains("clientCapabilities.terminal = true"));
             }
             _ => panic!("Expected error for missing client capabilities"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_kind_classification() {
+        // Test file system operations
+        assert_eq!(ToolKind::classify_tool("fs_read_text_file", &json!({})), ToolKind::Read);
+        assert_eq!(ToolKind::classify_tool("fs_write_text_file", &json!({})), ToolKind::Edit);
+        assert_eq!(ToolKind::classify_tool("fs_delete", &json!({})), ToolKind::Delete);
+        assert_eq!(ToolKind::classify_tool("fs_move", &json!({})), ToolKind::Move);
+        
+        // Test terminal operations
+        assert_eq!(ToolKind::classify_tool("terminal_create", &json!({})), ToolKind::Execute);
+        assert_eq!(ToolKind::classify_tool("execute", &json!({})), ToolKind::Execute);
+        
+        // Test search operations
+        assert_eq!(ToolKind::classify_tool("search", &json!({})), ToolKind::Search);
+        assert_eq!(ToolKind::classify_tool("grep", &json!({})), ToolKind::Search);
+        
+        // Test fetch operations
+        assert_eq!(ToolKind::classify_tool("fetch", &json!({})), ToolKind::Fetch);
+        assert_eq!(ToolKind::classify_tool("http_get", &json!({})), ToolKind::Fetch);
+        
+        // Test MCP tool classification
+        assert_eq!(ToolKind::classify_tool("mcp__files_read", &json!({})), ToolKind::Read);
+        assert_eq!(ToolKind::classify_tool("mcp__files_write", &json!({})), ToolKind::Edit);
+        assert_eq!(ToolKind::classify_tool("mcp__shell_execute", &json!({})), ToolKind::Execute);
+        assert_eq!(ToolKind::classify_tool("mcp__web_fetch", &json!({})), ToolKind::Fetch);
+        
+        // Test default fallback
+        assert_eq!(ToolKind::classify_tool("unknown_tool", &json!({})), ToolKind::Other);
+    }
+
+    #[tokio::test]
+    async fn test_tool_title_generation() {
+        // Test file operations with paths
+        let title = ToolCallReport::generate_title("fs_read_text_file", &json!({
+            "path": "/home/user/config.json"
+        }));
+        assert_eq!(title, "Reading config.json");
+
+        let title = ToolCallReport::generate_title("fs_write_text_file", &json!({
+            "path": "/var/log/app.log"
+        }));
+        assert_eq!(title, "Writing to app.log");
+
+        // Test terminal operations
+        let title = ToolCallReport::generate_title("terminal_create", &json!({
+            "command": "ls"
+        }));
+        assert_eq!(title, "Running ls");
+
+        // Test search operations
+        let title = ToolCallReport::generate_title("search", &json!({
+            "pattern": "error.*log"
+        }));
+        assert_eq!(title, "Searching for 'error.*log'");
+
+        // Test MCP tools
+        let title = ToolCallReport::generate_title("mcp__files_read", &json!({}));
+        assert_eq!(title, "Files read");
+
+        // Test fallback for unknown tools
+        let title = ToolCallReport::generate_title("unknown_tool", &json!({}));
+        assert_eq!(title, "Unknown tool");
+
+        // Test snake_case conversion
+        let title = ToolCallReport::generate_title("create_backup_file", &json!({}));
+        assert_eq!(title, "Create backup file");
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_id_generation() {
+        let handler = create_test_handler();
+        
+        // Test unique ID generation
+        let id1 = handler.generate_tool_call_id().await;
+        let id2 = handler.generate_tool_call_id().await;
+        
+        assert_ne!(id1, id2);
+        assert!(id1.starts_with("call_"));
+        assert!(id2.starts_with("call_"));
+        
+        // IDs should be ULID format after the prefix
+        let ulid_part1 = id1.strip_prefix("call_").unwrap();
+        let ulid_part2 = id2.strip_prefix("call_").unwrap();
+        
+        assert_eq!(ulid_part1.len(), 26); // ULID length
+        assert_eq!(ulid_part2.len(), 26);
+        
+        // Test multiple concurrent ID generations don't collide
+        let mut ids = Vec::new();
+        for _ in 0..10 {
+            ids.push(handler.generate_tool_call_id().await);
+        }
+        
+        // Check all IDs are unique
+        for i in 0..ids.len() {
+            for j in i+1..ids.len() {
+                assert_ne!(ids[i], ids[j], "Found duplicate IDs: {} and {}", ids[i], ids[j]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_report_lifecycle() {
+        let handler = create_test_handler();
+        
+        // Create a tool call report
+        let report = handler.create_tool_call_report("fs_read_text_file", &json!({
+            "path": "/test/file.txt"
+        })).await;
+        
+        assert_eq!(report.status, ToolCallStatus::Pending);
+        assert_eq!(report.kind, ToolKind::Read);
+        assert_eq!(report.title, "Reading file.txt");
+        assert!(report.raw_input.is_some());
+        assert!(report.raw_output.is_none());
+        
+        // Update the report status
+        let updated = handler.update_tool_call_report(&report.tool_call_id, |r| {
+            r.update_status(ToolCallStatus::InProgress);
+            r.add_content(ToolCallContent::Content {
+                content: agent_client_protocol::ContentBlock::Text(
+                    agent_client_protocol::TextContent {
+                        text: "Reading file...".to_string(),
+                        annotations: None,
+                        meta: None,
+                    }
+                ),
+            });
+        }).await;
+        
+        assert!(updated.is_some());
+        let updated = updated.unwrap();
+        assert_eq!(updated.status, ToolCallStatus::InProgress);
+        assert_eq!(updated.content.len(), 1);
+        
+        // Complete the tool call
+        let completed = handler.complete_tool_call_report(
+            &report.tool_call_id,
+            Some(json!({"content": "file contents"}))
+        ).await;
+        
+        assert!(completed.is_some());
+        let completed = completed.unwrap();
+        assert_eq!(completed.status, ToolCallStatus::Completed);
+        assert!(completed.raw_output.is_some());
+        
+        // Try to update a completed (removed) tool call - should return None
+        let not_found = handler.update_tool_call_report(&report.tool_call_id, |r| {
+            r.update_status(ToolCallStatus::Failed);
+        }).await;
+        
+        assert!(not_found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_report_failure() {
+        let handler = create_test_handler();
+        
+        // Create a tool call report
+        let report = handler.create_tool_call_report("fs_write_text_file", &json!({
+            "path": "/readonly/file.txt",
+            "content": "test"
+        })).await;
+        
+        // Fail the tool call
+        let failed = handler.fail_tool_call_report(
+            &report.tool_call_id,
+            Some(json!({"error": "Permission denied", "code": "EACCES"}))
+        ).await;
+        
+        assert!(failed.is_some());
+        let failed = failed.unwrap();
+        assert_eq!(failed.status, ToolCallStatus::Failed);
+        assert!(failed.raw_output.is_some());
+        
+        if let Some(output) = failed.raw_output {
+            assert!(output["error"].as_str().unwrap().contains("Permission denied"));
+            assert_eq!(output["code"], "EACCES");
+        }
+    }
+
+    #[tokio::test] 
+    async fn test_tool_call_locations_and_content() {
+        let mut report = ToolCallReport::new(
+            "call_test123".to_string(),
+            "Test operation".to_string(), 
+            ToolKind::Edit
+        );
+        
+        // Add file locations
+        report.add_location(ToolCallLocation {
+            path: "/home/user/src/main.rs".to_string(),
+            line: Some(42),
+        });
+        
+        report.add_location(ToolCallLocation {
+            path: "/home/user/src/lib.rs".to_string(),
+            line: None,
+        });
+        
+        // Add different types of content
+        report.add_content(ToolCallContent::Content {
+            content: agent_client_protocol::ContentBlock::Text(
+                agent_client_protocol::TextContent {
+                    text: "Operation completed".to_string(),
+                    annotations: None,
+                    meta: None,
+                }
+            ),
+        });
+        
+        report.add_content(ToolCallContent::Diff {
+            path: "/home/user/src/main.rs".to_string(),
+            old_text: Some("fn old() {}".to_string()),
+            new_text: "fn new() {}".to_string(),
+        });
+        
+        report.add_content(ToolCallContent::Terminal {
+            terminal_id: "term_abc123".to_string(),
+        });
+        
+        assert_eq!(report.locations.len(), 2);
+        assert_eq!(report.content.len(), 3);
+        assert_eq!(report.locations[0].line, Some(42));
+        assert_eq!(report.locations[1].line, None);
+        
+        // Test content types
+        match &report.content[0] {
+            ToolCallContent::Content { content } => {
+                if let agent_client_protocol::ContentBlock::Text(text) = content {
+                    assert_eq!(text.text, "Operation completed");
+                } else {
+                    panic!("Expected text content");
+                }
+            },
+            _ => panic!("Expected content type"),
+        }
+        
+        match &report.content[1] {
+            ToolCallContent::Diff { path, old_text, new_text } => {
+                assert_eq!(path, "/home/user/src/main.rs");
+                assert_eq!(old_text.as_ref().unwrap(), "fn old() {}");
+                assert_eq!(new_text, "fn new() {}");
+            },
+            _ => panic!("Expected diff content"),
+        }
+        
+        match &report.content[2] {
+            ToolCallContent::Terminal { terminal_id } => {
+                assert_eq!(terminal_id, "term_abc123");
+            },
+            _ => panic!("Expected terminal content"),
         }
     }
 }

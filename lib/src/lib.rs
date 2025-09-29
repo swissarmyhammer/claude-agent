@@ -22,6 +22,9 @@ pub mod session;
 pub mod session_errors;
 pub mod session_loading;
 pub mod session_validation;
+pub mod terminal_manager;
+pub mod tool_classification;
+pub mod tool_types;
 pub mod tools;
 
 pub use agent::ClaudeAgent;
