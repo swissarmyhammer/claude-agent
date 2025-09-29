@@ -135,6 +135,28 @@ pub struct ReadTextFileResponse {
     pub content: String,
 }
 
+/// Parameters for the ACP fs/write_text_file method
+///
+/// ACP fs/write_text_file method implementation:
+/// 1. sessionId: Required - validate against active sessions
+/// 2. path: Required - must be absolute path
+/// 3. content: Required - text content to write
+/// 4. MUST create file if it doesn't exist per ACP specification
+/// 5. MUST create parent directories if needed
+/// 6. Response: null result on success
+///
+/// Uses atomic write operations to ensure file integrity.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WriteTextFileParams {
+    /// Session ID for validation
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    /// Absolute path to the file to write
+    pub path: String,
+    /// Text content to write to the file
+    pub content: String,
+}
+
 use tokio::sync::{broadcast, RwLock};
 use tokio_stream::StreamExt;
 
@@ -1281,7 +1303,11 @@ impl ClaudeAgent {
                 "Claude refused to respond in streaming for session: {}",
                 session_id
             );
-            return Ok(self.create_refusal_response(&session_id.to_string(), true, Some(chunk_count)));
+            return Ok(self.create_refusal_response(
+                &session_id.to_string(),
+                true,
+                Some(chunk_count),
+            ));
         }
 
         tracing::info!("Completed streaming response with {} chunks", chunk_count);
@@ -1614,7 +1640,12 @@ impl ClaudeAgent {
     ///
     /// Returns a PromptResponse with StopReason::Refusal and appropriate metadata
     /// when Claude refuses to respond to a request.
-    fn create_refusal_response(&self, session_id: &str, is_streaming: bool, chunk_count: Option<usize>) -> PromptResponse {
+    fn create_refusal_response(
+        &self,
+        session_id: &str,
+        is_streaming: bool,
+        chunk_count: Option<usize>,
+    ) -> PromptResponse {
         let mut meta = serde_json::json!({
             "refusal_detected": true,
             "session_id": session_id
@@ -1623,7 +1654,8 @@ impl ClaudeAgent {
         if is_streaming {
             meta["streaming"] = serde_json::Value::Bool(true);
             if let Some(count) = chunk_count {
-                meta["chunks_processed"] = serde_json::Value::Number(serde_json::Number::from(count));
+                meta["chunks_processed"] =
+                    serde_json::Value::Number(serde_json::Number::from(count));
             }
         }
 
@@ -2665,7 +2697,9 @@ impl Agent for ClaudeAgent {
                         return Err(agent_client_protocol::Error::invalid_params());
                     }
                     None => {
-                        tracing::error!("No client capabilities available for fs/read_text_file validation");
+                        tracing::error!(
+                            "No client capabilities available for fs/read_text_file validation"
+                        );
                         return Err(agent_client_protocol::Error::invalid_params());
                     }
                 }
@@ -2678,14 +2712,61 @@ impl Agent for ClaudeAgent {
                     agent_client_protocol::Error::invalid_params()
                 })?;
 
-            let params: ReadTextFileParams = serde_json::from_value(params_value)
-                .map_err(|e| {
-                    tracing::error!("Failed to deserialize fs/read_text_file parameters: {}", e);
-                    agent_client_protocol::Error::invalid_params()
-                })?;
+            let params: ReadTextFileParams = serde_json::from_value(params_value).map_err(|e| {
+                tracing::error!("Failed to deserialize fs/read_text_file parameters: {}", e);
+                agent_client_protocol::Error::invalid_params()
+            })?;
 
             // Handle the file reading request
             let response = self.handle_read_text_file(params).await?;
+
+            // Convert response to RawValue
+            let response_json = serde_json::to_value(response)
+                .map_err(|_e| agent_client_protocol::Error::internal_error())?;
+
+            let raw_value = RawValue::from_string(response_json.to_string())
+                .map_err(|_e| agent_client_protocol::Error::internal_error())?;
+
+            return Ok(Arc::from(raw_value));
+        }
+
+        // Handle fs/write_text_file extension method
+        if request.method == "fs/write_text_file".into() {
+            // Validate client capabilities for file system write operations
+            {
+                let client_caps = self.client_capabilities.read().await;
+                match &*client_caps {
+                    Some(caps) if caps.fs.write_text_file => {
+                        tracing::debug!("File system write capability validated");
+                    }
+                    Some(_) => {
+                        tracing::error!("fs/write_text_file capability not declared by client");
+                        return Err(agent_client_protocol::Error::invalid_params());
+                    }
+                    None => {
+                        tracing::error!(
+                            "No client capabilities available for fs/write_text_file validation"
+                        );
+                        return Err(agent_client_protocol::Error::invalid_params());
+                    }
+                }
+            }
+
+            // Parse the request parameters from RawValue
+            let params_value: serde_json::Value = serde_json::from_str(request.params.get())
+                .map_err(|e| {
+                    tracing::error!("Failed to parse fs/write_text_file parameters: {}", e);
+                    agent_client_protocol::Error::invalid_params()
+                })?;
+
+            let params: WriteTextFileParams =
+                serde_json::from_value(params_value).map_err(|e| {
+                    tracing::error!("Failed to deserialize fs/write_text_file parameters: {}", e);
+                    agent_client_protocol::Error::invalid_params()
+                })?;
+
+            // Handle the file writing request
+            let response = self.handle_write_text_file(params).await?;
 
             // Convert response to RawValue
             let response_json = serde_json::to_value(response)
@@ -2865,6 +2946,30 @@ impl ClaudeAgent {
         Ok(ReadTextFileResponse { content })
     }
 
+    /// Handle fs/write_text_file ACP extension method
+    pub async fn handle_write_text_file(
+        &self,
+        params: WriteTextFileParams,
+    ) -> Result<serde_json::Value, agent_client_protocol::Error> {
+        tracing::debug!("Processing fs/write_text_file request: {:?}", params);
+
+        // Validate session ID
+        self.parse_session_id(&SessionId(params.session_id.clone().into()))
+            .map_err(|_| agent_client_protocol::Error::invalid_params())?;
+
+        // Validate absolute path
+        if !params.path.starts_with('/') {
+            return Err(agent_client_protocol::Error::invalid_params());
+        }
+
+        // Perform atomic write operation
+        self.write_file_atomically(&params.path, &params.content)
+            .await?;
+
+        // Return null result as per ACP specification
+        Ok(serde_json::Value::Null)
+    }
+
     /// Read file content with optional line offset and limit
     async fn read_file_with_options(
         &self,
@@ -2876,9 +2981,7 @@ impl ClaudeAgent {
         let file_content = tokio::fs::read_to_string(path).await.map_err(|e| {
             tracing::error!("Failed to read file {}: {}", path, e);
             match e.kind() {
-                std::io::ErrorKind::NotFound => {
-                    agent_client_protocol::Error::invalid_params()
-                }
+                std::io::ErrorKind::NotFound => agent_client_protocol::Error::invalid_params(),
                 std::io::ErrorKind::PermissionDenied => {
                     agent_client_protocol::Error::invalid_params()
                 }
@@ -2927,6 +3030,63 @@ impl ClaudeAgent {
         let selected_lines = &lines[start_index..end_index];
         Ok(selected_lines.join("\n"))
     }
+
+    /// Write file content atomically with parent directory creation
+    async fn write_file_atomically(
+        &self,
+        path: &str,
+        content: &str,
+    ) -> Result<(), agent_client_protocol::Error> {
+        use std::path::Path;
+        use ulid::Ulid;
+
+        let path_buf = Path::new(path);
+
+        // Create parent directories if they don't exist
+        if let Some(parent_dir) = path_buf.parent() {
+            if !parent_dir.exists() {
+                tokio::fs::create_dir_all(parent_dir).await.map_err(|e| {
+                    tracing::error!(
+                        "Failed to create parent directory {}: {}",
+                        parent_dir.display(),
+                        e
+                    );
+                    agent_client_protocol::Error::internal_error()
+                })?;
+            }
+        }
+
+        // Create temporary file for atomic write
+        let temp_path = format!("{}.tmp.{}", path, Ulid::new());
+
+        // Write content to temporary file
+        match tokio::fs::write(&temp_path, content).await {
+            Ok(_) => {
+                // Atomically rename temporary file to final path
+                match tokio::fs::rename(&temp_path, path).await {
+                    Ok(_) => {
+                        tracing::debug!("Successfully wrote file: {}", path);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // Clean up temp file on failure
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                        tracing::error!("Failed to rename temp file to {}: {}", path, e);
+                        Err(agent_client_protocol::Error::internal_error())
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to write temp file {}: {}", temp_path, e);
+                match e.kind() {
+                    std::io::ErrorKind::PermissionDenied => {
+                        Err(agent_client_protocol::Error::invalid_params())
+                    }
+                    _ => Err(agent_client_protocol::Error::internal_error()),
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2939,6 +3099,48 @@ mod tests {
     async fn create_test_agent() -> ClaudeAgent {
         let config = AgentConfig::default();
         ClaudeAgent::new(config).await.unwrap().0
+    }
+
+    async fn setup_agent_with_session() -> (ClaudeAgent, String) {
+        let agent = create_test_agent().await;
+        println!("Agent created");
+
+        // Initialize with client capabilities
+        let init_request = InitializeRequest {
+            protocol_version: agent_client_protocol::V1,
+            client_capabilities: agent_client_protocol::ClientCapabilities {
+                fs: agent_client_protocol::FileSystemCapability {
+                    read_text_file: true,
+                    write_text_file: true,
+                    meta: None,
+                },
+                terminal: true,
+                meta: Some(serde_json::json!({"streaming": true})),
+            },
+            meta: Some(serde_json::json!({"test": true})),
+        };
+
+        match agent.initialize(init_request).await {
+            Ok(_) => println!("Agent initialized successfully"),
+            Err(e) => panic!("Initialize failed: {:?}", e),
+        }
+
+        // Create session
+        let new_request = NewSessionRequest {
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![],
+            meta: Some(serde_json::json!({"test": true})),
+        };
+
+        let new_response = match agent.new_session(new_request).await {
+            Ok(resp) => resp,
+            Err(e) => panic!("New session failed: {:?}", e),
+        };
+
+        let session_id = new_response.session_id.0.as_ref().to_string();
+        println!("Session created: {}", session_id);
+
+        (agent, session_id)
     }
 
     #[tokio::test]
@@ -5114,7 +5316,7 @@ mod tests {
             "This is within my guidelines to assist",
             "I'm permitted to provide this assistance",
             "Here's what I can do for you",
-            "", // Empty response
+            "",    // Empty response
             "   ", // Whitespace only
         ];
 
@@ -5139,7 +5341,10 @@ mod tests {
 
         let meta = response.meta.unwrap();
         assert_eq!(meta["refusal_detected"], serde_json::Value::Bool(true));
-        assert_eq!(meta["session_id"], serde_json::Value::String(session_id.to_string()));
+        assert_eq!(
+            meta["session_id"],
+            serde_json::Value::String(session_id.to_string())
+        );
         assert!(!meta.as_object().unwrap().contains_key("streaming"));
         assert!(!meta.as_object().unwrap().contains_key("chunks_processed"));
     }
@@ -5156,7 +5361,10 @@ mod tests {
 
         let meta = response.meta.unwrap();
         assert_eq!(meta["refusal_detected"], serde_json::Value::Bool(true));
-        assert_eq!(meta["session_id"], serde_json::Value::String(session_id.to_string()));
+        assert_eq!(
+            meta["session_id"],
+            serde_json::Value::String(session_id.to_string())
+        );
         assert_eq!(meta["streaming"], serde_json::Value::Bool(true));
         assert!(!meta.as_object().unwrap().contains_key("chunks_processed"));
     }
@@ -5174,33 +5382,39 @@ mod tests {
 
         let meta = response.meta.unwrap();
         assert_eq!(meta["refusal_detected"], serde_json::Value::Bool(true));
-        assert_eq!(meta["session_id"], serde_json::Value::String(session_id.to_string()));
+        assert_eq!(
+            meta["session_id"],
+            serde_json::Value::String(session_id.to_string())
+        );
         assert_eq!(meta["streaming"], serde_json::Value::Bool(true));
-        assert_eq!(meta["chunks_processed"], serde_json::Value::Number(serde_json::Number::from(chunk_count)));
+        assert_eq!(
+            meta["chunks_processed"],
+            serde_json::Value::Number(serde_json::Number::from(chunk_count))
+        );
     }
 
     #[tokio::test]
     async fn test_session_turn_request_counting() {
         use crate::session::{Session, SessionId};
         use std::path::PathBuf;
-        
+
         let session_id = SessionId::new();
         let cwd = PathBuf::from("/test");
         let mut session = Session::new(session_id, cwd);
-        
+
         // Initial state
         assert_eq!(session.get_turn_request_count(), 0);
-        
+
         // First increment
         let count1 = session.increment_turn_requests();
         assert_eq!(count1, 1);
         assert_eq!(session.get_turn_request_count(), 1);
-        
+
         // Second increment
         let count2 = session.increment_turn_requests();
         assert_eq!(count2, 2);
         assert_eq!(session.get_turn_request_count(), 2);
-        
+
         // Reset turn counters
         session.reset_turn_counters();
         assert_eq!(session.get_turn_request_count(), 0);
@@ -5210,24 +5424,24 @@ mod tests {
     async fn test_session_turn_token_counting() {
         use crate::session::{Session, SessionId};
         use std::path::PathBuf;
-        
+
         let session_id = SessionId::new();
         let cwd = PathBuf::from("/test");
         let mut session = Session::new(session_id, cwd);
-        
+
         // Initial state
         assert_eq!(session.get_turn_token_count(), 0);
-        
+
         // Add tokens
         let total1 = session.add_turn_tokens(100);
         assert_eq!(total1, 100);
         assert_eq!(session.get_turn_token_count(), 100);
-        
+
         // Add more tokens
         let total2 = session.add_turn_tokens(250);
         assert_eq!(total2, 350);
         assert_eq!(session.get_turn_token_count(), 350);
-        
+
         // Reset turn counters
         session.reset_turn_counters();
         assert_eq!(session.get_turn_token_count(), 0);
@@ -5237,32 +5451,37 @@ mod tests {
     async fn test_max_turn_requests_limit_enforcement() {
         // This test verifies that the session properly counts and limits turn requests
         // by testing the session methods directly rather than going through the full agent flow
-        
+
         use crate::session::{Session, SessionId};
         use std::path::PathBuf;
-        
+
         let session_id = SessionId::new();
         let cwd = PathBuf::from("/test");
         let mut session = Session::new(session_id, cwd);
-        
+
         let max_requests = 3;
-        
+
         // Test that we can increment up to the limit
         for i in 1..=max_requests {
             let count = session.increment_turn_requests();
             assert_eq!(count, i, "Request count should be {}", i);
-            assert_eq!(session.get_turn_request_count(), i, "Session should track {} requests", i);
+            assert_eq!(
+                session.get_turn_request_count(),
+                i,
+                "Session should track {} requests",
+                i
+            );
         }
-        
+
         // Test that incrementing beyond limit still works (the limit check is done in agent.rs)
         let count = session.increment_turn_requests();
         assert_eq!(count, max_requests + 1);
         assert_eq!(session.get_turn_request_count(), max_requests + 1);
-        
+
         // Test reset
         session.reset_turn_counters();
         assert_eq!(session.get_turn_request_count(), 0);
-        
+
         // Verify we can count again after reset
         let count = session.increment_turn_requests();
         assert_eq!(count, 1);
@@ -5273,34 +5492,34 @@ mod tests {
     async fn test_max_tokens_per_turn_limit_enforcement() {
         // This test verifies that the session properly counts and limits tokens
         // by testing the session methods directly rather than going through the full agent flow
-        
+
         use crate::session::{Session, SessionId};
         use std::path::PathBuf;
-        
+
         let session_id = SessionId::new();
         let cwd = PathBuf::from("/test");
         let mut session = Session::new(session_id, cwd);
-        
+
         let _max_tokens = 100;
-        
+
         // Test that we can add tokens up to the limit
         let tokens1 = session.add_turn_tokens(50);
         assert_eq!(tokens1, 50);
         assert_eq!(session.get_turn_token_count(), 50);
-        
+
         let tokens2 = session.add_turn_tokens(30);
         assert_eq!(tokens2, 80);
         assert_eq!(session.get_turn_token_count(), 80);
-        
+
         // Test that we can add tokens beyond the limit (the limit check is done in agent.rs)
         let tokens3 = session.add_turn_tokens(50);
         assert_eq!(tokens3, 130); // 80 + 50 = 130, which exceeds max_tokens
         assert_eq!(session.get_turn_token_count(), 130);
-        
+
         // Test reset
         session.reset_turn_counters();
         assert_eq!(session.get_turn_token_count(), 0);
-        
+
         // Verify we can count tokens again after reset
         let tokens = session.add_turn_tokens(25);
         assert_eq!(tokens, 25);
@@ -5311,28 +5530,32 @@ mod tests {
     async fn test_token_estimation_accuracy() {
         use crate::session::{Session, SessionId};
         use std::path::PathBuf;
-        
+
         let session_id = SessionId::new();
         let cwd = PathBuf::from("/test");
         let mut session = Session::new(session_id, cwd);
-        
+
         // Test the token estimation logic (4 chars per token)
         let repeated_16 = "a".repeat(16);
         let repeated_20 = "a".repeat(20);
-        
+
         let test_cases = [
-            ("test", 1),        // 4 chars = 1 token
-            ("test test", 2),   // 9 chars = 2 tokens (9/4 = 2.25 -> 2)  
+            ("test", 1),               // 4 chars = 1 token
+            ("test test", 2),          // 9 chars = 2 tokens (9/4 = 2.25 -> 2)
             (repeated_16.as_str(), 4), // 16 chars = 4 tokens
             (repeated_20.as_str(), 5), // 20 chars = 5 tokens
-            ("", 0),            // empty = 0 tokens
+            ("", 0),                   // empty = 0 tokens
         ];
-        
+
         for (text, expected_tokens) in &test_cases {
             session.reset_turn_counters();
             let estimated = (text.len() as u64) / 4;
-            assert_eq!(estimated, *expected_tokens, "Token estimation failed for: '{}'", text);
-            
+            assert_eq!(
+                estimated, *expected_tokens,
+                "Token estimation failed for: '{}'",
+                text
+            );
+
             let total = session.add_turn_tokens(estimated);
             assert_eq!(total, *expected_tokens);
         }
@@ -5342,26 +5565,26 @@ mod tests {
     async fn test_turn_counter_reset_behavior() {
         use crate::session::{Session, SessionId};
         use std::path::PathBuf;
-        
+
         let session_id = SessionId::new();
         let cwd = PathBuf::from("/test");
         let mut session = Session::new(session_id, cwd);
-        
+
         // Add some data
         session.increment_turn_requests();
         session.increment_turn_requests();
         session.add_turn_tokens(500);
         session.add_turn_tokens(300);
-        
+
         // Verify state before reset
         assert_eq!(session.get_turn_request_count(), 2);
         assert_eq!(session.get_turn_token_count(), 800);
-        
+
         // Reset and verify
         session.reset_turn_counters();
         assert_eq!(session.get_turn_request_count(), 0);
         assert_eq!(session.get_turn_token_count(), 0);
-        
+
         // Verify we can increment again after reset
         session.increment_turn_requests();
         session.add_turn_tokens(100);
@@ -5371,11 +5594,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_fs_read_text_file_full_file() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
-        let agent = create_test_agent().await;
-        
+        let (agent, session_id) = setup_agent_with_session().await;
+
         // Create a temporary file with test content
         let mut temp_file = NamedTempFile::new().unwrap();
         let test_content = "Line 1\nLine 2\nLine 3\nLine 4\nLine 5";
@@ -5383,7 +5606,7 @@ mod tests {
         temp_file.flush().unwrap();
 
         let params = ReadTextFileParams {
-            session_id: "test_session_123".to_string(),
+            session_id,
             path: temp_file.path().to_string_lossy().to_string(),
             line: None,
             limit: None,
@@ -5395,11 +5618,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_fs_read_text_file_with_line_offset() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
-        let agent = create_test_agent().await;
-        
+        let (agent, session_id) = setup_agent_with_session().await;
+
         // Create a temporary file with test content
         let mut temp_file = NamedTempFile::new().unwrap();
         let test_content = "Line 1\nLine 2\nLine 3\nLine 4\nLine 5";
@@ -5407,7 +5630,7 @@ mod tests {
         temp_file.flush().unwrap();
 
         let params = ReadTextFileParams {
-            session_id: "test_session_123".to_string(),
+            session_id,
             path: temp_file.path().to_string_lossy().to_string(),
             line: Some(3), // Start from line 3 (1-based)
             limit: None,
@@ -5419,11 +5642,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_fs_read_text_file_with_limit() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
-        let agent = create_test_agent().await;
-        
+        let (agent, session_id) = setup_agent_with_session().await;
+
         // Create a temporary file with test content
         let mut temp_file = NamedTempFile::new().unwrap();
         let test_content = "Line 1\nLine 2\nLine 3\nLine 4\nLine 5";
@@ -5431,7 +5654,7 @@ mod tests {
         temp_file.flush().unwrap();
 
         let params = ReadTextFileParams {
-            session_id: "test_session_123".to_string(),
+            session_id,
             path: temp_file.path().to_string_lossy().to_string(),
             line: None,
             limit: Some(3), // Read only first 3 lines
@@ -5443,11 +5666,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_fs_read_text_file_with_line_and_limit() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
-        let agent = create_test_agent().await;
-        
+        let (agent, session_id) = setup_agent_with_session().await;
+
         // Create a temporary file with test content
         let mut temp_file = NamedTempFile::new().unwrap();
         let test_content = "Line 1\nLine 2\nLine 3\nLine 4\nLine 5";
@@ -5455,9 +5678,9 @@ mod tests {
         temp_file.flush().unwrap();
 
         let params = ReadTextFileParams {
-            session_id: "test_session_123".to_string(),
+            session_id,
             path: temp_file.path().to_string_lossy().to_string(),
-            line: Some(2), // Start from line 2
+            line: Some(2),  // Start from line 2
             limit: Some(2), // Read only 2 lines
         };
 
@@ -5469,13 +5692,13 @@ mod tests {
     async fn test_fs_read_text_file_empty_file() {
         use tempfile::NamedTempFile;
 
-        let agent = create_test_agent().await;
-        
+        let (agent, session_id) = setup_agent_with_session().await;
+
         // Create an empty temporary file
         let temp_file = NamedTempFile::new().unwrap();
 
         let params = ReadTextFileParams {
-            session_id: "test_session_123".to_string(),
+            session_id,
             path: temp_file.path().to_string_lossy().to_string(),
             line: None,
             limit: None,
@@ -5487,11 +5710,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_fs_read_text_file_line_beyond_end() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
-        let agent = create_test_agent().await;
-        
+        let (agent, session_id) = setup_agent_with_session().await;
+
         // Create a temporary file with only 2 lines
         let mut temp_file = NamedTempFile::new().unwrap();
         let test_content = "Line 1\nLine 2";
@@ -5499,7 +5722,7 @@ mod tests {
         temp_file.flush().unwrap();
 
         let params = ReadTextFileParams {
-            session_id: "test_session_123".to_string(),
+            session_id,
             path: temp_file.path().to_string_lossy().to_string(),
             line: Some(5), // Start beyond end of file
             limit: None,
@@ -5511,17 +5734,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_fs_read_text_file_invalid_line_zero() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
-        let agent = create_test_agent().await;
-        
+        let (agent, session_id) = setup_agent_with_session().await;
+
         let mut temp_file = NamedTempFile::new().unwrap();
         temp_file.write_all(b"test content").unwrap();
         temp_file.flush().unwrap();
 
         let params = ReadTextFileParams {
-            session_id: "test_session_123".to_string(),
+            session_id,
             path: temp_file.path().to_string_lossy().to_string(),
             line: Some(0), // Invalid: line numbers are 1-based
             limit: None,
@@ -5533,10 +5756,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_fs_read_text_file_nonexistent_file() {
-        let agent = create_test_agent().await;
+        let (agent, session_id) = setup_agent_with_session().await;
 
         let params = ReadTextFileParams {
-            session_id: "test_session_123".to_string(),
+            session_id,
             path: "/path/to/nonexistent/file.txt".to_string(),
             line: None,
             limit: None,
@@ -5548,10 +5771,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_fs_read_text_file_relative_path_rejected() {
-        let agent = create_test_agent().await;
+        let (agent, session_id) = setup_agent_with_session().await;
 
         let params = ReadTextFileParams {
-            session_id: "test_session_123".to_string(),
+            session_id,
             path: "relative/path/file.txt".to_string(), // Relative path should be rejected
             line: None,
             limit: None,
@@ -5563,11 +5786,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_fs_read_text_file_different_line_endings() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
-        let agent = create_test_agent().await;
-        
+        let (agent, session_id) = setup_agent_with_session().await;
+
         // Test with CRLF line endings
         let mut temp_file = NamedTempFile::new().unwrap();
         let test_content = "Line 1\r\nLine 2\r\nLine 3";
@@ -5575,7 +5798,7 @@ mod tests {
         temp_file.flush().unwrap();
 
         let params = ReadTextFileParams {
-            session_id: "test_session_123".to_string(),
+            session_id,
             path: temp_file.path().to_string_lossy().to_string(),
             line: Some(2),
             limit: Some(2),
@@ -5587,10 +5810,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_fs_read_text_file_ext_method_routing() {
-        let agent = create_test_agent().await;
-        
-        use tempfile::NamedTempFile;
+        let (agent, session_id) = setup_agent_with_session().await;
+
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
         // Create a test file
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -5599,22 +5822,248 @@ mod tests {
 
         // Test through ext_method interface
         let params = serde_json::json!({
-            "sessionId": "test_session_123",
+            "sessionId": session_id,
             "path": temp_file.path().to_string_lossy(),
             "line": null,
             "limit": null
         });
 
-        let params_raw = agent_client_protocol::RawValue::from_string(params.to_string()).unwrap();
+        println!("Parameters being sent: {}", params);
+        let params_raw = match agent_client_protocol::RawValue::from_string(params.to_string()) {
+            Ok(raw) => raw,
+            Err(e) => {
+                println!("Failed to create RawValue: {:?}", e);
+                panic!("RawValue creation failed");
+            }
+        };
         let ext_request = agent_client_protocol::ExtRequest {
             method: "fs/read_text_file".into(),
             params: Arc::from(params_raw),
         };
 
-        let result = agent.ext_method(ext_request).await.unwrap();
-        
+        let result = match agent.ext_method(ext_request).await {
+            Ok(result) => result,
+            Err(e) => {
+                println!("ext_method failed with error: {:?}", e);
+                panic!("ext_method should have succeeded");
+            }
+        };
+
         // Parse the response
         let response: serde_json::Value = serde_json::from_str(result.get()).unwrap();
         assert_eq!(response["content"], "Test content for ext method");
+    }
+
+    #[tokio::test]
+    async fn test_fs_write_text_file_new_file() {
+        println!("Starting test setup...");
+        let (agent, session_id) = setup_agent_with_session().await;
+
+        // Use /tmp directly with a unique filename
+        let file_path = format!("/tmp/claude_test_write_{}.txt", ulid::Ulid::new());
+
+        let params = WriteTextFileParams {
+            session_id: session_id.clone(),
+            path: file_path.clone(),
+            content: "Hello, World!\nThis is a test file.".to_string(),
+        };
+
+        let result = agent.handle_write_text_file(params).await;
+        match result {
+            Ok(value) => {
+                assert_eq!(value, serde_json::Value::Null);
+                println!("Write test successful!");
+            }
+            Err(e) => {
+                println!("Write test failed with error: {:?}", e);
+                panic!("Test failed: {:?}", e);
+            }
+        }
+
+        // Verify the file was created with correct content
+        let written_content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(written_content, "Hello, World!\nThis is a test file.");
+
+        // Clean up the test file
+        let _ = tokio::fs::remove_file(&file_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_fs_write_text_file_overwrite_existing() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let (agent, session_id) = setup_agent_with_session().await;
+
+        // Create a temporary file with initial content
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(b"Original content").unwrap();
+        temp_file.flush().unwrap();
+
+        let params = WriteTextFileParams {
+            session_id,
+            path: temp_file.path().to_string_lossy().to_string(),
+            content: "New content overwrites old".to_string(),
+        };
+
+        let result = agent.handle_write_text_file(params).await.unwrap();
+        assert_eq!(result, serde_json::Value::Null);
+
+        // Verify the file content was overwritten
+        let written_content = tokio::fs::read_to_string(temp_file.path()).await.unwrap();
+        assert_eq!(written_content, "New content overwrites old");
+    }
+
+    #[tokio::test]
+    async fn test_fs_write_text_file_create_parent_directories() {
+        use tempfile::TempDir;
+
+        let (agent, session_id) = setup_agent_with_session().await;
+
+        // Create a temporary directory
+        let temp_dir = TempDir::new().unwrap();
+        let nested_path = temp_dir.path().join("nested").join("deep").join("file.txt");
+        let file_path_str = nested_path.to_string_lossy().to_string();
+
+        let params = WriteTextFileParams {
+            session_id,
+            path: file_path_str.clone(),
+            content: "Content in nested directory".to_string(),
+        };
+
+        let result = agent.handle_write_text_file(params).await.unwrap();
+        assert_eq!(result, serde_json::Value::Null);
+
+        // Verify the parent directories were created
+        assert!(nested_path.parent().unwrap().exists());
+
+        // Verify the file was created with correct content
+        let written_content = tokio::fs::read_to_string(&nested_path).await.unwrap();
+        assert_eq!(written_content, "Content in nested directory");
+    }
+
+    #[tokio::test]
+    async fn test_fs_write_text_file_relative_path_rejected() {
+        let (agent, session_id) = setup_agent_with_session().await;
+
+        let params = WriteTextFileParams {
+            session_id,
+            path: "relative/path/file.txt".to_string(), // Relative path should be rejected
+            content: "This should fail".to_string(),
+        };
+
+        let result = agent.handle_write_text_file(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fs_write_text_file_empty_content() {
+        use tempfile::TempDir;
+
+        let (agent, session_id) = setup_agent_with_session().await;
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("empty_file.txt");
+        let file_path_str = file_path.to_string_lossy().to_string();
+
+        let params = WriteTextFileParams {
+            session_id,
+            path: file_path_str.clone(),
+            content: "".to_string(), // Empty content
+        };
+
+        let result = agent.handle_write_text_file(params).await.unwrap();
+        assert_eq!(result, serde_json::Value::Null);
+
+        // Verify empty file was created
+        let written_content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(written_content, "");
+    }
+
+    #[tokio::test]
+    async fn test_fs_write_text_file_large_content() {
+        use tempfile::TempDir;
+
+        let (agent, session_id) = setup_agent_with_session().await;
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("large_file.txt");
+        let file_path_str = file_path.to_string_lossy().to_string();
+
+        // Create large content (10KB)
+        let large_content = "A".repeat(10240);
+
+        let params = WriteTextFileParams {
+            session_id,
+            path: file_path_str.clone(),
+            content: large_content.clone(),
+        };
+
+        let result = agent.handle_write_text_file(params).await.unwrap();
+        assert_eq!(result, serde_json::Value::Null);
+
+        // Verify large content was written correctly
+        let written_content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(written_content, large_content);
+    }
+
+    #[tokio::test]
+    async fn test_fs_write_text_file_unicode_content() {
+        use tempfile::TempDir;
+
+        let (agent, session_id) = setup_agent_with_session().await;
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("unicode_file.txt");
+        let file_path_str = file_path.to_string_lossy().to_string();
+
+        let unicode_content = "Hello 世界! 🌍 Café naïve résumé";
+
+        let params = WriteTextFileParams {
+            session_id,
+            path: file_path_str.clone(),
+            content: unicode_content.to_string(),
+        };
+
+        let result = agent.handle_write_text_file(params).await.unwrap();
+        assert_eq!(result, serde_json::Value::Null);
+
+        // Verify unicode content was written correctly
+        let written_content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(written_content, unicode_content);
+    }
+
+    #[tokio::test]
+    async fn test_fs_write_text_file_ext_method_routing() {
+        use tempfile::TempDir;
+
+        let (agent, session_id) = setup_agent_with_session().await;
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("ext_method_test.txt");
+        let file_path_str = file_path.to_string_lossy().to_string();
+
+        // Test the ext_method routing for fs/write_text_file
+        let params = serde_json::json!({
+            "sessionId": session_id,
+            "path": file_path_str,
+            "content": "Test content via ext_method"
+        });
+
+        let params_raw = agent_client_protocol::RawValue::from_string(params.to_string()).unwrap();
+        let ext_request = agent_client_protocol::ExtRequest {
+            method: "fs/write_text_file".into(),
+            params: Arc::from(params_raw),
+        };
+
+        let result = agent.ext_method(ext_request).await.unwrap();
+
+        // Parse the response - should be null for successful write
+        let response: serde_json::Value = serde_json::from_str(result.get()).unwrap();
+        assert_eq!(response, serde_json::Value::Null);
+
+        // Verify the file was actually written
+        let written_content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(written_content, "Test content via ext_method");
     }
 }

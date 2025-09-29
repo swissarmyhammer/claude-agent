@@ -252,8 +252,10 @@ impl ClaudeAgentServer {
             // Handle extension methods through ext_method
             _ => {
                 let params_raw = agent_client_protocol::RawValue::from_string(params.to_string())
-                    .map_err(|_| AgentError::Protocol("Failed to convert params to RawValue".to_string()))?;
-                
+                    .map_err(|_| {
+                    AgentError::Protocol("Failed to convert params to RawValue".to_string())
+                })?;
+
                 let ext_request = agent_client_protocol::ExtRequest {
                     method: method.to_string().into(),
                     params: Arc::from(params_raw),
@@ -263,8 +265,9 @@ impl ClaudeAgentServer {
                     .await
                     .map(|raw_value| {
                         // Parse the RawValue back to serde_json::Value
-                        serde_json::from_str(raw_value.get())
-                            .unwrap_or_else(|_| serde_json::Value::String(raw_value.get().to_string()))
+                        serde_json::from_str(raw_value.get()).unwrap_or_else(|_| {
+                            serde_json::Value::String(raw_value.get().to_string())
+                        })
                     })
                     .map_err(|e| {
                         tracing::error!("Extension method {} failed: {}", method, e);
