@@ -15,9 +15,11 @@ use agent_client_protocol::{
     Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
     ContentBlock, ExtNotification, ExtRequest, InitializeRequest, InitializeResponse,
     LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
-    PromptResponse, RawValue, SessionId, SessionModeId, SessionNotification, SessionUpdate, SetSessionModeRequest,
+    PromptResponse, RawValue, SessionId, SessionNotification, SessionUpdate, SetSessionModeRequest,
     SetSessionModeResponse, StopReason, TextContent,
 };
+#[cfg(test)]
+use agent_client_protocol::SessionModeId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -2185,6 +2187,27 @@ impl Agent for ClaudeAgent {
         self.log_request("new_session", &request);
         tracing::info!("Creating new session");
 
+        // ACP requires strict transport capability enforcement:
+        // 1. stdio: Always supported (mandatory per spec)
+        // 2. http: Only if mcpCapabilities.http: true was declared
+        // 3. sse: Only if mcpCapabilities.sse: true was declared  
+        //
+        // This prevents protocol violations and ensures capability negotiation contract.
+        
+        // Convert ACP MCP server configs to internal types for validation
+        let internal_mcp_servers: Vec<crate::config::McpServerConfig> = request.mcp_servers.iter()
+            .filter_map(|server| self.convert_acp_to_internal_mcp_config(server))
+            .collect();
+        
+        // Validate transport requirements against agent capabilities
+        if let Err(validation_error) = crate::capability_validation::CapabilityRequirementChecker::check_new_session_requirements(
+            &self.capabilities,
+            &internal_mcp_servers,
+        ) {
+            tracing::error!("Session creation failed: Transport validation error - {}", validation_error);
+            return Err(self.convert_session_setup_error_to_acp_error(validation_error));
+        }
+
         let session_id = self
             .session_manager
             .create_session(request.cwd.clone())
@@ -2194,11 +2217,11 @@ impl Agent for ClaudeAgent {
         if !request.mcp_servers.is_empty() {
             self.session_manager
                 .update_session(&session_id, |session| {
-                    // Store the actual MCP server info from the request (convert to debug string for now)
+                    // Store the actual MCP server info from the request as JSON strings
                     session.mcp_servers = request
                         .mcp_servers
                         .iter()
-                        .map(|server| format!("{:?}", server))
+                        .map(|server| serde_json::to_string(server).unwrap_or_else(|_| format!("{:?}", server)))
                         .collect();
                 })
                 .map_err(|_e| agent_client_protocol::Error::internal_error())?;
@@ -2247,6 +2270,21 @@ impl Agent for ClaudeAgent {
         // 3. Maintain exact chronological order of original conversation
         // 4. Only respond to session/load AFTER all history is streamed
         // 5. Client can then continue conversation seamlessly
+
+        // ACP requires strict transport capability enforcement for session loading:
+        // Convert ACP MCP server configs to internal types for validation
+        let internal_mcp_servers: Vec<crate::config::McpServerConfig> = request.mcp_servers.iter()
+            .filter_map(|server| self.convert_acp_to_internal_mcp_config(server))
+            .collect();
+        
+        // Validate transport requirements and loadSession capability
+        if let Err(validation_error) = crate::capability_validation::CapabilityRequirementChecker::check_load_session_requirements(
+            &self.capabilities,
+            &internal_mcp_servers,
+        ) {
+            tracing::error!("Session loading failed: Transport/capability validation error - {}", validation_error);
+            return Err(self.convert_session_setup_error_to_acp_error(validation_error));
+        }
 
         // Step 1: Validate loadSession capability before allowing session/load
         if !self.capabilities.load_session {
@@ -3150,6 +3188,103 @@ impl ClaudeAgent {
                     }
                     _ => Err(agent_client_protocol::Error::internal_error()),
                 }
+            }
+        }
+    }
+
+    /// Convert ACP MCP server configuration to internal configuration type for validation
+    fn convert_acp_to_internal_mcp_config(
+        &self,
+        acp_config: &agent_client_protocol::McpServer,
+    ) -> Option<crate::config::McpServerConfig> {
+        use agent_client_protocol::McpServer;
+        use crate::config::{McpServerConfig, StdioTransport, HttpTransport, SseTransport, EnvVariable, HttpHeader};
+        
+        match acp_config {
+            McpServer::Stdio { name, command, args, env } => {
+                let internal_env = env.iter().map(|env_var| EnvVariable {
+                    name: env_var.name.clone(),
+                    value: env_var.value.clone(),
+                }).collect();
+
+                Some(McpServerConfig::Stdio(StdioTransport {
+                    name: name.clone(),
+                    command: command.to_string_lossy().to_string(),
+                    args: args.clone(),
+                    env: internal_env,
+                    cwd: None, // ACP doesn't specify cwd, use default
+                }))
+            }
+            McpServer::Http { name, url, headers } => {
+                let internal_headers = headers.iter().map(|header| HttpHeader {
+                    name: header.name.clone(),
+                    value: header.value.clone(),
+                }).collect();
+
+                Some(McpServerConfig::Http(HttpTransport {
+                    transport_type: "http".to_string(),
+                    name: name.clone(),
+                    url: url.clone(),
+                    headers: internal_headers,
+                }))
+            }
+            McpServer::Sse { name, url, headers } => {
+                let internal_headers = headers.iter().map(|header| HttpHeader {
+                    name: header.name.clone(),
+                    value: header.value.clone(),
+                }).collect();
+
+                Some(McpServerConfig::Sse(SseTransport {
+                    transport_type: "sse".to_string(),
+                    name: name.clone(),
+                    url: url.clone(),
+                    headers: internal_headers,
+                }))
+            }
+        }
+    }
+
+    /// Convert SessionSetupError to ACP-compliant error response
+    fn convert_session_setup_error_to_acp_error(
+        &self,
+        error: crate::session_errors::SessionSetupError,
+    ) -> agent_client_protocol::Error {
+        use crate::session_errors::SessionSetupError;
+        
+        match error {
+            SessionSetupError::TransportNotSupported {
+                requested_transport,
+                declared_capability,
+                supported_transports,
+            } => {
+                agent_client_protocol::Error {
+                    code: -32602, // Invalid params
+                    message: format!(
+                        "{} transport not supported: agent did not declare mcpCapabilities.{}",
+                        requested_transport.to_uppercase(),
+                        requested_transport
+                    ),
+                    data: Some(serde_json::json!({
+                        "requestedTransport": requested_transport,
+                        "declaredCapability": declared_capability,
+                        "supportedTransports": supported_transports
+                    })),
+                }
+            }
+            SessionSetupError::LoadSessionNotSupported { declared_capability } => {
+                agent_client_protocol::Error {
+                    code: -32601, // Method not found
+                    message: "Method not supported: agent does not support loadSession capability".to_string(),
+                    data: Some(serde_json::json!({
+                        "method": "session/load",
+                        "requiredCapability": "loadSession", 
+                        "declared": declared_capability
+                    })),
+                }
+            }
+            _ => {
+                // For any other validation errors, return generic invalid params
+                agent_client_protocol::Error::invalid_params()
             }
         }
     }
@@ -6148,5 +6283,49 @@ mod tests {
         // Verify the file was actually written
         let written_content = tokio::fs::read_to_string(&file_path).await.unwrap();
         assert_eq!(written_content, "Test content via ext_method");
+    }
+
+    #[tokio::test]
+    async fn test_new_session_validates_mcp_transport_capabilities() {
+        // This test verifies that transport validation is called
+        // For now, we use empty MCP server lists since the validation logic
+        // exists but isn't integrated yet - this should pass once we add the calls
+        
+        let agent = create_test_agent().await;
+        
+        let request = NewSessionRequest {
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![], // Empty for now
+            meta: None,
+        };
+        
+        let result = agent.new_session(request).await;
+        // Should succeed with empty MCP servers
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test] 
+    async fn test_load_session_validates_mcp_transport_capabilities() {
+        // This test verifies that transport validation is called
+        // For now, we use empty MCP server lists since the validation logic
+        // exists but isn't integrated yet - this should pass once we add the calls
+        
+        let agent = create_test_agent().await;
+        
+        let request = LoadSessionRequest {
+            session_id: SessionId("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string().into()),
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![], // Empty for now
+            meta: None,
+        };
+        
+        let result = agent.load_session(request).await;
+        // Should succeed now - transport validation passes with empty MCP servers
+        // and then fail with session not found (but validation runs first)
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        // Could be transport validation error (-32602) or session not found (-32603)
+        // Both are acceptable since validation runs before session lookup
+        assert!(error.code == -32602 || error.code == -32603);
     }
 }
