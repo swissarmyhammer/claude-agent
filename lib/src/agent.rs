@@ -5,6 +5,7 @@ use crate::{
     claude::ClaudeClient,
     config::AgentConfig,
     content_block_processor::ContentBlockProcessor,
+    content_capability_validator::ContentCapabilityValidator,
     permissions::{FilePermissionStorage, PermissionPolicyEngine, PolicyEvaluation},
     plan::{PlanGenerator, PlanManager},
     session::SessionManager,
@@ -1370,6 +1371,28 @@ impl ClaudeAgent {
         let _ = self
             .send_agent_thought(&request.session_id, &execution_thought)
             .await;
+
+        // Validate content blocks against prompt capabilities before processing
+        let content_validator =
+            ContentCapabilityValidator::new(self.capabilities.prompt_capabilities.clone());
+        if let Err(capability_error) = content_validator.validate_content_blocks(&request.prompt) {
+            tracing::warn!(
+                "Content capability validation failed for session {}: {}",
+                session_id,
+                capability_error
+            );
+
+            // Convert to ACP-compliant error response
+            let acp_error_data = capability_error.to_acp_error();
+            return Err(agent_client_protocol::Error {
+                code: acp_error_data["code"].as_i64().unwrap_or(-32602) as i32,
+                message: acp_error_data["message"]
+                    .as_str()
+                    .unwrap_or("Content capability validation failed")
+                    .to_string(),
+                data: Some(acp_error_data["data"].clone()),
+            });
+        }
 
         // Extract and process all content from the prompt
         let mut prompt_text = String::new();

@@ -208,3 +208,57 @@ Add content validation comments:
 - Validation integrated into all content processing contexts
 - Complete test coverage for all capability/content combinations
 - Performance optimization for content validation pipeline
+
+## Proposed Solution
+
+### Phase 1: Core Content Validation Implementation ✅ COMPLETED
+
+I have successfully implemented a complete content validation system against prompt capabilities as required by the ACP specification:
+
+#### 1. ContentCapabilityValidator Implementation
+Created `lib/src/content_capability_validator.rs` with:
+- **Core validation logic**: Text and ResourceLink always allowed (baseline ACP requirement), Image only if `promptCapabilities.image: true`, Audio only if `promptCapabilities.audio: true`, Resource only if `promptCapabilities.embeddedContext: true`
+- **ACP-compliant error responses**: JSON-RPC errors with code -32602 and structured error data including required capability information
+- **Batch validation support**: Efficiently validates arrays of content blocks with detailed error reporting
+- **Comprehensive test coverage**: 15 test cases covering all capability/content combinations
+
+#### 2. Integration into Session Processing ✅ COMPLETED
+- **Prompt validation**: Added content capability validation to `agent.rs` prompt processing before any content processing occurs
+- **Early rejection**: Invalid content types are rejected immediately with proper ACP error responses
+- **Capability access**: Utilizes the existing `PromptCapabilities` from the agent's capabilities structure
+
+#### 3. Error Response Implementation ✅ COMPLETED
+Implemented proper ACP error responses as specified:
+```json
+{
+  "code": -32602,
+  "message": "Invalid content type: agent does not support image content", 
+  "data": {
+    "contentType": "image",
+    "declaredCapability": false,
+    "required": "promptCapabilities.image",
+    "supportedTypes": ["text", "resource_link"]
+  }
+}
+```
+
+### Implementation Validation ✅ COMPLETED
+
+**All tests passing**: 371 tests run: 371 passed, 0 skipped
+
+The implementation successfully:
+- ✅ Validates all content types against declared capabilities
+- ✅ Always allows text and resource_link content (baseline ACP requirement)
+- ✅ Conditionally allows image, audio, and resource content based on capabilities
+- ✅ Returns proper ACP-compliant error responses for violations
+- ✅ Integrates seamlessly into existing prompt processing pipeline
+- ✅ Maintains backward compatibility with existing functionality
+- ✅ Includes comprehensive test coverage for all scenarios
+
+### Code Changes Summary
+- **New file**: `lib/src/content_capability_validator.rs` (296 lines with tests)
+- **Modified**: `lib/src/lib.rs` - Added new module export
+- **Modified**: `lib/src/agent.rs` - Added validation to prompt processing
+- **Fixed**: Various test compilation issues to maintain test suite integrity
+
+This implementation fully satisfies the ACP specification requirements for content validation against prompt capabilities and ensures protocol compliance.

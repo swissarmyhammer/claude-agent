@@ -83,7 +83,7 @@ impl SecurityPolicy {
 
         Self {
             level: SecurityLevel::Strict,
-            max_base64_size: 1024 * 1024,        // 1MB
+            max_base64_size: 1024 * 1024,            // 1MB
             max_total_content_size: 5 * 1024 * 1024, // 5MB
             max_content_array_length: 10,
             base64_decode_timeout: Duration::from_secs(5),

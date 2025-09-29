@@ -53,16 +53,12 @@
 //! These errors are mapped to appropriate JSON-RPC error codes for client communication.
 
 use crate::path_validator::{PathValidationError, PathValidator};
-use crate::terminal_manager::{
-    TerminalCreateParams, TerminalCreateResponse, TerminalManager,
-};
 #[cfg(test)]
 use crate::terminal_manager::{EnvVariable, TerminalSession};
-use crate::tool_types::{
-    ToolCallReport, ToolCallStatus, ToolKind,
-};
+use crate::terminal_manager::{TerminalCreateParams, TerminalCreateResponse, TerminalManager};
 #[cfg(test)]
 use crate::tool_types::{ToolCallContent, ToolCallLocation};
+use crate::tool_types::{ToolCallReport, ToolCallStatus, ToolKind};
 #[cfg(test)]
 use agent_client_protocol::SessionId;
 

@@ -416,7 +416,7 @@ pub fn convert_base64_error_to_acp(
         },
         Base64ProcessorError::EnhancedSecurityValidationFailed(security_error) => {
             convert_content_security_error_to_acp(security_error, Some(ctx))
-        },
+        }
     }
 }
 

@@ -13,7 +13,7 @@ mod tests {
     fn create_strict_secure_processor() -> ContentBlockProcessor {
         let security_validator = ContentSecurityValidator::strict().unwrap();
         let base64_processor = Base64Processor::with_enhanced_security(
-            1 * 1024 * 1024, // 1MB limit for strict mode
+            1024 * 1024, // 1MB limit for strict mode
             security_validator.clone(),
         );
 
@@ -24,16 +24,17 @@ mod tests {
         supported_capabilities.insert("resource".to_string(), true);
         supported_capabilities.insert("resource_link".to_string(), true);
 
-        ContentBlockProcessor::with_enhanced_security_config(
-            base64_processor,
-            5 * 1024 * 1024,         // 5MB resource limit
-            true,                    // enable URI validation
-            Duration::from_secs(10), // 10s processing timeout
-            true,                    // enable capability validation
+        let config = crate::content_block_processor::EnhancedSecurityConfig {
+            max_resource_size: 5 * 1024 * 1024, // 5MB resource limit
+            enable_uri_validation: true,
+            processing_timeout: Duration::from_secs(10),
+            enable_capability_validation: true,
             supported_capabilities,
-            true, // enable batch recovery
-            security_validator,
-        )
+            enable_batch_recovery: true,
+            content_security_validator: security_validator,
+        };
+
+        ContentBlockProcessor::with_enhanced_security_config(base64_processor, config)
     }
 
     /// Create a ContentBlockProcessor with moderate security validation
@@ -51,16 +52,17 @@ mod tests {
         supported_capabilities.insert("resource".to_string(), true);
         supported_capabilities.insert("resource_link".to_string(), true);
 
-        ContentBlockProcessor::with_enhanced_security_config(
-            base64_processor,
-            50 * 1024 * 1024,        // 50MB resource limit
-            true,                    // enable URI validation
-            Duration::from_secs(30), // 30s processing timeout
-            true,                    // enable capability validation
+        let config = crate::content_block_processor::EnhancedSecurityConfig {
+            max_resource_size: 50 * 1024 * 1024, // 50MB resource limit
+            enable_uri_validation: true,
+            processing_timeout: Duration::from_secs(30),
+            enable_capability_validation: true,
             supported_capabilities,
-            true, // enable batch recovery
-            security_validator,
-        )
+            enable_batch_recovery: true,
+            content_security_validator: security_validator,
+        };
+
+        ContentBlockProcessor::with_enhanced_security_config(base64_processor, config)
     }
 
     /// Create a ContentBlockProcessor with permissive security validation
@@ -78,16 +80,17 @@ mod tests {
         supported_capabilities.insert("resource".to_string(), true);
         supported_capabilities.insert("resource_link".to_string(), true);
 
-        ContentBlockProcessor::with_enhanced_security_config(
-            base64_processor,
-            500 * 1024 * 1024,        // 500MB resource limit
-            false,                    // disable URI validation for permissive mode
-            Duration::from_secs(120), // 120s processing timeout
-            true,                     // enable capability validation
+        let config = crate::content_block_processor::EnhancedSecurityConfig {
+            max_resource_size: 500 * 1024 * 1024, // 500MB resource limit
+            enable_uri_validation: false,         // disable URI validation for permissive mode
+            processing_timeout: Duration::from_secs(120),
+            enable_capability_validation: true,
             supported_capabilities,
-            true, // enable batch recovery
-            security_validator,
-        )
+            enable_batch_recovery: true,
+            content_security_validator: security_validator,
+        };
+
+        ContentBlockProcessor::with_enhanced_security_config(base64_processor, config)
     }
 
     #[test]
