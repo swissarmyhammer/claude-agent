@@ -53,17 +53,24 @@
 //! These errors are mapped to appropriate JSON-RPC error codes for client communication.
 
 use crate::path_validator::{PathValidationError, PathValidator};
-use crate::terminal_manager::{TerminalManager, TerminalCreateParams, TerminalCreateResponse, EnvVariable, TerminalSession};
-use crate::tool_types::{ToolKind, ToolCallStatus, ToolCallReport, ToolCallContent, ToolCallLocation};
-
+use crate::terminal_manager::{
+    TerminalCreateParams, TerminalCreateResponse, TerminalManager,
+};
+#[cfg(test)]
+use crate::terminal_manager::{EnvVariable, TerminalSession};
+use crate::tool_types::{
+    ToolCallReport, ToolCallStatus, ToolKind,
+};
+#[cfg(test)]
+use crate::tool_types::{ToolCallContent, ToolCallLocation};
+#[cfg(test)]
+use agent_client_protocol::SessionId;
 
 use serde_json::Value;
-use agent_client_protocol::SessionId;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-
 
 /// Internal representation of a tool request from an LLM
 #[derive(Debug, Clone)]
@@ -75,16 +82,6 @@ pub struct InternalToolRequest {
     /// Arguments passed to the tool as JSON
     pub arguments: Value,
 }
-
-
-
-
-
-
-
-
-
-
 
 /// Handles tool request execution with permission management and security validation
 #[derive(Debug, Clone)]
@@ -193,8 +190,6 @@ pub struct PermissionRequest {
     pub arguments: Value,
 }
 
-
-
 impl ToolCallHandler {
     /// Create a new tool call handler with the given permissions
     pub fn new(permissions: ToolPermissions) -> Self {
@@ -230,7 +225,7 @@ impl ToolCallHandler {
 
         loop {
             let id = format!("call_{}", ulid::Ulid::new());
-            
+
             // Check for collision in active tool calls
             {
                 let active_calls = self.active_tool_calls.read().await;
@@ -242,7 +237,8 @@ impl ToolCallHandler {
             attempt += 1;
             if attempt >= MAX_ATTEMPTS {
                 // Fallback with timestamp and random component for extremely rare collision cases
-                return format!("call_{}_{}", 
+                return format!(
+                    "call_{}_{}",
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -250,7 +246,7 @@ impl ToolCallHandler {
                     ulid::Ulid::new()
                 );
             }
-            
+
             // Short delay before retry (should be extremely rare)
             tokio::time::sleep(tokio::time::Duration::from_nanos(1)).await;
         }
@@ -266,10 +262,10 @@ impl ToolCallHandler {
         let tool_call_id = self.generate_tool_call_id().await;
         let title = ToolCallReport::generate_title(tool_name, arguments);
         let kind = ToolKind::classify_tool(tool_name, arguments);
-        
+
         let mut report = ToolCallReport::new(tool_call_id.clone(), title, kind);
         report.set_raw_input(arguments.clone());
-        
+
         // Track the active tool call
         {
             let mut active_calls = self.active_tool_calls.write().await;
@@ -284,7 +280,7 @@ impl ToolCallHandler {
         // 5. Include results/errors in final update content
         //
         // Status updates provide transparency and enable client UI updates.
-        
+
         // Send initial tool_call notification
         if let Some(sender) = &self.notification_sender {
             let notification = agent_client_protocol::SessionNotification {
@@ -292,7 +288,7 @@ impl ToolCallHandler {
                 update: agent_client_protocol::SessionUpdate::ToolCall(report.to_acp_tool_call()),
                 meta: None,
             };
-            
+
             if let Err(e) = sender.send_update(notification).await {
                 tracing::warn!(
                     tool_call_id = %tool_call_id,
@@ -302,16 +298,16 @@ impl ToolCallHandler {
                 );
             }
         }
-        
+
         report
     }
 
     /// Update a tracked tool call report with ACP-compliant session notification
     pub async fn update_tool_call_report(
-        &self, 
+        &self,
         session_id: &agent_client_protocol::SessionId,
-        tool_call_id: &str, 
-        update_fn: impl FnOnce(&mut ToolCallReport)
+        tool_call_id: &str,
+        update_fn: impl FnOnce(&mut ToolCallReport),
     ) -> Option<ToolCallReport> {
         let updated_report = {
             let mut active_calls = self.active_tool_calls.write().await;
@@ -328,10 +324,12 @@ impl ToolCallHandler {
             if let Some(sender) = &self.notification_sender {
                 let notification = agent_client_protocol::SessionNotification {
                     session_id: session_id.clone(),
-                    update: agent_client_protocol::SessionUpdate::ToolCallUpdate(report.to_acp_tool_call_update()),
+                    update: agent_client_protocol::SessionUpdate::ToolCallUpdate(
+                        report.to_acp_tool_call_update(),
+                    ),
                     meta: None,
                 };
-                
+
                 if let Err(e) = sender.send_update(notification).await {
                     tracing::warn!(
                         tool_call_id = %tool_call_id,
@@ -348,10 +346,10 @@ impl ToolCallHandler {
 
     /// Complete and remove a tool call from tracking with ACP-compliant session notification
     pub async fn complete_tool_call_report(
-        &self, 
+        &self,
         session_id: &agent_client_protocol::SessionId,
-        tool_call_id: &str, 
-        raw_output: Option<serde_json::Value>
+        tool_call_id: &str,
+        raw_output: Option<serde_json::Value>,
     ) -> Option<ToolCallReport> {
         let completed_report = {
             let mut active_calls = self.active_tool_calls.write().await;
@@ -371,10 +369,12 @@ impl ToolCallHandler {
             if let Some(sender) = &self.notification_sender {
                 let notification = agent_client_protocol::SessionNotification {
                     session_id: session_id.clone(),
-                    update: agent_client_protocol::SessionUpdate::ToolCallUpdate(report.to_acp_tool_call_update()),
+                    update: agent_client_protocol::SessionUpdate::ToolCallUpdate(
+                        report.to_acp_tool_call_update(),
+                    ),
                     meta: None,
                 };
-                
+
                 if let Err(e) = sender.send_update(notification).await {
                     tracing::warn!(
                         tool_call_id = %tool_call_id,
@@ -391,10 +391,10 @@ impl ToolCallHandler {
 
     /// Fail and remove a tool call from tracking with ACP-compliant session notification
     pub async fn fail_tool_call_report(
-        &self, 
+        &self,
         session_id: &agent_client_protocol::SessionId,
-        tool_call_id: &str, 
-        error_output: Option<serde_json::Value>
+        tool_call_id: &str,
+        error_output: Option<serde_json::Value>,
     ) -> Option<ToolCallReport> {
         let failed_report = {
             let mut active_calls = self.active_tool_calls.write().await;
@@ -414,10 +414,12 @@ impl ToolCallHandler {
             if let Some(sender) = &self.notification_sender {
                 let notification = agent_client_protocol::SessionNotification {
                     session_id: session_id.clone(),
-                    update: agent_client_protocol::SessionUpdate::ToolCallUpdate(report.to_acp_tool_call_update()),
+                    update: agent_client_protocol::SessionUpdate::ToolCallUpdate(
+                        report.to_acp_tool_call_update(),
+                    ),
                     meta: None,
                 };
-                
+
                 if let Err(e) = sender.send_update(notification).await {
                     tracing::warn!(
                         tool_call_id = %tool_call_id,
@@ -434,9 +436,9 @@ impl ToolCallHandler {
 
     /// Cancel and remove a tool call from tracking with ACP-compliant session notification
     pub async fn cancel_tool_call_report(
-        &self, 
+        &self,
         session_id: &agent_client_protocol::SessionId,
-        tool_call_id: &str
+        tool_call_id: &str,
     ) -> Option<ToolCallReport> {
         let cancelled_report = {
             let mut active_calls = self.active_tool_calls.write().await;
@@ -453,10 +455,12 @@ impl ToolCallHandler {
             if let Some(sender) = &self.notification_sender {
                 let notification = agent_client_protocol::SessionNotification {
                     session_id: session_id.clone(),
-                    update: agent_client_protocol::SessionUpdate::ToolCallUpdate(report.to_acp_tool_call_update()),
+                    update: agent_client_protocol::SessionUpdate::ToolCallUpdate(
+                        report.to_acp_tool_call_update(),
+                    ),
                     meta: None,
                 };
-                
+
                 if let Err(e) = sender.send_update(notification).await {
                     tracing::warn!(
                         tool_call_id = %tool_call_id,
@@ -570,7 +574,9 @@ impl ToolCallHandler {
         tracing::info!("Handling tool request: {}", request.name);
 
         // Create tool call report for tracking
-        let tool_report = self.create_tool_call_report(session_id, &request.name, &request.arguments).await;
+        let tool_report = self
+            .create_tool_call_report(session_id, &request.name, &request.arguments)
+            .await;
         tracing::debug!("Created tool call report: {}", tool_report.tool_call_id);
 
         // Check if permission is required for this tool
@@ -582,37 +588,50 @@ impl ToolCallHandler {
         // Update status to in_progress and execute the tool request
         self.update_tool_call_report(session_id, &tool_report.tool_call_id, |report| {
             report.update_status(ToolCallStatus::InProgress);
-        }).await;
+        })
+        .await;
 
         match self.execute_tool_request(&request).await {
             Ok(response) => {
                 // Complete the tool call with success
-                let completed_report = self.complete_tool_call_report(
-                    session_id,
-                    &tool_report.tool_call_id, 
-                    Some(serde_json::json!({"response": response}))
-                ).await;
-                
+                let completed_report = self
+                    .complete_tool_call_report(
+                        session_id,
+                        &tool_report.tool_call_id,
+                        Some(serde_json::json!({"response": response})),
+                    )
+                    .await;
+
                 if let Some(report) = completed_report {
-                    tracing::debug!("Completed tool call: {} with status {:?}", report.tool_call_id, report.status);
+                    tracing::debug!(
+                        "Completed tool call: {} with status {:?}",
+                        report.tool_call_id,
+                        report.status
+                    );
                 }
-                
+
                 Ok(ToolCallResult::Success(response))
-            },
+            }
             Err(e) => {
                 // Fail the tool call with error
-                let failed_report = self.fail_tool_call_report(
-                    session_id,
-                    &tool_report.tool_call_id, 
-                    Some(serde_json::json!({"error": e.to_string()}))
-                ).await;
-                
+                let failed_report = self
+                    .fail_tool_call_report(
+                        session_id,
+                        &tool_report.tool_call_id,
+                        Some(serde_json::json!({"error": e.to_string()})),
+                    )
+                    .await;
+
                 if let Some(report) = failed_report {
-                    tracing::debug!("Failed tool call: {} with error: {}", report.tool_call_id, e);
+                    tracing::debug!(
+                        "Failed tool call: {} with error: {}",
+                        report.tool_call_id,
+                        e
+                    );
                 }
-                
+
                 Ok(ToolCallResult::Error(e.to_string()))
-            },
+            }
         }
     }
 
@@ -1360,7 +1379,10 @@ mod tests {
             }),
         };
 
-        let result = handler.handle_tool_request(&session_id, request).await.unwrap();
+        let result = handler
+            .handle_tool_request(&session_id, request)
+            .await
+            .unwrap();
 
         match result {
             ToolCallResult::PermissionRequired(perm_req) => {
@@ -1385,7 +1407,10 @@ mod tests {
             }),
         };
 
-        let result = handler.handle_tool_request(&session_id, request).await.unwrap();
+        let result = handler
+            .handle_tool_request(&session_id, request)
+            .await
+            .unwrap();
 
         match result {
             ToolCallResult::Error(msg) => {
@@ -1566,7 +1591,10 @@ mod tests {
             }),
         };
 
-        let write_result = handler.handle_tool_request(&session_id, write_request).await.unwrap();
+        let write_result = handler
+            .handle_tool_request(&session_id, write_request)
+            .await
+            .unwrap();
         match write_result {
             ToolCallResult::Success(msg) => {
                 assert!(msg.contains("Successfully wrote"));
@@ -1584,7 +1612,10 @@ mod tests {
             }),
         };
 
-        let read_result = handler.handle_tool_request(&session_id, read_request).await.unwrap();
+        let read_result = handler
+            .handle_tool_request(&session_id, read_request)
+            .await
+            .unwrap();
         match read_result {
             ToolCallResult::Success(content) => {
                 assert_eq!(content, "Hello, World! This is a test.");
@@ -1621,7 +1652,10 @@ mod tests {
             }),
         };
 
-        let list_result = handler.handle_tool_request(&session_id, list_request).await.unwrap();
+        let list_result = handler
+            .handle_tool_request(&session_id, list_request)
+            .await
+            .unwrap();
         match list_result {
             ToolCallResult::Success(content) => {
                 assert!(content.contains("Contents of"));
@@ -1651,7 +1685,10 @@ mod tests {
             arguments: json!({}),
         };
 
-        let create_result = handler.handle_tool_request(&session_id, create_request).await.unwrap();
+        let create_result = handler
+            .handle_tool_request(&session_id, create_request)
+            .await
+            .unwrap();
         let terminal_id = match create_result {
             ToolCallResult::Success(msg) => {
                 assert!(msg.contains("Created terminal session:"));
@@ -1671,7 +1708,10 @@ mod tests {
             }),
         };
 
-        let write_result = handler.handle_tool_request(&session_id, write_request).await.unwrap();
+        let write_result = handler
+            .handle_tool_request(&session_id, write_request)
+            .await
+            .unwrap();
         match write_result {
             ToolCallResult::Success(output) => {
                 assert!(
@@ -1704,7 +1744,10 @@ mod tests {
             arguments: json!({}),
         };
 
-        let create_result = handler.handle_tool_request(&session_id, create_request).await.unwrap();
+        let create_result = handler
+            .handle_tool_request(&session_id, create_request)
+            .await
+            .unwrap();
         let terminal_id = match create_result {
             ToolCallResult::Success(msg) => msg.split_whitespace().last().unwrap().to_string(),
             _ => panic!("Terminal creation should succeed"),
@@ -1720,7 +1763,10 @@ mod tests {
             }),
         };
 
-        let cd_result = handler.handle_tool_request(&session_id, cd_request).await.unwrap();
+        let cd_result = handler
+            .handle_tool_request(&session_id, cd_request)
+            .await
+            .unwrap();
         match cd_result {
             ToolCallResult::Success(output) => {
                 assert!(output.contains("Changed directory to:"));
@@ -1757,7 +1803,10 @@ mod tests {
                 }),
             };
 
-            let result = handler.handle_tool_request(&session_id, read_request).await.unwrap();
+            let result = handler
+                .handle_tool_request(&session_id, read_request)
+                .await
+                .unwrap();
             match result {
                 ToolCallResult::Error(msg) => {
                     // With capability validation now happening first, we expect either:
@@ -1809,7 +1858,10 @@ mod tests {
             }),
         };
 
-        let result = handler.handle_tool_request(&session_id, read_request).await.unwrap();
+        let result = handler
+            .handle_tool_request(&session_id, read_request)
+            .await
+            .unwrap();
         match result {
             ToolCallResult::Success(content) => {
                 assert_eq!(content, "ACP test content");
@@ -1844,7 +1896,10 @@ mod tests {
                 }),
             };
 
-            let result = handler.handle_tool_request(&session_id, read_request).await.unwrap();
+            let result = handler
+                .handle_tool_request(&session_id, read_request)
+                .await
+                .unwrap();
             match result {
                 ToolCallResult::Error(msg) => {
                     // With capability validation first, we expect either capability errors or path errors
@@ -1882,7 +1937,10 @@ mod tests {
             }),
         };
 
-        let result = handler.handle_tool_request(&session_id, read_request).await.unwrap();
+        let result = handler
+            .handle_tool_request(&session_id, read_request)
+            .await
+            .unwrap();
         match result {
             ToolCallResult::Error(msg) => {
                 // With capability validation first, we expect either capability errors or path errors
@@ -2089,7 +2147,10 @@ mod tests {
             arguments: json!({"path": "/test/file.txt"}),
         };
 
-        let result = handler.handle_tool_request(&session_id, read_request).await.unwrap();
+        let result = handler
+            .handle_tool_request(&session_id, read_request)
+            .await
+            .unwrap();
         match result {
             ToolCallResult::Error(msg) => {
                 assert!(msg.contains("fs.read_text_file capability"));
@@ -2126,7 +2187,10 @@ mod tests {
             arguments: json!({}),
         };
 
-        let result = handler.handle_tool_request(&session_id, terminal_request).await.unwrap();
+        let result = handler
+            .handle_tool_request(&session_id, terminal_request)
+            .await
+            .unwrap();
         match result {
             ToolCallResult::Error(msg) => {
                 assert!(msg.contains("terminal capability"));
@@ -2163,7 +2227,10 @@ mod tests {
             arguments: json!({"path": "/test/file.txt"}),
         };
 
-        let result = handler.handle_tool_request(&session_id, read_request).await.unwrap();
+        let result = handler
+            .handle_tool_request(&session_id, read_request)
+            .await
+            .unwrap();
         if let ToolCallResult::Error(msg) = result {
             // Should be a file I/O error, not a capability error
             assert!(!msg.contains("capability"));
@@ -2177,7 +2244,10 @@ mod tests {
             arguments: json!({}),
         };
 
-        let result = handler.handle_tool_request(&session_id, terminal_request).await.unwrap();
+        let result = handler
+            .handle_tool_request(&session_id, terminal_request)
+            .await
+            .unwrap();
         match result {
             ToolCallResult::Success(msg) => {
                 assert!(msg.contains("Created terminal session"));
@@ -2608,7 +2678,10 @@ mod tests {
             arguments: json!({}),
         };
 
-        let result = handler.handle_tool_request(&session_id, terminal_request).await.unwrap();
+        let result = handler
+            .handle_tool_request(&session_id, terminal_request)
+            .await
+            .unwrap();
         match result {
             ToolCallResult::Error(msg) => {
                 assert!(msg.contains("Method not supported"));
@@ -2625,11 +2698,14 @@ mod tests {
         });
 
         let result_no_caps = handler_no_caps
-            .handle_tool_request(&session_id, InternalToolRequest {
-                id: "test".to_string(),
-                name: "terminal_create".to_string(),
-                arguments: json!({}),
-            })
+            .handle_tool_request(
+                &session_id,
+                InternalToolRequest {
+                    id: "test".to_string(),
+                    name: "terminal_create".to_string(),
+                    arguments: json!({}),
+                },
+            )
             .await
             .unwrap();
 
@@ -2645,56 +2721,113 @@ mod tests {
     #[tokio::test]
     async fn test_tool_kind_classification() {
         // Test file system operations
-        assert_eq!(ToolKind::classify_tool("fs_read_text_file", &json!({})), ToolKind::Read);
-        assert_eq!(ToolKind::classify_tool("fs_write_text_file", &json!({})), ToolKind::Edit);
-        assert_eq!(ToolKind::classify_tool("fs_delete", &json!({})), ToolKind::Delete);
-        assert_eq!(ToolKind::classify_tool("fs_move", &json!({})), ToolKind::Move);
-        
+        assert_eq!(
+            ToolKind::classify_tool("fs_read_text_file", &json!({})),
+            ToolKind::Read
+        );
+        assert_eq!(
+            ToolKind::classify_tool("fs_write_text_file", &json!({})),
+            ToolKind::Edit
+        );
+        assert_eq!(
+            ToolKind::classify_tool("fs_delete", &json!({})),
+            ToolKind::Delete
+        );
+        assert_eq!(
+            ToolKind::classify_tool("fs_move", &json!({})),
+            ToolKind::Move
+        );
+
         // Test terminal operations
-        assert_eq!(ToolKind::classify_tool("terminal_create", &json!({})), ToolKind::Execute);
-        assert_eq!(ToolKind::classify_tool("execute", &json!({})), ToolKind::Execute);
-        
+        assert_eq!(
+            ToolKind::classify_tool("terminal_create", &json!({})),
+            ToolKind::Execute
+        );
+        assert_eq!(
+            ToolKind::classify_tool("execute", &json!({})),
+            ToolKind::Execute
+        );
+
         // Test search operations
-        assert_eq!(ToolKind::classify_tool("search", &json!({})), ToolKind::Search);
-        assert_eq!(ToolKind::classify_tool("grep", &json!({})), ToolKind::Search);
-        
+        assert_eq!(
+            ToolKind::classify_tool("search", &json!({})),
+            ToolKind::Search
+        );
+        assert_eq!(
+            ToolKind::classify_tool("grep", &json!({})),
+            ToolKind::Search
+        );
+
         // Test fetch operations
-        assert_eq!(ToolKind::classify_tool("fetch", &json!({})), ToolKind::Fetch);
-        assert_eq!(ToolKind::classify_tool("http_get", &json!({})), ToolKind::Fetch);
-        
+        assert_eq!(
+            ToolKind::classify_tool("fetch", &json!({})),
+            ToolKind::Fetch
+        );
+        assert_eq!(
+            ToolKind::classify_tool("http_get", &json!({})),
+            ToolKind::Fetch
+        );
+
         // Test MCP tool classification
-        assert_eq!(ToolKind::classify_tool("mcp__files_read", &json!({})), ToolKind::Read);
-        assert_eq!(ToolKind::classify_tool("mcp__files_write", &json!({})), ToolKind::Edit);
-        assert_eq!(ToolKind::classify_tool("mcp__shell_execute", &json!({})), ToolKind::Execute);
-        assert_eq!(ToolKind::classify_tool("mcp__web_fetch", &json!({})), ToolKind::Fetch);
-        
+        assert_eq!(
+            ToolKind::classify_tool("mcp__files_read", &json!({})),
+            ToolKind::Read
+        );
+        assert_eq!(
+            ToolKind::classify_tool("mcp__files_write", &json!({})),
+            ToolKind::Edit
+        );
+        assert_eq!(
+            ToolKind::classify_tool("mcp__shell_execute", &json!({})),
+            ToolKind::Execute
+        );
+        assert_eq!(
+            ToolKind::classify_tool("mcp__web_fetch", &json!({})),
+            ToolKind::Fetch
+        );
+
         // Test default fallback
-        assert_eq!(ToolKind::classify_tool("unknown_tool", &json!({})), ToolKind::Other);
+        assert_eq!(
+            ToolKind::classify_tool("unknown_tool", &json!({})),
+            ToolKind::Other
+        );
     }
 
     #[tokio::test]
     async fn test_tool_title_generation() {
         // Test file operations with paths
-        let title = ToolCallReport::generate_title("fs_read_text_file", &json!({
-            "path": "/home/user/config.json"
-        }));
+        let title = ToolCallReport::generate_title(
+            "fs_read_text_file",
+            &json!({
+                "path": "/home/user/config.json"
+            }),
+        );
         assert_eq!(title, "Reading config.json");
 
-        let title = ToolCallReport::generate_title("fs_write_text_file", &json!({
-            "path": "/var/log/app.log"
-        }));
+        let title = ToolCallReport::generate_title(
+            "fs_write_text_file",
+            &json!({
+                "path": "/var/log/app.log"
+            }),
+        );
         assert_eq!(title, "Writing to app.log");
 
         // Test terminal operations
-        let title = ToolCallReport::generate_title("terminal_create", &json!({
-            "command": "ls"
-        }));
+        let title = ToolCallReport::generate_title(
+            "terminal_create",
+            &json!({
+                "command": "ls"
+            }),
+        );
         assert_eq!(title, "Running ls");
 
         // Test search operations
-        let title = ToolCallReport::generate_title("search", &json!({
-            "pattern": "error.*log"
-        }));
+        let title = ToolCallReport::generate_title(
+            "search",
+            &json!({
+                "pattern": "error.*log"
+            }),
+        );
         assert_eq!(title, "Searching for 'error.*log'");
 
         // Test MCP tools
@@ -2713,32 +2846,36 @@ mod tests {
     #[tokio::test]
     async fn test_tool_call_id_generation() {
         let handler = create_test_handler();
-        
+
         // Test unique ID generation
         let id1 = handler.generate_tool_call_id().await;
         let id2 = handler.generate_tool_call_id().await;
-        
+
         assert_ne!(id1, id2);
         assert!(id1.starts_with("call_"));
         assert!(id2.starts_with("call_"));
-        
+
         // IDs should be ULID format after the prefix
         let ulid_part1 = id1.strip_prefix("call_").unwrap();
         let ulid_part2 = id2.strip_prefix("call_").unwrap();
-        
+
         assert_eq!(ulid_part1.len(), 26); // ULID length
         assert_eq!(ulid_part2.len(), 26);
-        
+
         // Test multiple concurrent ID generations don't collide
         let mut ids = Vec::new();
         for _ in 0..10 {
             ids.push(handler.generate_tool_call_id().await);
         }
-        
+
         // Check all IDs are unique
         for i in 0..ids.len() {
-            for j in i+1..ids.len() {
-                assert_ne!(ids[i], ids[j], "Found duplicate IDs: {} and {}", ids[i], ids[j]);
+            for j in i + 1..ids.len() {
+                assert_ne!(
+                    ids[i], ids[j],
+                    "Found duplicate IDs: {} and {}",
+                    ids[i], ids[j]
+                );
             }
         }
     }
@@ -2747,54 +2884,66 @@ mod tests {
     async fn test_tool_call_report_lifecycle() {
         let handler = create_test_handler();
         let session_id = agent_client_protocol::SessionId("test_session".into());
-        
+
         // Create a tool call report
-        let report = handler.create_tool_call_report(&session_id, "fs_read_text_file", &json!({
-            "path": "/test/file.txt"
-        })).await;
-        
+        let report = handler
+            .create_tool_call_report(
+                &session_id,
+                "fs_read_text_file",
+                &json!({
+                    "path": "/test/file.txt"
+                }),
+            )
+            .await;
+
         assert_eq!(report.status, ToolCallStatus::Pending);
         assert_eq!(report.kind, ToolKind::Read);
         assert_eq!(report.title, "Reading file.txt");
         assert!(report.raw_input.is_some());
         assert!(report.raw_output.is_none());
-        
+
         // Update the report status
-        let updated = handler.update_tool_call_report(&session_id, &report.tool_call_id, |r| {
-            r.update_status(ToolCallStatus::InProgress);
-            r.add_content(ToolCallContent::Content {
-                content: agent_client_protocol::ContentBlock::Text(
-                    agent_client_protocol::TextContent {
-                        text: "Reading file...".to_string(),
-                        annotations: None,
-                        meta: None,
-                    }
-                ),
-            });
-        }).await;
-        
+        let updated = handler
+            .update_tool_call_report(&session_id, &report.tool_call_id, |r| {
+                r.update_status(ToolCallStatus::InProgress);
+                r.add_content(ToolCallContent::Content {
+                    content: agent_client_protocol::ContentBlock::Text(
+                        agent_client_protocol::TextContent {
+                            text: "Reading file...".to_string(),
+                            annotations: None,
+                            meta: None,
+                        },
+                    ),
+                });
+            })
+            .await;
+
         assert!(updated.is_some());
         let updated = updated.unwrap();
         assert_eq!(updated.status, ToolCallStatus::InProgress);
         assert_eq!(updated.content.len(), 1);
-        
+
         // Complete the tool call
-        let completed = handler.complete_tool_call_report(
-            &session_id,
-            &report.tool_call_id,
-            Some(json!({"content": "file contents"}))
-        ).await;
-        
+        let completed = handler
+            .complete_tool_call_report(
+                &session_id,
+                &report.tool_call_id,
+                Some(json!({"content": "file contents"})),
+            )
+            .await;
+
         assert!(completed.is_some());
         let completed = completed.unwrap();
         assert_eq!(completed.status, ToolCallStatus::Completed);
         assert!(completed.raw_output.is_some());
-        
+
         // Try to update a completed (removed) tool call - should return None
-        let not_found = handler.update_tool_call_report(&session_id, &report.tool_call_id, |r| {
-            r.update_status(ToolCallStatus::Failed);
-        }).await;
-        
+        let not_found = handler
+            .update_tool_call_report(&session_id, &report.tool_call_id, |r| {
+                r.update_status(ToolCallStatus::Failed);
+            })
+            .await;
+
         assert!(not_found.is_none());
     }
 
@@ -2802,50 +2951,61 @@ mod tests {
     async fn test_tool_call_report_failure() {
         let handler = create_test_handler();
         let session_id = agent_client_protocol::SessionId("test_session".into());
-        
+
         // Create a tool call report
-        let report = handler.create_tool_call_report(&session_id, "fs_write_text_file", &json!({
-            "path": "/readonly/file.txt",
-            "content": "test"
-        })).await;
-        
+        let report = handler
+            .create_tool_call_report(
+                &session_id,
+                "fs_write_text_file",
+                &json!({
+                    "path": "/readonly/file.txt",
+                    "content": "test"
+                }),
+            )
+            .await;
+
         // Fail the tool call
-        let failed = handler.fail_tool_call_report(
-            &session_id,
-            &report.tool_call_id,
-            Some(json!({"error": "Permission denied", "code": "EACCES"}))
-        ).await;
-        
+        let failed = handler
+            .fail_tool_call_report(
+                &session_id,
+                &report.tool_call_id,
+                Some(json!({"error": "Permission denied", "code": "EACCES"})),
+            )
+            .await;
+
         assert!(failed.is_some());
         let failed = failed.unwrap();
         assert_eq!(failed.status, ToolCallStatus::Failed);
         assert!(failed.raw_output.is_some());
-        
+
         if let Some(output) = failed.raw_output {
-            assert!(output["error"].as_str().unwrap().contains("Permission denied"));
+            assert!(output["error"]
+                .as_str()
+                .unwrap()
+                .contains("Permission denied"));
             assert_eq!(output["code"], "EACCES");
         }
     }
 
-    #[tokio::test] 
+    #[tokio::test]
     async fn test_tool_call_locations_and_content() {
         let mut report = ToolCallReport::new(
             "call_test123".to_string(),
-            "Test operation".to_string(), 
-            ToolKind::Edit
+            "Test operation".to_string(),
+            ToolKind::Edit,
         );
-        
+
         // Add file locations
         report.add_location(ToolCallLocation {
             path: "/home/user/src/main.rs".to_string(),
             line: Some(42),
         });
-        
+
         report.add_location(ToolCallLocation {
             path: "/home/user/src/lib.rs".to_string(),
             line: None,
         });
-        
+
         // Add different types of content
         report.add_content(ToolCallContent::Content {
             content: agent_client_protocol::ContentBlock::Text(
@@ -2853,25 +3013,25 @@ mod tests {
                     text: "Operation completed".to_string(),
                     annotations: None,
                     meta: None,
-                }
+                },
             ),
         });
-        
+
         report.add_content(ToolCallContent::Diff {
             path: "/home/user/src/main.rs".to_string(),
             old_text: Some("fn old() {}".to_string()),
             new_text: "fn new() {}".to_string(),
         });
-        
+
         report.add_content(ToolCallContent::Terminal {
             terminal_id: "term_abc123".to_string(),
         });
-        
+
         assert_eq!(report.locations.len(), 2);
         assert_eq!(report.content.len(), 3);
         assert_eq!(report.locations[0].line, Some(42));
         assert_eq!(report.locations[1].line, None);
-        
+
         // Test content types
         match &report.content[0] {
             ToolCallContent::Content { content } => {
@@ -2880,23 +3040,27 @@ mod tests {
                 } else {
                     panic!("Expected text content");
                 }
-            },
+            }
             _ => panic!("Expected content type"),
         }
-        
+
         match &report.content[1] {
-            ToolCallContent::Diff { path, old_text, new_text } => {
+            ToolCallContent::Diff {
+                path,
+                old_text,
+                new_text,
+            } => {
                 assert_eq!(path, "/home/user/src/main.rs");
                 assert_eq!(old_text.as_ref().unwrap(), "fn old() {}");
                 assert_eq!(new_text, "fn new() {}");
-            },
+            }
             _ => panic!("Expected diff content"),
         }
-        
+
         match &report.content[2] {
             ToolCallContent::Terminal { terminal_id } => {
                 assert_eq!(terminal_id, "term_abc123");
-            },
+            }
             _ => panic!("Expected terminal content"),
         }
     }

@@ -1,11 +1,22 @@
-
 use crate::base64_processor::{Base64Processor, Base64ProcessorError};
+use crate::content_security_validator::{ContentSecurityError, ContentSecurityValidator};
 use agent_client_protocol::{ContentBlock, TextContent};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, error, warn};
 
+/// Configuration struct for enhanced security settings
+#[derive(Debug)]
+pub struct EnhancedSecurityConfig {
+    pub max_resource_size: usize,
+    pub enable_uri_validation: bool,
+    pub processing_timeout: Duration,
+    pub enable_capability_validation: bool,
+    pub supported_capabilities: HashMap<String, bool>,
+    pub enable_batch_recovery: bool,
+    pub content_security_validator: ContentSecurityValidator,
+}
 
 #[derive(Debug, Error, Clone)]
 pub enum ContentBlockProcessorError {
@@ -41,6 +52,8 @@ pub enum ContentBlockProcessorError {
     ResourceLinkFetchFailed { uri: String },
     #[error("Content array validation failed: {details}")]
     ContentArrayValidationFailed { details: String },
+    #[error("Content security validation failed: {0}")]
+    ContentSecurityValidationFailed(#[from] ContentSecurityError),
 }
 
 #[derive(Debug)]
@@ -78,6 +91,7 @@ pub struct ContentBlockProcessor {
     enable_capability_validation: bool,
     supported_capabilities: HashMap<String, bool>,
     enable_batch_recovery: bool,
+    content_security_validator: Option<ContentSecurityValidator>,
 }
 
 impl Default for ContentBlockProcessor {
@@ -97,6 +111,7 @@ impl Default for ContentBlockProcessor {
             enable_capability_validation: true,
             supported_capabilities,
             enable_batch_recovery: true,
+            content_security_validator: None, // Default to no enhanced security validation
         }
     }
 }
@@ -132,6 +147,38 @@ impl ContentBlockProcessor {
             enable_capability_validation,
             supported_capabilities,
             enable_batch_recovery,
+            content_security_validator: None,
+        }
+    }
+
+    pub fn with_enhanced_security(
+        base64_processor: Base64Processor,
+        max_resource_size: usize,
+        enable_uri_validation: bool,
+        content_security_validator: ContentSecurityValidator,
+    ) -> Self {
+        Self {
+            base64_processor,
+            max_resource_size,
+            enable_uri_validation,
+            content_security_validator: Some(content_security_validator),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_enhanced_security_config(
+        base64_processor: Base64Processor,
+        config: EnhancedSecurityConfig,
+    ) -> Self {
+        Self {
+            base64_processor,
+            max_resource_size: config.max_resource_size,
+            enable_uri_validation: config.enable_uri_validation,
+            processing_timeout: config.processing_timeout,
+            enable_capability_validation: config.enable_capability_validation,
+            supported_capabilities: config.supported_capabilities,
+            enable_batch_recovery: config.enable_batch_recovery,
+            content_security_validator: Some(config.content_security_validator),
         }
     }
 
@@ -171,7 +218,15 @@ impl ContentBlockProcessor {
     }
 
     /// Validate content block structure
-    pub fn validate_content_block_structure(&self, content_block: &ContentBlock) -> Result<(), ContentBlockProcessorError> {
+    pub fn validate_content_block_structure(
+        &self,
+        content_block: &ContentBlock,
+    ) -> Result<(), ContentBlockProcessorError> {
+        // Enhanced security validation first if available
+        if let Some(ref validator) = self.content_security_validator {
+            validator.validate_content_security(content_block)?;
+        }
+
         match content_block {
             ContentBlock::Text(text_content) => {
                 if text_content.text.is_empty() {
@@ -179,35 +234,45 @@ impl ContentBlockProcessor {
                         details: "Text content cannot be empty".to_string(),
                     });
                 }
-            },
+            }
             ContentBlock::Image(image_content) => {
                 if image_content.data.is_empty() {
-                    return Err(ContentBlockProcessorError::MissingRequiredField("data".to_string()));
+                    return Err(ContentBlockProcessorError::MissingRequiredField(
+                        "data".to_string(),
+                    ));
                 }
                 if image_content.mime_type.is_empty() {
-                    return Err(ContentBlockProcessorError::MissingRequiredField("mime_type".to_string()));
+                    return Err(ContentBlockProcessorError::MissingRequiredField(
+                        "mime_type".to_string(),
+                    ));
                 }
-            },
+            }
             ContentBlock::Audio(audio_content) => {
                 self.validate_capability("audio")?;
                 if audio_content.data.is_empty() {
-                    return Err(ContentBlockProcessorError::MissingRequiredField("data".to_string()));
+                    return Err(ContentBlockProcessorError::MissingRequiredField(
+                        "data".to_string(),
+                    ));
                 }
                 if audio_content.mime_type.is_empty() {
-                    return Err(ContentBlockProcessorError::MissingRequiredField("mime_type".to_string()));
+                    return Err(ContentBlockProcessorError::MissingRequiredField(
+                        "mime_type".to_string(),
+                    ));
                 }
-            },
+            }
             ContentBlock::Resource(_resource_content) => {
                 self.validate_capability("resource")?;
                 // Resource structure validation will be enhanced when Resource processing is fully implemented
                 debug!("Resource content structure validation placeholder");
-            },
+            }
             ContentBlock::ResourceLink(resource_link) => {
                 self.validate_capability("resource_link")?;
                 if resource_link.uri.is_empty() {
-                    return Err(ContentBlockProcessorError::MissingRequiredField("uri".to_string()));
+                    return Err(ContentBlockProcessorError::MissingRequiredField(
+                        "uri".to_string(),
+                    ));
                 }
-            },
+            }
         }
         Ok(())
     }
@@ -246,7 +311,7 @@ impl ContentBlockProcessor {
             ContentBlock::Text(text_content) => {
                 self.validate_capability("text")?;
                 self.process_text_content(text_content)
-            },
+            }
             ContentBlock::Image(image_content) => {
                 self.validate_capability("image")?;
                 // Decode and validate image data using existing base64_processor
@@ -421,6 +486,11 @@ impl ContentBlockProcessor {
         &self,
         content_blocks: &[ContentBlock],
     ) -> Result<ContentProcessingSummary, ContentBlockProcessorError> {
+        // Enhanced security validation for content arrays if available
+        if let Some(ref validator) = self.content_security_validator {
+            validator.validate_content_blocks_security(content_blocks)?;
+        }
+
         if self.enable_batch_recovery {
             self.process_content_blocks_with_recovery(content_blocks)
         } else {
@@ -440,13 +510,16 @@ impl ContentBlockProcessor {
         let mut content_type_counts = HashMap::new();
 
         for (index, content_block) in content_blocks.iter().enumerate() {
-            debug!("Processing content block {} of {}", index + 1, content_blocks.len());
-            
-            let processed = self.process_content_block(content_block)
-                .map_err(|e| {
-                    error!("Failed to process content block at index {}: {}", index, e);
-                    e
-                })?;
+            debug!(
+                "Processing content block {} of {}",
+                index + 1,
+                content_blocks.len()
+            );
+
+            let processed = self.process_content_block(content_block).map_err(|e| {
+                error!("Failed to process content block at index {}: {}", index, e);
+                e
+            })?;
 
             // Accumulate text representation
             text_content.push_str(&processed.text_representation);
@@ -487,12 +560,16 @@ impl ContentBlockProcessor {
         let mut processing_errors = Vec::new();
 
         for (index, content_block) in content_blocks.iter().enumerate() {
-            debug!("Processing content block {} of {} (with recovery)", index + 1, content_blocks.len());
-            
+            debug!(
+                "Processing content block {} of {} (with recovery)",
+                index + 1,
+                content_blocks.len()
+            );
+
             match self.process_content_block_with_retry(content_block, 3) {
                 Ok(processed) => {
                     successful_count += 1;
-                    
+
                     // Accumulate text representation
                     text_content.push_str(&processed.text_representation);
 
@@ -507,13 +584,16 @@ impl ContentBlockProcessor {
                     *content_type_counts.entry(type_key.to_string()).or_insert(0) += 1;
 
                     processed_contents.push(processed);
-                },
+                }
                 Err(e) => {
-                    error!("Failed to process content block at index {} after retries: {}", index, e);
-                    
+                    error!(
+                        "Failed to process content block at index {} after retries: {}",
+                        index, e
+                    );
+
                     // Add placeholder for failed content
                     let fallback_content = self.create_fallback_content(index, &e);
-                    
+
                     // Store error for reporting
                     processing_errors.push((index, e));
                     text_content.push_str(&fallback_content.text_representation);
@@ -551,25 +631,32 @@ impl ContentBlockProcessor {
         max_retries: u32,
     ) -> Result<ProcessedContent, ContentBlockProcessorError> {
         let mut last_error = None;
-        
+
         for attempt in 0..=max_retries {
             if attempt > 0 {
                 // Exponential backoff
                 let backoff_ms = std::cmp::min(1000 * (2_u64.pow(attempt - 1)), 10000);
-                debug!("Retrying content block processing after {}ms (attempt {})", backoff_ms, attempt + 1);
+                debug!(
+                    "Retrying content block processing after {}ms (attempt {})",
+                    backoff_ms,
+                    attempt + 1
+                );
                 std::thread::sleep(Duration::from_millis(backoff_ms));
             }
 
             match self.process_content_block(content_block) {
                 Ok(processed) => {
                     if attempt > 0 {
-                        debug!("Content block processing succeeded on attempt {}", attempt + 1);
+                        debug!(
+                            "Content block processing succeeded on attempt {}",
+                            attempt + 1
+                        );
                     }
                     return Ok(processed);
-                },
+                }
                 Err(e) => {
                     last_error = Some(e);
-                    
+
                     // Don't retry certain non-transient errors
                     if let Some(ref error) = last_error {
                         if self.is_non_retryable_error(error) {
@@ -592,12 +679,13 @@ impl ContentBlockProcessor {
             ContentBlockProcessorError::InvalidContentStructure { .. } => true,
             ContentBlockProcessorError::UnsupportedContentType(_) => true,
             ContentBlockProcessorError::Base64Error(base64_error) => {
-                matches!(base64_error, 
-                    crate::base64_processor::Base64ProcessorError::MimeTypeNotAllowed(_) |
-                    crate::base64_processor::Base64ProcessorError::CapabilityNotSupported { .. } |
-                    crate::base64_processor::Base64ProcessorError::InvalidBase64(_)
+                matches!(
+                    base64_error,
+                    crate::base64_processor::Base64ProcessorError::MimeTypeNotAllowed(_)
+                        | crate::base64_processor::Base64ProcessorError::CapabilityNotSupported { .. }
+                        | crate::base64_processor::Base64ProcessorError::InvalidBase64(_)
                 )
-            },
+            }
             _ => false, // Retry timeouts, memory issues, etc.
         }
     }
@@ -610,12 +698,18 @@ impl ContentBlockProcessor {
     ) -> ProcessedContent {
         let mut metadata = HashMap::new();
         metadata.insert("processing_failed".to_string(), "true".to_string());
-        metadata.insert("error_type".to_string(), format!("{:?}", std::mem::discriminant(error)));
+        metadata.insert(
+            "error_type".to_string(),
+            format!("{:?}", std::mem::discriminant(error)),
+        );
         metadata.insert("content_index".to_string(), index.to_string());
 
         ProcessedContent {
             content_type: ProcessedContentType::Text,
-            text_representation: format!("[Content processing failed at index {}: {}]", index, error),
+            text_representation: format!(
+                "[Content processing failed at index {}: {}]",
+                index, error
+            ),
             binary_data: None,
             metadata,
             size_bytes: 0,
@@ -635,6 +729,7 @@ impl ContentBlockProcessor {
 }
 
 /// Summary of processing multiple content blocks
+#[derive(Debug)]
 pub struct ContentProcessingSummary {
     pub processed_contents: Vec<ProcessedContent>,
     pub combined_text: String,
@@ -658,10 +753,10 @@ mod tests {
 
         ContentBlockProcessor::new_with_config(
             Base64Processor::default(),
-            50 * 1024 * 1024, // 50MB for resources
-            true, // enable_uri_validation
+            50 * 1024 * 1024,        // 50MB for resources
+            true,                    // enable_uri_validation
             Duration::from_secs(30), // processing_timeout
-            true, // enable_capability_validation
+            true,                    // enable_capability_validation
             supported_capabilities,
             true, // enable_batch_recovery
         )
@@ -747,15 +842,18 @@ mod tests {
     #[test]
     fn test_process_audio_content_wav() {
         let processor = create_test_processor();
-        
+
         // Test that audio capability is supported
         println!("Testing audio capability support...");
         let capability_result = processor.validate_capability("audio");
         if let Err(e) = &capability_result {
             println!("Audio capability validation failed: {:?}", e);
         }
-        assert!(capability_result.is_ok(), "Audio capability should be supported in test processor");
-        
+        assert!(
+            capability_result.is_ok(),
+            "Audio capability should be supported in test processor"
+        );
+
         // Simple WAV header in base64 (RIFF header + WAVE format)
         let wav_data = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAAA";
 
@@ -767,17 +865,17 @@ mod tests {
         };
 
         let content_block = ContentBlock::Audio(audio_content);
-        
+
         // Test content block structure validation first
         println!("Testing content block structure validation...");
         let structure_result = processor.validate_content_block_structure(&content_block);
         if let Err(e) = &structure_result {
             println!("Structure validation failed: {:?}", e);
         }
-        
+
         println!("Processing audio content block...");
         let result = processor.process_content_block(&content_block);
-        
+
         match &result {
             Ok(_) => {
                 println!("Audio processing succeeded");
@@ -794,8 +892,12 @@ mod tests {
                 }
             }
         }
-        
-        assert!(result.is_ok(), "Expected audio processing to succeed, but got error: {:?}", result.err());
+
+        assert!(
+            result.is_ok(),
+            "Expected audio processing to succeed, but got error: {:?}",
+            result.err()
+        );
 
         let processed = result.unwrap();
         assert!(processed

@@ -11,6 +11,10 @@ pub mod capability_validation;
 pub mod claude;
 pub mod config;
 pub mod content_block_processor;
+pub mod content_security_validator;
+
+#[cfg(test)]
+mod content_security_integration_tests;
 pub mod error;
 pub mod mcp;
 pub mod mcp_error_handling;

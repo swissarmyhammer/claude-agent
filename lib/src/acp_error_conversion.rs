@@ -1,5 +1,6 @@
 use crate::base64_processor::Base64ProcessorError;
 use crate::content_block_processor::ContentBlockProcessorError;
+use crate::content_security_validator::ContentSecurityError;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -27,46 +28,46 @@ pub struct JsonRpcError {
 pub enum ContentProcessingError {
     #[error("Invalid content block structure: {0}")]
     InvalidStructure(String),
-    
+
     #[error("Unsupported content type: {content_type}, supported types: {supported:?}")]
     UnsupportedContentType {
         content_type: String,
         supported: Vec<String>,
     },
-    
+
     #[error("Invalid base64 data: {0}")]
     InvalidBase64(String),
-    
+
     #[error("Content size exceeded: {size} > {limit}")]
     ContentSizeExceeded { size: usize, limit: usize },
-    
+
     #[error("MIME type validation failed: {mime_type} does not match content format")]
     MimeTypeMismatch { mime_type: String },
-    
+
     #[error("Content capability not supported: {capability}")]
     CapabilityNotSupported { capability: String },
-    
+
     #[error("Security validation failed: {reason}")]
     SecurityViolation { reason: String },
-    
+
     #[error("Processing timeout: content processing exceeded {timeout}s")]
     ProcessingTimeout { timeout: u64 },
-    
+
     #[error("Memory pressure: insufficient memory for content processing")]
     MemoryPressure,
-    
+
     #[error("Resource contention: processing queue full")]
     ResourceContention,
-    
+
     #[error("Invalid URI format: {uri}")]
     InvalidUri { uri: String },
-    
+
     #[error("Missing required field: {field}")]
     MissingRequiredField { field: String },
-    
+
     #[error("Content validation failed: {details}")]
     ContentValidationFailed { details: String },
-    
+
     #[error("Format detection failed: {reason}")]
     FormatDetectionFailed { reason: String },
 }
@@ -91,13 +92,195 @@ impl Default for ErrorContext {
     }
 }
 
+/// Convert ContentSecurityError to ACP-compliant JSON-RPC error
+pub fn convert_content_security_error_to_acp(
+    error: ContentSecurityError,
+    context: Option<ErrorContext>,
+) -> JsonRpcError {
+    let ctx = context.unwrap_or_default();
+
+    match error {
+        ContentSecurityError::SecurityValidationFailed {
+            reason,
+            policy_violated,
+        } => JsonRpcError {
+            code: -32602,
+            message: "Content security validation failed".to_string(),
+            data: Some(json!({
+                "error": "security_validation_failed",
+                "details": reason,
+                "policyViolated": policy_violated,
+                "suggestion": "Review content security policies and ensure compliance",
+                "correlationId": ctx.correlation_id,
+                "stage": ctx.processing_stage
+            })),
+        },
+        ContentSecurityError::SuspiciousContentDetected {
+            threat_type,
+            details,
+        } => JsonRpcError {
+            code: -32602,
+            message: "Suspicious content detected".to_string(),
+            data: Some(json!({
+                "error": "suspicious_content_detected",
+                "threatType": threat_type,
+                "details": details,
+                "suggestion": "Remove suspicious content or use a lower security level",
+                "correlationId": ctx.correlation_id,
+                "stage": ctx.processing_stage
+            })),
+        },
+        ContentSecurityError::DoSProtectionTriggered {
+            protection_type,
+            threshold,
+        } => JsonRpcError {
+            code: -32602,
+            message: "DoS protection triggered".to_string(),
+            data: Some(json!({
+                "error": "dos_protection_triggered",
+                "protectionType": protection_type,
+                "threshold": threshold,
+                "suggestion": "Reduce content size or processing complexity",
+                "correlationId": ctx.correlation_id,
+                "stage": ctx.processing_stage
+            })),
+        },
+        ContentSecurityError::UriSecurityViolation { uri, reason } => JsonRpcError {
+            code: -32602,
+            message: "URI security violation".to_string(),
+            data: Some(json!({
+                "error": "uri_security_violation",
+                "uri": uri,
+                "details": reason,
+                "suggestion": "Use allowed URI schemes and avoid private/local addresses",
+                "correlationId": ctx.correlation_id,
+                "stage": ctx.processing_stage
+            })),
+        },
+        ContentSecurityError::Base64SecurityViolation { reason } => JsonRpcError {
+            code: -32602,
+            message: "Base64 security violation".to_string(),
+            data: Some(json!({
+                "error": "base64_security_violation",
+                "details": reason,
+                "suggestion": "Ensure base64 data is valid and within size limits",
+                "correlationId": ctx.correlation_id,
+                "stage": ctx.processing_stage
+            })),
+        },
+        ContentSecurityError::ContentTypeSpoofingDetected { declared, actual } => JsonRpcError {
+            code: -32602,
+            message: "Content type spoofing detected".to_string(),
+            data: Some(json!({
+                "error": "content_type_spoofing_detected",
+                "declaredType": declared,
+                "actualType": actual,
+                "suggestion": "Ensure declared MIME type matches actual content format",
+                "correlationId": ctx.correlation_id,
+                "stage": ctx.processing_stage
+            })),
+        },
+        ContentSecurityError::ContentSanitizationFailed { reason } => JsonRpcError {
+            code: -32602,
+            message: "Content sanitization failed".to_string(),
+            data: Some(json!({
+                "error": "content_sanitization_failed",
+                "details": reason,
+                "suggestion": "Remove potentially dangerous content patterns",
+                "correlationId": ctx.correlation_id,
+                "stage": ctx.processing_stage
+            })),
+        },
+        ContentSecurityError::SsrfProtectionTriggered { target, reason } => JsonRpcError {
+            code: -32602,
+            message: "SSRF protection triggered".to_string(),
+            data: Some(json!({
+                "error": "ssrf_protection_triggered",
+                "target": target,
+                "details": reason,
+                "suggestion": "Avoid accessing private networks or sensitive endpoints",
+                "correlationId": ctx.correlation_id,
+                "stage": ctx.processing_stage
+            })),
+        },
+        ContentSecurityError::ProcessingTimeout { timeout } => JsonRpcError {
+            code: -32000,
+            message: "Processing timeout".to_string(),
+            data: Some(json!({
+                "error": "processing_timeout",
+                "timeoutMs": timeout,
+                "suggestion": "Reduce content complexity or increase timeout limits",
+                "correlationId": ctx.correlation_id,
+                "stage": ctx.processing_stage
+            })),
+        },
+        ContentSecurityError::MemoryLimitExceeded { actual, limit } => JsonRpcError {
+            code: -32602,
+            message: "Memory limit exceeded".to_string(),
+            data: Some(json!({
+                "error": "memory_limit_exceeded",
+                "actualBytes": actual,
+                "limitBytes": limit,
+                "suggestion": "Reduce content size or increase memory limits",
+                "correlationId": ctx.correlation_id,
+                "stage": ctx.processing_stage
+            })),
+        },
+        ContentSecurityError::RateLimitExceeded { operation } => JsonRpcError {
+            code: -32000,
+            message: "Rate limit exceeded".to_string(),
+            data: Some(json!({
+                "error": "rate_limit_exceeded",
+                "operation": operation,
+                "suggestion": "Reduce request frequency or wait before retrying",
+                "correlationId": ctx.correlation_id,
+                "stage": ctx.processing_stage
+            })),
+        },
+        ContentSecurityError::ContentArrayTooLarge { length, max_length } => JsonRpcError {
+            code: -32602,
+            message: "Content array too large".to_string(),
+            data: Some(json!({
+                "error": "content_array_too_large",
+                "arrayLength": length,
+                "maxLength": max_length,
+                "suggestion": "Reduce the number of content blocks in the array",
+                "correlationId": ctx.correlation_id,
+                "stage": ctx.processing_stage
+            })),
+        },
+        ContentSecurityError::InvalidContentEncoding { encoding } => JsonRpcError {
+            code: -32602,
+            message: "Invalid content encoding".to_string(),
+            data: Some(json!({
+                "error": "invalid_content_encoding",
+                "encoding": encoding,
+                "suggestion": "Use supported content encoding formats",
+                "correlationId": ctx.correlation_id,
+                "stage": ctx.processing_stage
+            })),
+        },
+        ContentSecurityError::MaliciousPatternDetected { pattern_type } => JsonRpcError {
+            code: -32602,
+            message: "Malicious pattern detected".to_string(),
+            data: Some(json!({
+                "error": "malicious_pattern_detected",
+                "patternType": pattern_type,
+                "suggestion": "Remove or sanitize detected malicious patterns",
+                "correlationId": ctx.correlation_id,
+                "stage": ctx.processing_stage
+            })),
+        },
+    }
+}
+
 /// Convert Base64ProcessorError to ACP-compliant JSON-RPC error
 pub fn convert_base64_error_to_acp(
     error: Base64ProcessorError,
     context: Option<ErrorContext>,
 ) -> JsonRpcError {
     let ctx = context.unwrap_or_default();
-    
+
     match error {
         Base64ProcessorError::InvalidBase64(details) => JsonRpcError {
             code: -32602,
@@ -125,7 +308,7 @@ pub fn convert_base64_error_to_acp(
         Base64ProcessorError::MimeTypeNotAllowed(mime_type) => {
             // Get supported MIME types based on context
             let supported_types = get_supported_mime_types(&ctx.content_type);
-            
+
             JsonRpcError {
                 code: -32602,
                 message: format!("Unsupported content type: {}", mime_type),
@@ -141,7 +324,10 @@ pub fn convert_base64_error_to_acp(
         }
         Base64ProcessorError::FormatMismatch { expected, actual } => JsonRpcError {
             code: -32602,
-            message: format!("Content format validation failed: expected {}, got {}", expected, actual),
+            message: format!(
+                "Content format validation failed: expected {}, got {}",
+                expected, actual
+            ),
             data: Some(json!({
                 "error": "format_mismatch",
                 "expectedFormat": expected,
@@ -228,6 +414,9 @@ pub fn convert_base64_error_to_acp(
                 "stage": ctx.processing_stage
             })),
         },
+        Base64ProcessorError::EnhancedSecurityValidationFailed(security_error) => {
+            convert_content_security_error_to_acp(security_error, Some(ctx))
+        },
     }
 }
 
@@ -237,11 +426,11 @@ pub fn convert_content_block_error_to_acp(
     context: Option<ErrorContext>,
 ) -> JsonRpcError {
     let ctx = context.unwrap_or_default();
-    
+
     match error {
         ContentBlockProcessorError::Base64Error(base64_error) => {
             convert_base64_error_to_acp(base64_error, Some(ctx))
-        },
+        }
         ContentBlockProcessorError::UnsupportedContentType(content_type) => JsonRpcError {
             code: -32602,
             message: format!("Unsupported content type: {}", content_type),
@@ -377,7 +566,10 @@ pub fn convert_content_block_error_to_acp(
         },
         ContentBlockProcessorError::PartialBatchFailure { successful, total } => JsonRpcError {
             code: -32603,
-            message: format!("Batch processing partially failed: {}/{} items processed", successful, total),
+            message: format!(
+                "Batch processing partially failed: {}/{} items processed",
+                successful, total
+            ),
             data: Some(json!({
                 "error": "partial_batch_failure",
                 "successfulItems": successful,
@@ -409,6 +601,9 @@ pub fn convert_content_block_error_to_acp(
                 "stage": ctx.processing_stage
             })),
         },
+        ContentBlockProcessorError::ContentSecurityValidationFailed(security_error) => {
+            convert_content_security_error_to_acp(security_error.clone(), Some(ctx))
+        }
     }
 }
 
@@ -418,7 +613,7 @@ pub fn convert_content_processing_error_to_acp(
     context: Option<ErrorContext>,
 ) -> JsonRpcError {
     let ctx = context.unwrap_or_default();
-    
+
     match error {
         ContentProcessingError::InvalidStructure(details) => JsonRpcError {
             code: -32602,
@@ -431,7 +626,10 @@ pub fn convert_content_processing_error_to_acp(
                 "stage": ctx.processing_stage
             })),
         },
-        ContentProcessingError::UnsupportedContentType { content_type, supported } => JsonRpcError {
+        ContentProcessingError::UnsupportedContentType {
+            content_type,
+            supported,
+        } => JsonRpcError {
             code: -32602,
             message: format!("Unsupported content type: {}", content_type),
             data: Some(json!({
@@ -479,7 +677,10 @@ pub fn convert_content_processing_error_to_acp(
         },
         ContentProcessingError::CapabilityNotSupported { capability } => JsonRpcError {
             code: -32602,
-            message: format!("Content type not supported: agent does not support {}", capability),
+            message: format!(
+                "Content type not supported: agent does not support {}",
+                capability
+            ),
             data: Some(json!({
                 "error": "capability_not_supported",
                 "requiredCapability": capability,
@@ -623,12 +824,12 @@ mod tests {
             content_type: Some("image".to_string()),
             metadata: HashMap::new(),
         };
-        
+
         let json_rpc_error = convert_base64_error_to_acp(error, Some(context));
-        
+
         assert_eq!(json_rpc_error.code, -32602);
         assert_eq!(json_rpc_error.message, "Invalid base64 data");
-        
+
         if let Some(data) = json_rpc_error.data {
             assert_eq!(data["error"], "invalid_base64_format");
             assert_eq!(data["correlationId"], "test-123");
@@ -641,16 +842,19 @@ mod tests {
 
     #[test]
     fn test_size_exceeded_error_conversion() {
-        let error = Base64ProcessorError::SizeExceeded { 
-            limit: 1024, 
-            actual: 2048 
+        let error = Base64ProcessorError::SizeExceeded {
+            limit: 1024,
+            actual: 2048,
         };
-        
+
         let json_rpc_error = convert_base64_error_to_acp(error, None);
-        
+
         assert_eq!(json_rpc_error.code, -32602);
-        assert_eq!(json_rpc_error.message, "Content size exceeded maximum limit");
-        
+        assert_eq!(
+            json_rpc_error.message,
+            "Content size exceeded maximum limit"
+        );
+
         if let Some(data) = json_rpc_error.data {
             assert_eq!(data["error"], "content_size_exceeded");
             assert_eq!(data["providedSize"], 2048);
@@ -662,15 +866,15 @@ mod tests {
 
     #[test]
     fn test_content_processing_error_conversion() {
-        let error = ContentProcessingError::CapabilityNotSupported { 
-            capability: "audio".to_string() 
+        let error = ContentProcessingError::CapabilityNotSupported {
+            capability: "audio".to_string(),
         };
-        
+
         let json_rpc_error = convert_content_processing_error_to_acp(error, None);
-        
+
         assert_eq!(json_rpc_error.code, -32602);
         assert!(json_rpc_error.message.contains("audio"));
-        
+
         if let Some(data) = json_rpc_error.data {
             assert_eq!(data["error"], "capability_not_supported");
             assert_eq!(data["requiredCapability"], "audio");
@@ -682,15 +886,15 @@ mod tests {
 
     #[test]
     fn test_security_violation_no_info_disclosure() {
-        let error = ContentProcessingError::SecurityViolation { 
-            reason: "sensitive internal details".to_string() 
+        let error = ContentProcessingError::SecurityViolation {
+            reason: "sensitive internal details".to_string(),
         };
-        
+
         let json_rpc_error = convert_content_processing_error_to_acp(error, None);
-        
+
         assert_eq!(json_rpc_error.code, -32602);
         assert_eq!(json_rpc_error.message, "Security validation failed");
-        
+
         if let Some(data) = json_rpc_error.data {
             assert_eq!(data["error"], "security_violation");
             // Ensure sensitive reason is not included
@@ -703,7 +907,7 @@ mod tests {
     #[test]
     fn test_default_error_context() {
         let context = ErrorContext::default();
-        
+
         assert!(!context.correlation_id.is_empty());
         assert_eq!(context.processing_stage, "unknown");
         assert!(context.content_type.is_none());
@@ -716,12 +920,12 @@ mod tests {
         assert!(image_types.contains(&"image/png".to_string()));
         assert!(image_types.contains(&"image/jpeg".to_string()));
         assert!(!image_types.contains(&"audio/wav".to_string()));
-        
+
         let audio_types = get_supported_mime_types(&Some("audio".to_string()));
         assert!(audio_types.contains(&"audio/wav".to_string()));
         assert!(audio_types.contains(&"audio/mp3".to_string()));
         assert!(!audio_types.contains(&"image/png".to_string()));
-        
+
         let all_types = get_supported_mime_types(&None);
         assert!(all_types.contains(&"image/png".to_string()));
         assert!(all_types.contains(&"audio/wav".to_string()));

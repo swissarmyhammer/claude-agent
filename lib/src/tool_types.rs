@@ -84,7 +84,7 @@ pub enum ToolCallContent {
 
 /// File location affected by a tool call for "follow-along" features
 ///
-/// Tool calls can report file locations they're working with, enabling Clients 
+/// Tool calls can report file locations they're working with, enabling Clients
 /// to implement features that track which files the Agent is accessing or modifying.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallLocation {
@@ -232,9 +232,15 @@ impl ToolCallContent {
     pub fn to_acp_content(&self) -> agent_client_protocol::ToolCallContent {
         match self {
             ToolCallContent::Content { content } => {
-                agent_client_protocol::ToolCallContent::Content { content: content.clone() }
+                agent_client_protocol::ToolCallContent::Content {
+                    content: content.clone(),
+                }
             }
-            ToolCallContent::Diff { path, old_text, new_text } => {
+            ToolCallContent::Diff {
+                path,
+                old_text,
+                new_text,
+            } => {
                 // ACP expects a diff field with a Diff struct
                 agent_client_protocol::ToolCallContent::Diff {
                     diff: agent_client_protocol::Diff {
@@ -242,7 +248,7 @@ impl ToolCallContent {
                         old_text: old_text.clone(),
                         new_text: new_text.clone(),
                         meta: None,
-                    }
+                    },
                 }
             }
             ToolCallContent::Terminal { terminal_id } => {

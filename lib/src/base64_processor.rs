@@ -1,3 +1,4 @@
+use crate::content_security_validator::{ContentSecurityError, ContentSecurityValidator};
 use base64::{engine::general_purpose, Engine as _};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -25,6 +26,8 @@ pub enum Base64ProcessorError {
     CapabilityNotSupported { capability: String },
     #[error("Security validation failed")]
     SecurityValidationFailed,
+    #[error("Enhanced security validation failed: {0}")]
+    EnhancedSecurityValidationFailed(#[from] ContentSecurityError),
     #[error("Content validation failed: {details}")]
     ContentValidationFailed { details: String },
 }
@@ -40,6 +43,7 @@ pub struct Base64Processor {
     enable_capability_validation: bool,
     enable_security_validation: bool,
     supported_capabilities: HashSet<String>,
+    content_security_validator: Option<ContentSecurityValidator>,
 }
 
 impl Default for Base64Processor {
@@ -78,6 +82,7 @@ impl Default for Base64Processor {
             enable_capability_validation: true,
             enable_security_validation: true,
             supported_capabilities,
+            content_security_validator: None, // Default to no enhanced security validation
         }
     }
 }
@@ -105,6 +110,39 @@ impl Base64Processor {
             enable_capability_validation,
             enable_security_validation,
             supported_capabilities,
+            content_security_validator: None,
+            ..Default::default()
+        }
+    }
+
+    pub fn with_enhanced_security(
+        max_size: usize,
+        content_security_validator: ContentSecurityValidator,
+    ) -> Self {
+        Self {
+            max_size,
+            content_security_validator: Some(content_security_validator),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_enhanced_security_config(
+        max_size: usize,
+        processing_timeout: Duration,
+        max_memory_usage: usize,
+        enable_capability_validation: bool,
+        enable_security_validation: bool,
+        supported_capabilities: HashSet<String>,
+        content_security_validator: ContentSecurityValidator,
+    ) -> Self {
+        Self {
+            max_size,
+            processing_timeout,
+            max_memory_usage,
+            enable_capability_validation,
+            enable_security_validation,
+            supported_capabilities,
+            content_security_validator: Some(content_security_validator),
             ..Default::default()
         }
     }
@@ -160,7 +198,7 @@ impl Base64Processor {
             return true; // DOS/Windows executable
         }
         if data.len() >= 4 && data.starts_with(b"\x7fELF") {
-            return true; // Linux ELF executable  
+            return true; // Linux ELF executable
         }
         if data.len() >= 3 && data.starts_with(b"\xfe\xed\xfa") {
             return true; // Mach-O binary (partial)
@@ -197,7 +235,14 @@ impl Base64Processor {
     ) -> Result<Vec<u8>, Base64ProcessorError> {
         // Validate capability support
         self.validate_capability("image")?;
-        
+
+        // Enhanced security validation if available
+        if let Some(ref validator) = self.content_security_validator {
+            validator
+                .validate_base64_security(data, "image")
+                .map_err(|_e| Base64ProcessorError::SecurityValidationFailed)?;
+        }
+
         // Validate MIME type and base64 format
         self.validate_mime_type(mime_type, &self.allowed_image_mime_types)?;
         self.validate_base64_format(data)?;
@@ -212,7 +257,7 @@ impl Base64Processor {
 
         // Perform format validation with timeout
         self.with_timeout(|| self.validate_image_format(&decoded, mime_type))??;
-        
+
         // Security validation
         self.perform_security_validation(&decoded)?;
 
@@ -226,7 +271,14 @@ impl Base64Processor {
     ) -> Result<Vec<u8>, Base64ProcessorError> {
         // Validate capability support
         self.validate_capability("audio")?;
-        
+
+        // Enhanced security validation if available
+        if let Some(ref validator) = self.content_security_validator {
+            validator
+                .validate_base64_security(data, "audio")
+                .map_err(|_e| Base64ProcessorError::SecurityValidationFailed)?;
+        }
+
         // Validate MIME type and base64 format
         self.validate_mime_type(mime_type, &self.allowed_audio_mime_types)?;
         self.validate_base64_format(data)?;
@@ -241,7 +293,7 @@ impl Base64Processor {
 
         // Perform format validation with timeout
         self.with_timeout(|| self.validate_audio_format(&decoded, mime_type))??;
-        
+
         // Security validation
         self.perform_security_validation(&decoded)?;
 
@@ -262,7 +314,14 @@ impl Base64Processor {
             "text" // Default for other blob types like PDF, text
         };
         self.validate_capability(capability)?;
-        
+
+        // Enhanced security validation if available
+        if let Some(ref validator) = self.content_security_validator {
+            validator
+                .validate_base64_security(data, "blob")
+                .map_err(|_e| Base64ProcessorError::SecurityValidationFailed)?;
+        }
+
         // Validate MIME type and base64 format
         self.validate_mime_type(mime_type, &self.allowed_blob_mime_types)?;
         self.validate_base64_format(data)?;
@@ -274,7 +333,7 @@ impl Base64Processor {
                 .decode(data)
                 .map_err(|e| Base64ProcessorError::InvalidBase64(e.to_string()))
         })??;
-        
+
         // Security validation
         self.perform_security_validation(&decoded)?;
 
