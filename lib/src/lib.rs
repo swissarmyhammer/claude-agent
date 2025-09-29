@@ -4,6 +4,7 @@
 //! wrapping Claude Code functionality to enable any ACP-compatible client
 //! to interact with Claude Code.
 
+pub mod acp_error_conversion;
 pub mod agent;
 pub mod base64_processor;
 pub mod capability_validation;
