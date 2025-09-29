@@ -53,6 +53,7 @@
 //! These errors are mapped to appropriate JSON-RPC error codes for client communication.
 
 use crate::path_validator::{PathValidationError, PathValidator};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -82,6 +83,58 @@ pub struct TerminalSession {
     process: Option<Child>,
     working_dir: std::path::PathBuf,
     environment: HashMap<String, String>,
+    // ACP-compliant fields for terminal/create method
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub session_id: Option<String>,
+    pub output_byte_limit: u64,
+    pub output_buffer: Vec<u8>,
+    pub buffer_truncated: bool,
+}
+
+/// ACP-compliant request parameters for terminal/create method
+///
+/// This struct defines all the parameters needed to create a new terminal session
+/// following the Anthropic Computer Protocol (ACP) specification.
+#[derive(Debug, Deserialize)]
+pub struct TerminalCreateParams {
+    /// Session identifier that must exist and be a valid ULID format
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    /// Command to execute in the terminal (e.g., "bash", "python", "echo")
+    pub command: String,
+    /// Optional command line arguments as a vector of strings
+    pub args: Option<Vec<String>>,
+    /// Optional environment variables to set for the terminal session
+    pub env: Option<Vec<EnvVariable>>,
+    /// Optional working directory path (must be absolute if provided)
+    pub cwd: Option<String>,
+    /// Optional byte limit for terminal output buffering (defaults to system limit)
+    #[serde(rename = "outputByteLimit")]
+    pub output_byte_limit: Option<u64>,
+}
+
+/// Environment variable specification for terminal creation
+///
+/// Represents a single environment variable to be set in the terminal session.
+/// Environment variables override system defaults when names conflict.
+#[derive(Debug, Deserialize)]
+pub struct EnvVariable {
+    /// Environment variable name (cannot be empty)
+    pub name: String,
+    /// Environment variable value
+    pub value: String,
+}
+
+/// ACP-compliant response for terminal/create method
+///
+/// Returns the unique identifier for the newly created terminal session.
+/// This terminal ID can be used for subsequent terminal operations.
+#[derive(Debug, Serialize)]
+pub struct TerminalCreateResponse {
+    /// Unique terminal identifier (ULID format)
+    #[serde(rename = "terminalId")]
+    pub terminal_id: String,
 }
 
 /// Handles tool request execution with permission management and security validation
@@ -195,9 +248,14 @@ impl TerminalManager {
         }
     }
 
+    /// Generate ACP-compliant terminal ID with "term_" prefix
+    fn generate_terminal_id(&self) -> String {
+        format!("term_{}", ulid::Ulid::new())
+    }
+
     /// Create a new terminal session
     pub async fn create_terminal(&self, working_dir: Option<String>) -> crate::Result<String> {
-        let terminal_id = ulid::Ulid::new().to_string();
+        let terminal_id = self.generate_terminal_id();
         let working_dir = working_dir
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
@@ -208,6 +266,12 @@ impl TerminalManager {
             process: None,
             working_dir,
             environment: std::env::vars().collect(),
+            command: None,
+            args: Vec::new(),
+            session_id: None,
+            output_byte_limit: 1_048_576, // 1MB default
+            output_buffer: Vec::new(),
+            buffer_truncated: false,
         };
 
         let mut terminals = self.terminals.write().await;
@@ -215,6 +279,175 @@ impl TerminalManager {
 
         tracing::info!("Created terminal session: {}", terminal_id);
         Ok(terminal_id)
+    }
+
+    /// Create ACP-compliant terminal session with command and all parameters
+    ///
+    /// This method creates a new terminal session following the Anthropic Computer Protocol
+    /// specification. It validates the session ID, resolves the working directory,
+    /// prepares environment variables, and creates the terminal with proper output buffering.
+    ///
+    /// # Arguments
+    /// * `session_manager` - Manager for session validation and retrieval
+    /// * `params` - Terminal creation parameters including command, args, env, etc.
+    ///
+    /// # Returns
+    /// * `Ok(String)` - The unique terminal ID (ULID format) on success
+    /// * `Err(AgentError)` - Protocol error for invalid parameters or session issues
+    ///
+    /// # Examples
+    /// ```
+    /// let params = TerminalCreateParams {
+    ///     session_id: "01HKQM85501ECE8XJGNZKNJQW".to_string(),
+    ///     command: "echo".to_string(),
+    ///     args: Some(vec!["Hello".to_string(), "World".to_string()]),
+    ///     env: None,
+    ///     cwd: None,
+    ///     output_byte_limit: Some(1024),
+    /// };
+    /// let terminal_id = handler.create_terminal_with_command(&session_manager, params).await?;
+    /// ```
+    pub async fn create_terminal_with_command(
+        &self,
+        session_manager: &crate::session::SessionManager,
+        params: TerminalCreateParams,
+    ) -> crate::Result<String> {
+        // 1. Validate session ID
+        self.validate_session_id(session_manager, &params.session_id)
+            .await?;
+
+        // 2. Generate ACP-compliant terminal ID
+        let terminal_id = self.generate_terminal_id();
+
+        // 3. Resolve working directory (use session cwd if not specified)
+        let working_dir = self
+            .resolve_working_directory(session_manager, &params.session_id, params.cwd.as_deref())
+            .await?;
+
+        // 4. Prepare environment variables
+        let environment = self.prepare_environment(params.env.unwrap_or_default())?;
+
+        // 5. Create enhanced terminal session
+        let session = TerminalSession {
+            process: None,
+            working_dir,
+            environment,
+            command: Some(params.command),
+            args: params.args.unwrap_or_default(),
+            session_id: Some(params.session_id),
+            output_byte_limit: params.output_byte_limit.unwrap_or(1_048_576), // 1MB default
+            output_buffer: Vec::new(),
+            buffer_truncated: false,
+        };
+
+        // 6. Register terminal
+        let mut terminals = self.terminals.write().await;
+        terminals.insert(terminal_id.clone(), session);
+
+        tracing::info!("Created ACP terminal session: {}", terminal_id);
+        Ok(terminal_id)
+    }
+
+    /// Validate session ID exists and is properly formatted
+    ///
+    /// Ensures the session ID is a valid ULID format and corresponds to an existing session.
+    ///
+    /// # Arguments
+    /// * `session_manager` - Manager for session validation
+    /// * `session_id` - Session ID string to validate
+    ///
+    /// # Returns
+    /// * `Ok(())` - Session is valid and exists
+    /// * `Err(AgentError::Protocol)` - Invalid format or session not found
+    async fn validate_session_id(
+        &self,
+        session_manager: &crate::session::SessionManager,
+        session_id: &str,
+    ) -> crate::Result<()> {
+        let session_ulid = session_id.parse::<ulid::Ulid>().map_err(|_| {
+            crate::AgentError::Protocol(format!("Invalid session ID format: {}", session_id))
+        })?;
+
+        session_manager.get_session(&session_ulid)?.ok_or_else(|| {
+            crate::AgentError::Protocol(format!("Session not found: {}", session_id))
+        })?;
+
+        Ok(())
+    }
+
+    /// Resolve working directory from session or parameter
+    ///
+    /// Determines the working directory for the terminal session. If a working directory
+    /// parameter is provided, it must be an absolute path. Otherwise, uses the session's
+    /// current working directory.
+    ///
+    /// # Arguments
+    /// * `session_manager` - Manager for session retrieval
+    /// * `session_id` - Valid session ID
+    /// * `cwd_param` - Optional working directory parameter (must be absolute if provided)
+    ///
+    /// # Returns
+    /// * `Ok(PathBuf)` - Resolved absolute path for working directory
+    /// * `Err(AgentError::Protocol)` - Invalid path or session not found
+    async fn resolve_working_directory(
+        &self,
+        session_manager: &crate::session::SessionManager,
+        session_id: &str,
+        cwd_param: Option<&str>,
+    ) -> crate::Result<std::path::PathBuf> {
+        if let Some(cwd) = cwd_param {
+            // Use provided working directory, validate it's absolute
+            let path = std::path::PathBuf::from(cwd);
+            if !path.is_absolute() {
+                return Err(crate::AgentError::Protocol(format!(
+                    "Working directory must be absolute path: {}",
+                    cwd
+                )));
+            }
+            Ok(path)
+        } else {
+            // Use session's working directory
+            let session_ulid = session_id.parse::<ulid::Ulid>().map_err(|_| {
+                crate::AgentError::Protocol(format!("Invalid session ID format: {}", session_id))
+            })?;
+
+            let session = session_manager.get_session(&session_ulid)?.ok_or_else(|| {
+                crate::AgentError::Protocol(format!("Session not found: {}", session_id))
+            })?;
+
+            Ok(session.cwd)
+        }
+    }
+
+    /// Prepare environment variables by merging custom with system environment
+    ///
+    /// Creates a complete environment variable map by starting with system environment
+    /// variables and applying custom overrides. Custom variables take precedence over
+    /// system variables with the same name.
+    ///
+    /// # Arguments
+    /// * `env_vars` - Vector of custom environment variables to apply
+    ///
+    /// # Returns
+    /// * `Ok(HashMap)` - Complete environment variable map
+    /// * `Err(AgentError::Protocol)` - Empty environment variable name detected
+    fn prepare_environment(
+        &self,
+        env_vars: Vec<EnvVariable>,
+    ) -> crate::Result<HashMap<String, String>> {
+        let mut environment: HashMap<String, String> = std::env::vars().collect();
+
+        // Apply custom environment variables, overriding system ones
+        for env_var in env_vars {
+            if env_var.name.is_empty() {
+                return Err(crate::AgentError::Protocol(
+                    "Environment variable name cannot be empty".to_string(),
+                ));
+            }
+            environment.insert(env_var.name, env_var.value);
+        }
+
+        Ok(environment)
     }
 
     /// Execute a command in the specified terminal session
@@ -320,6 +553,43 @@ impl TerminalManager {
 impl Default for TerminalManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl TerminalSession {
+    /// Add output data to the buffer, enforcing byte limits
+    pub fn add_output(&mut self, data: &[u8]) {
+        // Always append the new data first
+        self.output_buffer.extend_from_slice(data);
+
+        // Then truncate from beginning if we exceed the limit
+        let limit = self.output_byte_limit as usize;
+        if self.output_buffer.len() > limit {
+            let excess = self.output_buffer.len() - limit;
+            self.output_buffer.drain(0..excess);
+            self.buffer_truncated = true;
+        }
+    }
+
+    /// Get output as UTF-8 string
+    pub fn get_output_string(&self) -> String {
+        String::from_utf8_lossy(&self.output_buffer).to_string()
+    }
+
+    /// Check if output buffer has been truncated
+    pub fn is_output_truncated(&self) -> bool {
+        self.buffer_truncated
+    }
+
+    /// Get current buffer size in bytes
+    pub fn get_buffer_size(&self) -> usize {
+        self.output_buffer.len()
+    }
+
+    /// Clear the output buffer
+    pub fn clear_output(&mut self) {
+        self.output_buffer.clear();
+        self.buffer_truncated = false;
     }
 }
 
@@ -1047,6 +1317,39 @@ impl ToolCallHandler {
             // Unknown tools are treated as moderate risk
             _ => ToolRiskLevel::Moderate,
         }
+    }
+}
+
+/// ACP-compliant terminal method handler
+#[derive(Debug, Clone)]
+pub struct TerminalMethodHandler {
+    terminal_manager: Arc<TerminalManager>,
+    session_manager: Arc<crate::session::SessionManager>,
+}
+
+impl TerminalMethodHandler {
+    /// Create a new terminal method handler
+    pub fn new(
+        terminal_manager: Arc<TerminalManager>,
+        session_manager: Arc<crate::session::SessionManager>,
+    ) -> Self {
+        Self {
+            terminal_manager,
+            session_manager,
+        }
+    }
+
+    /// Handle ACP terminal/create method
+    pub async fn handle_terminal_create(
+        &self,
+        params: TerminalCreateParams,
+    ) -> crate::Result<TerminalCreateResponse> {
+        let terminal_id = self
+            .terminal_manager
+            .create_terminal_with_command(&self.session_manager, params)
+            .await?;
+
+        Ok(TerminalCreateResponse { terminal_id })
     }
 }
 
@@ -2050,6 +2353,314 @@ mod tests {
         assert!(tools_no_caps.contains(&"fs_read".to_string()));
         assert!(tools_no_caps.contains(&"fs_write".to_string()));
         assert!(tools_no_caps.contains(&"fs_list".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_acp_terminal_create_with_all_parameters() {
+        use crate::session::SessionManager;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let session_manager = Arc::new(SessionManager::new());
+        let terminal_manager = Arc::new(TerminalManager::new());
+
+        // Create test session
+        let session_id = session_manager
+            .create_session(temp_dir.path().to_path_buf())
+            .unwrap();
+
+        // Test terminal creation with all parameters
+        let params = TerminalCreateParams {
+            session_id: session_id.to_string(),
+            command: "echo".to_string(),
+            args: Some(vec!["Hello".to_string(), "World".to_string()]),
+            env: Some(vec![
+                EnvVariable {
+                    name: "TEST_VAR".to_string(),
+                    value: "test_value".to_string(),
+                },
+                EnvVariable {
+                    name: "NODE_ENV".to_string(),
+                    value: "test".to_string(),
+                },
+            ]),
+            cwd: Some(temp_dir.path().to_string_lossy().to_string()),
+            output_byte_limit: Some(2048),
+        };
+
+        let terminal_id = terminal_manager
+            .create_terminal_with_command(&session_manager, params)
+            .await
+            .unwrap();
+
+        // Verify terminal ID has correct format
+        assert!(terminal_id.starts_with("term_"));
+        assert!(terminal_id.len() > 5); // "term_" + ULID
+
+        // Verify terminal session was created with correct parameters
+        let terminals = terminal_manager.terminals.read().await;
+        let session = terminals.get(&terminal_id).unwrap();
+
+        assert_eq!(session.command.as_ref().unwrap(), "echo");
+        assert_eq!(session.args, vec!["Hello", "World"]);
+        assert_eq!(
+            session.session_id.as_ref().unwrap(),
+            &session_id.to_string()
+        );
+        assert_eq!(session.output_byte_limit, 2048);
+        assert!(session.environment.contains_key("TEST_VAR"));
+        assert_eq!(session.environment.get("TEST_VAR").unwrap(), "test_value");
+        assert_eq!(session.environment.get("NODE_ENV").unwrap(), "test");
+        assert!(session.working_dir.is_absolute());
+    }
+
+    #[tokio::test]
+    async fn test_acp_terminal_create_minimal_parameters() {
+        use crate::session::SessionManager;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let session_manager = Arc::new(SessionManager::new());
+        let terminal_manager = Arc::new(TerminalManager::new());
+
+        // Create test session
+        let session_id = session_manager
+            .create_session(temp_dir.path().to_path_buf())
+            .unwrap();
+
+        // Test terminal creation with minimal parameters
+        let params = TerminalCreateParams {
+            session_id: session_id.to_string(),
+            command: "pwd".to_string(),
+            args: None,
+            env: None,
+            cwd: None,
+            output_byte_limit: None,
+        };
+
+        let terminal_id = terminal_manager
+            .create_terminal_with_command(&session_manager, params)
+            .await
+            .unwrap();
+
+        // Verify terminal session was created with defaults
+        let terminals = terminal_manager.terminals.read().await;
+        let session = terminals.get(&terminal_id).unwrap();
+
+        assert_eq!(session.command.as_ref().unwrap(), "pwd");
+        assert!(session.args.is_empty());
+        assert_eq!(session.output_byte_limit, 1_048_576); // Default 1MB
+        assert_eq!(session.working_dir, temp_dir.path()); // Uses session cwd
+    }
+
+    #[tokio::test]
+    async fn test_acp_terminal_create_invalid_session_id() {
+        use crate::session::SessionManager;
+
+        let session_manager = Arc::new(SessionManager::new());
+        let terminal_manager = Arc::new(TerminalManager::new());
+
+        let params = TerminalCreateParams {
+            session_id: "invalid-session-id".to_string(),
+            command: "echo".to_string(),
+            args: None,
+            env: None,
+            cwd: None,
+            output_byte_limit: None,
+        };
+
+        let result = terminal_manager
+            .create_terminal_with_command(&session_manager, params)
+            .await;
+
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("Invalid session ID format"));
+    }
+
+    #[tokio::test]
+    async fn test_acp_terminal_create_nonexistent_session() {
+        use crate::session::SessionManager;
+
+        let session_manager = Arc::new(SessionManager::new());
+        let terminal_manager = Arc::new(TerminalManager::new());
+
+        let params = TerminalCreateParams {
+            session_id: ulid::Ulid::new().to_string(), // Valid ULID but non-existent
+            command: "echo".to_string(),
+            args: None,
+            env: None,
+            cwd: None,
+            output_byte_limit: None,
+        };
+
+        let result = terminal_manager
+            .create_terminal_with_command(&session_manager, params)
+            .await;
+
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("Session not found"));
+    }
+
+    #[tokio::test]
+    async fn test_terminal_session_output_buffer_management() {
+        let mut session = TerminalSession {
+            process: None,
+            working_dir: std::path::PathBuf::from("/tmp"),
+            environment: HashMap::new(),
+            command: Some("test".to_string()),
+            args: Vec::new(),
+            session_id: Some("test".to_string()),
+            output_byte_limit: 10, // Very small for testing
+            output_buffer: Vec::new(),
+            buffer_truncated: false,
+        };
+
+        // Test normal addition within limits
+        session.add_output(b"hello");
+        assert_eq!(session.get_output_string(), "hello");
+        assert!(!session.is_output_truncated());
+        assert_eq!(session.get_buffer_size(), 5);
+
+        // Test addition that exceeds limit
+        session.add_output(b" world test");
+        assert_eq!(session.get_output_string(), "world test"); // Truncated from beginning
+        assert!(session.is_output_truncated());
+        assert_eq!(session.get_buffer_size(), 10);
+
+        // Test large addition that fills entire buffer
+        session.add_output(b"replacement");
+        assert_eq!(session.get_output_string(), "eplacement"); // Last 10 bytes within limit
+        assert!(session.is_output_truncated());
+        assert_eq!(session.get_buffer_size(), 10);
+
+        // Test clearing buffer
+        session.clear_output();
+        assert_eq!(session.get_output_string(), "");
+        assert!(!session.is_output_truncated());
+        assert_eq!(session.get_buffer_size(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_environment_variable_validation() {
+        let terminal_manager = TerminalManager::new();
+
+        // Test valid environment variables
+        let env_vars = vec![
+            EnvVariable {
+                name: "TEST_VAR".to_string(),
+                value: "test_value".to_string(),
+            },
+            EnvVariable {
+                name: "PATH".to_string(),
+                value: "/usr/bin:/bin".to_string(),
+            },
+        ];
+
+        let result = terminal_manager.prepare_environment(env_vars);
+        assert!(result.is_ok());
+        let environment = result.unwrap();
+        assert_eq!(environment.get("TEST_VAR").unwrap(), "test_value");
+        assert_eq!(environment.get("PATH").unwrap(), "/usr/bin:/bin");
+
+        // Test empty variable name
+        let invalid_env_vars = vec![EnvVariable {
+            name: "".to_string(),
+            value: "some_value".to_string(),
+        }];
+
+        let result = terminal_manager.prepare_environment(invalid_env_vars);
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("Environment variable name cannot be empty"));
+    }
+
+    #[tokio::test]
+    async fn test_working_directory_resolution() {
+        use crate::session::SessionManager;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let other_temp_dir = TempDir::new().unwrap();
+        let session_manager = SessionManager::new();
+        let terminal_manager = TerminalManager::new();
+
+        // Create test session with specific working directory
+        let session_id = session_manager
+            .create_session(temp_dir.path().to_path_buf())
+            .unwrap();
+
+        // Test using session's working directory (no cwd parameter)
+        let result = terminal_manager
+            .resolve_working_directory(&session_manager, &session_id.to_string(), None)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), temp_dir.path());
+
+        // Test using provided absolute path
+        let result = terminal_manager
+            .resolve_working_directory(
+                &session_manager,
+                &session_id.to_string(),
+                Some(&other_temp_dir.path().to_string_lossy()),
+            )
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), other_temp_dir.path());
+
+        // Test using relative path (should fail)
+        let result = terminal_manager
+            .resolve_working_directory(
+                &session_manager,
+                &session_id.to_string(),
+                Some("relative/path"),
+            )
+            .await;
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("must be absolute path"));
+    }
+
+    #[tokio::test]
+    async fn test_terminal_method_handler() {
+        use crate::session::SessionManager;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let session_manager = Arc::new(SessionManager::new());
+        let terminal_manager = Arc::new(TerminalManager::new());
+        let handler = TerminalMethodHandler::new(terminal_manager.clone(), session_manager.clone());
+
+        // Create test session
+        let session_id = session_manager
+            .create_session(temp_dir.path().to_path_buf())
+            .unwrap();
+
+        // Test ACP terminal/create handler
+        let params = TerminalCreateParams {
+            session_id: session_id.to_string(),
+            command: "echo".to_string(),
+            args: Some(vec!["test".to_string()]),
+            env: Some(vec![EnvVariable {
+                name: "TEST_ENV".to_string(),
+                value: "test_val".to_string(),
+            }]),
+            cwd: None,
+            output_byte_limit: Some(4096),
+        };
+
+        let response = handler.handle_terminal_create(params).await.unwrap();
+
+        // Verify response format
+        assert!(response.terminal_id.starts_with("term_"));
+
+        // Verify terminal was created
+        let terminals = terminal_manager.terminals.read().await;
+        let session = terminals.get(&response.terminal_id).unwrap();
+        assert_eq!(session.command.as_ref().unwrap(), "echo");
+        assert_eq!(session.args, vec!["test"]);
+        assert_eq!(session.output_byte_limit, 4096);
     }
 
     #[tokio::test]

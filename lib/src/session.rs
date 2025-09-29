@@ -162,6 +162,7 @@ pub enum MessageRole {
 }
 
 /// Thread-safe session manager
+#[derive(Debug)]
 pub struct SessionManager {
     sessions: Arc<RwLock<HashMap<SessionId, Session>>>,
     cleanup_interval: Duration,
