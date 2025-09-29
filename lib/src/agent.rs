@@ -15,7 +15,7 @@ use agent_client_protocol::{
     Agent, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
     ContentBlock, ExtNotification, ExtRequest, InitializeRequest, InitializeResponse,
     LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
-    PromptResponse, RawValue, SessionId, SessionNotification, SessionUpdate, SetSessionModeRequest,
+    PromptResponse, RawValue, SessionId, SessionModeId, SessionNotification, SessionUpdate, SetSessionModeRequest,
     SetSessionModeResponse, StopReason, TextContent,
 };
 use std::collections::{HashMap, HashSet};
@@ -2367,11 +2367,53 @@ impl Agent for ClaudeAgent {
     ) -> Result<SetSessionModeResponse, agent_client_protocol::Error> {
         self.log_request("set_session_mode", &request);
 
-        // For now, accept any session mode
+        let session_id_ulid = match ulid::Ulid::from_string(&request.session_id.0) {
+            Ok(id) => id,
+            Err(_) => {
+                return Err(agent_client_protocol::Error::invalid_request());
+            }
+        };
+
+        let mode_id_string = request.mode_id.0.to_string();
+        
+        // Get the current mode to check if it will change
+        let current_mode = self
+            .session_manager
+            .get_session(&session_id_ulid)
+            .map_err(|_| agent_client_protocol::Error::internal_error())?
+            .map(|session| session.current_mode.clone())
+            .unwrap_or(None);
+        
+        let mode_changed = current_mode != Some(mode_id_string.clone());
+        
+        // Update session with new mode
+        self.session_manager
+            .update_session(&session_id_ulid, |session| {
+                session.current_mode = Some(mode_id_string.clone());
+            })
+            .map_err(|_| agent_client_protocol::Error::internal_error())?;
+
+        // Send current mode update notification if mode actually changed
+        if mode_changed {
+            if let Err(e) = self
+                .send_session_update(SessionNotification {
+                    session_id: request.session_id.clone(),
+                    update: SessionUpdate::CurrentModeUpdate {
+                        current_mode_id: request.mode_id.clone(),
+                    },
+                    meta: None,
+                })
+                .await
+            {
+                tracing::warn!("Failed to send current mode update notification: {}", e);
+            }
+        }
+
         let response = SetSessionModeResponse {
             meta: Some(serde_json::json!({
                 "mode_set": true,
-                "message": "Session mode updated"
+                "message": "Session mode updated",
+                "previous_mode_changed": mode_changed
             })),
         };
 
@@ -3529,16 +3571,33 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_session_mode() {
-        let agent = create_test_agent().await;
+        let (agent, _receiver) = create_test_agent_with_notifications().await;
+
+        // First create a valid session using system temp directory
+        let new_session_request = NewSessionRequest {
+            cwd: std::env::temp_dir(),
+            mcp_servers: vec![],
+            meta: None,
+        };
+        let session_response = agent.new_session(new_session_request).await.unwrap();
 
         let request = SetSessionModeRequest {
-            session_id: SessionId("test_session".to_string().into()),
-            mode_id: agent_client_protocol::SessionModeId("interactive".to_string().into()),
+            session_id: session_response.session_id.clone(),
+            mode_id: SessionModeId("interactive".to_string().into()),
             meta: Some(serde_json::json!({"mode": "interactive"})),
         };
 
         let response = agent.set_session_mode(request).await.unwrap();
         assert!(response.meta.is_some());
+        
+        // Check that mode was set in the session
+        let session_id_ulid = ulid::Ulid::from_string(&session_response.session_id.0).unwrap();
+        let session = agent
+            .session_manager
+            .get_session(&session_id_ulid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.current_mode, Some("interactive".to_string()));
     }
 
     #[tokio::test]

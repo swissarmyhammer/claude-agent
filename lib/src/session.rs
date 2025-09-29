@@ -27,6 +27,8 @@ pub struct Session {
     pub turn_request_count: u64,
     /// Total tokens consumed in the current turn (input + output)
     pub turn_token_count: u64,
+    /// Current session mode identifier for ACP current mode updates
+    pub current_mode: Option<String>,
 }
 
 impl Session {
@@ -60,6 +62,7 @@ impl Session {
             available_commands: Vec::new(),
             turn_request_count: 0,
             turn_token_count: 0,
+            current_mode: None,
         }
     }
 
