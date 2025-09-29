@@ -262,6 +262,12 @@ impl ToolCallHandler {
         let mut report = ToolCallReport::new(tool_call_id.clone(), title, kind);
         report.set_raw_input(arguments.clone());
 
+        // Extract and add file locations for ACP follow-along features
+        let locations = ToolCallReport::extract_file_locations(tool_name, arguments);
+        for location in locations {
+            report.add_location(location);
+        }
+
         // Track the active tool call
         {
             let mut active_calls = self.active_tool_calls.write().await;

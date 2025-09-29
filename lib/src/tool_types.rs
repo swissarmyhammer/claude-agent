@@ -138,6 +138,156 @@ impl ToolCallReport {
         }
     }
 
+    /// Extract file locations from tool parameters for ACP file location tracking
+    pub fn extract_file_locations(
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Vec<ToolCallLocation> {
+        let mut locations = Vec::new();
+
+        // Common file path parameter names across different tools
+        let path_fields = [
+            "path",
+            "file_path", 
+            "filepath",
+            "filename",
+            "file",
+            "source",
+            "dest",
+            "destination",
+            "input",
+            "output",
+        ];
+
+        // Extract file paths from common parameter structures
+        match arguments {
+            serde_json::Value::Object(obj) => {
+                for field_name in &path_fields {
+                    if let Some(path_value) = obj.get(*field_name) {
+                        if let Some(path_str) = path_value.as_str() {
+                            // Only add valid file paths (not URLs or other non-file paths)
+                            if Self::is_file_path(path_str) {
+                                locations.push(ToolCallLocation {
+                                    path: Self::normalize_path(path_str),
+                                    line: None,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Handle array of paths (e.g., patterns in glob operations)
+                if let Some(serde_json::Value::Array(pattern_array)) = obj.get("patterns") {
+                    for pattern in pattern_array {
+                        if let Some(pattern_str) = pattern.as_str() {
+                            if Self::is_file_path(pattern_str) {
+                                locations.push(ToolCallLocation {
+                                    path: Self::normalize_path(pattern_str),
+                                    line: None,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Handle line number if present (for edit operations)
+                let line_number = obj.get("line")
+                    .and_then(|v| v.as_u64())
+                    .or_else(|| obj.get("line_number").and_then(|v| v.as_u64()))
+                    .or_else(|| obj.get("offset").and_then(|v| v.as_u64()));
+
+                // Add line number to the first location if available
+                if let (Some(line), Some(first_location)) = (line_number, locations.first_mut()) {
+                    first_location.line = Some(line);
+                }
+            }
+            _ => {
+                // Handle string parameters that might be file paths
+                if let Some(path_str) = arguments.as_str() {
+                    if Self::is_file_path(path_str) {
+                        locations.push(ToolCallLocation {
+                            path: Self::normalize_path(path_str),
+                            line: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Tool-specific location extraction
+        match tool_name {
+            // MCP file operations
+            tool if tool.starts_with("mcp__files_") => {
+                // These tools typically use standardized parameter names
+                // Already handled by the generic extraction above
+            }
+            // Built-in file operations
+            "Read" | "Write" | "Edit" | "Glob" | "Grep" => {
+                // Already handled by the generic extraction above  
+            }
+            _ => {
+                // For unknown tools, the generic extraction should suffice
+            }
+        }
+
+        locations
+    }
+
+    /// Check if a string represents a file path (not URL, command, etc.)
+    fn is_file_path(s: &str) -> bool {
+        // Skip URLs
+        if s.starts_with("http://") || s.starts_with("https://") {
+            return false;
+        }
+        
+        // Skip commands or other non-path strings
+        if s.contains(' ') && !s.starts_with('/') && !s.contains('\\') {
+            return false;
+        }
+        
+        // Handle glob patterns - these are definitely file patterns
+        if s.contains('*') || s.contains('?') || s.contains('[') {
+            return true;
+        }
+        
+        // Must contain path separators or be absolute path
+        s.contains('/') || s.contains('\\') || s.starts_with('/')
+            || (cfg!(windows) && s.contains(':'))
+    }
+
+    /// Normalize file path to absolute form for consistency
+    fn normalize_path(path: &str) -> String {
+        // Don't normalize glob patterns - they should remain as-is
+        if path.contains('*') || path.contains('?') || path.contains('[') {
+            return path.to_string();
+        }
+        
+        // Convert to absolute path if relative
+        if path.starts_with("./") || path.starts_with("../") {
+            // Try to resolve relative paths
+            if let Ok(absolute) = std::fs::canonicalize(path) {
+                absolute.to_string_lossy().to_string()
+            } else {
+                // If canonicalize fails, try to construct absolute path
+                if let Ok(current_dir) = std::env::current_dir() {
+                    current_dir.join(path).to_string_lossy().to_string()
+                } else {
+                    path.to_string()
+                }
+            }
+        } else if !path.starts_with('/') && !path.contains(':') {
+            // Relative path without ./ prefix - make absolute only for non-glob patterns
+            if let Ok(current_dir) = std::env::current_dir() {
+                current_dir.join(path).to_string_lossy().to_string()
+            } else {
+                path.to_string()
+            }
+        } else {
+            // Already absolute path
+            path.to_string()
+        }
+    }
+
     /// Update the status of this tool call
     pub fn update_status(&mut self, status: ToolCallStatus) {
         self.status = status;
@@ -268,5 +418,210 @@ impl ToolCallLocation {
             line: self.line.map(|l| l as u32),
             meta: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_file_location_creation() {
+        let location = ToolCallLocation {
+            path: "/home/user/test.txt".to_string(),
+            line: Some(42),
+        };
+        
+        assert_eq!(location.path, "/home/user/test.txt");
+        assert_eq!(location.line, Some(42));
+    }
+
+    #[test]
+    fn test_file_location_to_acp_conversion() {
+        let location = ToolCallLocation {
+            path: "/home/user/test.txt".to_string(),
+            line: Some(42),
+        };
+        
+        let acp_location = location.to_acp_location();
+        assert_eq!(acp_location.path.to_string_lossy(), "/home/user/test.txt");
+        assert_eq!(acp_location.line, Some(42));
+        assert!(acp_location.meta.is_none());
+    }
+
+    #[test]
+    fn test_extract_file_locations_basic_path() {
+        let args = json!({
+            "path": "/home/user/document.txt"
+        });
+        
+        let locations = ToolCallReport::extract_file_locations("fs_read", &args);
+        assert_eq!(locations.len(), 1);
+        assert!(locations[0].path.ends_with("document.txt"));
+        assert_eq!(locations[0].line, None);
+    }
+
+    #[test]
+    fn test_extract_file_locations_with_line_number() {
+        let args = json!({
+            "file_path": "/home/user/code.rs",
+            "line": 25
+        });
+        
+        let locations = ToolCallReport::extract_file_locations("edit_file", &args);
+        assert_eq!(locations.len(), 1);
+        assert!(locations[0].path.ends_with("code.rs"));
+        assert_eq!(locations[0].line, Some(25));
+    }
+
+    #[test]
+    fn test_extract_file_locations_multiple_paths() {
+        let args = json!({
+            "source": "/home/user/source.txt",
+            "destination": "/home/user/dest.txt"
+        });
+        
+        let locations = ToolCallReport::extract_file_locations("fs_move", &args);
+        assert_eq!(locations.len(), 2);
+        assert!(locations.iter().any(|l| l.path.ends_with("source.txt")));
+        assert!(locations.iter().any(|l| l.path.ends_with("dest.txt")));
+    }
+
+
+
+    #[test]
+    fn test_extract_file_locations_ignores_urls() {
+        let args = json!({
+            "path": "https://example.com/file.txt",
+            "url": "http://test.com",
+            "file": "/local/file.txt"
+        });
+        
+        let locations = ToolCallReport::extract_file_locations("fetch", &args);
+        assert_eq!(locations.len(), 1);
+        assert!(locations[0].path.ends_with("file.txt"));
+        assert!(!locations[0].path.contains("http"));
+    }
+
+    #[test]
+    fn test_extract_file_locations_ignores_commands() {
+        let args = json!({
+            "command": "ls -la /tmp",
+            "path": "/actual/file.txt"
+        });
+        
+        let locations = ToolCallReport::extract_file_locations("execute", &args);
+        assert_eq!(locations.len(), 1);
+        assert!(locations[0].path.ends_with("file.txt"));
+    }
+
+    #[test]
+    fn test_is_file_path_detection() {
+        // Valid file paths
+        assert!(ToolCallReport::is_file_path("/absolute/path.txt"));
+        assert!(ToolCallReport::is_file_path("./relative/path.txt"));
+        assert!(ToolCallReport::is_file_path("../parent/file.txt"));
+        assert!(ToolCallReport::is_file_path("subdir/file.txt"));
+        
+        // Invalid file paths
+        assert!(!ToolCallReport::is_file_path("https://example.com"));
+        assert!(!ToolCallReport::is_file_path("http://test.com"));
+        assert!(!ToolCallReport::is_file_path("ls -la directory"));
+        assert!(!ToolCallReport::is_file_path("simple command"));
+    }
+
+    #[test]
+    fn test_normalize_path_absolute() {
+        let path = "/home/user/test.txt";
+        let normalized = ToolCallReport::normalize_path(path);
+        assert_eq!(normalized, path);
+    }
+
+    #[test]
+    fn test_tool_call_report_add_location() {
+        let mut report = ToolCallReport::new(
+            "test_id".to_string(),
+            "Test Tool".to_string(),
+            ToolKind::Read
+        );
+        
+        let location = ToolCallLocation {
+            path: "/test/path.txt".to_string(),
+            line: Some(10),
+        };
+        
+        report.add_location(location);
+        assert_eq!(report.locations.len(), 1);
+        assert_eq!(report.locations[0].path, "/test/path.txt");
+        assert_eq!(report.locations[0].line, Some(10));
+    }
+
+    #[test]
+    fn test_tool_call_to_acp_includes_locations() {
+        let mut report = ToolCallReport::new(
+            "test_id".to_string(),
+            "Reading file".to_string(),
+            ToolKind::Read
+        );
+        
+        report.add_location(ToolCallLocation {
+            path: "/test/file.txt".to_string(),
+            line: Some(5),
+        });
+        
+        let acp_tool_call = report.to_acp_tool_call();
+        assert_eq!(acp_tool_call.locations.len(), 1);
+        assert_eq!(acp_tool_call.locations[0].path.to_string_lossy(), "/test/file.txt");
+        assert_eq!(acp_tool_call.locations[0].line, Some(5));
+    }
+
+    #[test]
+    fn test_tool_call_update_includes_locations() {
+        let mut report = ToolCallReport::new(
+            "test_id".to_string(),
+            "Writing file".to_string(),
+            ToolKind::Edit
+        );
+        
+        report.add_location(ToolCallLocation {
+            path: "/test/output.txt".to_string(),
+            line: None,
+        });
+        
+        let acp_update = report.to_acp_tool_call_update();
+        assert!(acp_update.fields.locations.is_some());
+        let locations = acp_update.fields.locations.unwrap();
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].path.to_string_lossy(), "/test/output.txt");
+        assert_eq!(locations[0].line, None);
+    }
+
+    #[test]
+    fn test_extract_locations_mcp_tools() {
+        let args = json!({
+            "file_path": "/workspace/src/main.rs"
+        });
+        
+        let locations = ToolCallReport::extract_file_locations("mcp__files_read", &args);
+        assert_eq!(locations.len(), 1);
+        assert!(locations[0].path.ends_with("main.rs"));
+    }
+
+    #[test]
+    fn test_extract_locations_empty_args() {
+        let args = json!({});
+        
+        let locations = ToolCallReport::extract_file_locations("unknown_tool", &args);
+        assert_eq!(locations.len(), 0);
+    }
+
+    #[test]
+    fn test_extract_locations_string_arg() {
+        let args = json!("/single/file/path.txt");
+        
+        let locations = ToolCallReport::extract_file_locations("tool", &args);
+        assert_eq!(locations.len(), 1);
+        assert!(locations[0].path.ends_with("path.txt"));
     }
 }
