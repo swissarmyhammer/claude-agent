@@ -105,6 +105,36 @@ impl AgentThought {
     }
 }
 
+/// Parameters for the ACP fs/read_text_file method
+///
+/// ACP fs/read_text_file method implementation:
+/// 1. sessionId: Required - validate against active sessions
+/// 2. path: Required - must be absolute path
+/// 3. line: Optional - 1-based line number to start reading from
+/// 4. limit: Optional - maximum number of lines to read
+/// 5. Response: content field with requested file content
+///
+/// Supports partial file reading for performance optimization.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReadTextFileParams {
+    /// Session ID for validation
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    /// Absolute path to the file to read
+    pub path: String,
+    /// Optional 1-based line number to start reading from
+    pub line: Option<u32>,
+    /// Optional maximum number of lines to read
+    pub limit: Option<u32>,
+}
+
+/// Response for the ACP fs/read_text_file method
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReadTextFileResponse {
+    /// File content as requested (full file or partial based on line/limit)
+    pub content: String,
+}
+
 use tokio::sync::{broadcast, RwLock};
 use tokio_stream::StreamExt;
 
@@ -2621,7 +2651,53 @@ impl Agent for ClaudeAgent {
         self.log_request("ext_method", &request);
         tracing::info!("Extension method called: {}", request.method);
 
-        // Return a structured response indicating no extensions are implemented
+        // Handle fs/read_text_file extension method
+        if request.method == "fs/read_text_file".into() {
+            // Validate client capabilities for file system read operations
+            {
+                let client_caps = self.client_capabilities.read().await;
+                match &*client_caps {
+                    Some(caps) if caps.fs.read_text_file => {
+                        tracing::debug!("File system read capability validated");
+                    }
+                    Some(_) => {
+                        tracing::error!("fs/read_text_file capability not declared by client");
+                        return Err(agent_client_protocol::Error::invalid_params());
+                    }
+                    None => {
+                        tracing::error!("No client capabilities available for fs/read_text_file validation");
+                        return Err(agent_client_protocol::Error::invalid_params());
+                    }
+                }
+            }
+
+            // Parse the request parameters from RawValue
+            let params_value: serde_json::Value = serde_json::from_str(request.params.get())
+                .map_err(|e| {
+                    tracing::error!("Failed to parse fs/read_text_file parameters: {}", e);
+                    agent_client_protocol::Error::invalid_params()
+                })?;
+
+            let params: ReadTextFileParams = serde_json::from_value(params_value)
+                .map_err(|e| {
+                    tracing::error!("Failed to deserialize fs/read_text_file parameters: {}", e);
+                    agent_client_protocol::Error::invalid_params()
+                })?;
+
+            // Handle the file reading request
+            let response = self.handle_read_text_file(params).await?;
+
+            // Convert response to RawValue
+            let response_json = serde_json::to_value(response)
+                .map_err(|_e| agent_client_protocol::Error::internal_error())?;
+
+            let raw_value = RawValue::from_string(response_json.to_string())
+                .map_err(|_e| agent_client_protocol::Error::internal_error())?;
+
+            return Ok(Arc::from(raw_value));
+        }
+
+        // Return a structured response indicating no other extensions are implemented
         // This maintains ACP compliance while clearly communicating capability limitations
         let response = serde_json::json!({
             "method": request.method,
@@ -2756,6 +2832,100 @@ impl ClaudeAgent {
 
         self.log_response("request_permission", &response);
         Ok(response)
+    }
+
+    /// Handle fs/read_text_file ACP extension method
+    pub async fn handle_read_text_file(
+        &self,
+        params: ReadTextFileParams,
+    ) -> Result<ReadTextFileResponse, agent_client_protocol::Error> {
+        tracing::debug!("Processing fs/read_text_file request: {:?}", params);
+
+        // Validate session ID
+        self.parse_session_id(&SessionId(params.session_id.clone().into()))
+            .map_err(|_| agent_client_protocol::Error::invalid_params())?;
+
+        // Validate absolute path
+        if !params.path.starts_with('/') {
+            return Err(agent_client_protocol::Error::invalid_params());
+        }
+
+        // Validate line and limit parameters
+        if let Some(line) = params.line {
+            if line == 0 {
+                return Err(agent_client_protocol::Error::invalid_params());
+            }
+        }
+
+        // Read file content with line offset and limit
+        let content = self
+            .read_file_with_options(&params.path, params.line, params.limit)
+            .await?;
+
+        Ok(ReadTextFileResponse { content })
+    }
+
+    /// Read file content with optional line offset and limit
+    async fn read_file_with_options(
+        &self,
+        path: &str,
+        start_line: Option<u32>,
+        limit: Option<u32>,
+    ) -> Result<String, agent_client_protocol::Error> {
+        // Read the entire file
+        let file_content = tokio::fs::read_to_string(path).await.map_err(|e| {
+            tracing::error!("Failed to read file {}: {}", path, e);
+            match e.kind() {
+                std::io::ErrorKind::NotFound => {
+                    agent_client_protocol::Error::invalid_params()
+                }
+                std::io::ErrorKind::PermissionDenied => {
+                    agent_client_protocol::Error::invalid_params()
+                }
+                _ => agent_client_protocol::Error::internal_error(),
+            }
+        })?;
+
+        // Apply line filtering if specified
+        self.apply_line_filtering(&file_content, start_line, limit)
+    }
+
+    /// Apply line offset and limit filtering to file content
+    fn apply_line_filtering(
+        &self,
+        content: &str,
+        start_line: Option<u32>,
+        limit: Option<u32>,
+    ) -> Result<String, agent_client_protocol::Error> {
+        let lines: Vec<&str> = content.lines().collect();
+
+        let start_index = match start_line {
+            Some(line) => {
+                if line == 0 {
+                    return Err(agent_client_protocol::Error::invalid_params());
+                }
+                (line - 1) as usize // Convert to 0-based index
+            }
+            None => 0,
+        };
+
+        // If start index is beyond the end of the file, return empty string
+        if start_index >= lines.len() {
+            return Ok(String::new());
+        }
+
+        let end_index = match limit {
+            Some(limit_count) => {
+                if limit_count == 0 {
+                    return Ok(String::new());
+                }
+                std::cmp::min(start_index + limit_count as usize, lines.len())
+            }
+            None => lines.len(),
+        };
+
+        let selected_lines = &lines[start_index..end_index];
+        Ok(selected_lines.join("\n"))
     }
 }
 
@@ -5197,5 +5367,254 @@ mod tests {
         session.add_turn_tokens(100);
         assert_eq!(session.get_turn_request_count(), 1);
         assert_eq!(session.get_turn_token_count(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_text_file_full_file() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+
+        let agent = create_test_agent().await;
+        
+        // Create a temporary file with test content
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let test_content = "Line 1\nLine 2\nLine 3\nLine 4\nLine 5";
+        temp_file.write_all(test_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let params = ReadTextFileParams {
+            session_id: "test_session_123".to_string(),
+            path: temp_file.path().to_string_lossy().to_string(),
+            line: None,
+            limit: None,
+        };
+
+        let response = agent.handle_read_text_file(params).await.unwrap();
+        assert_eq!(response.content, test_content);
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_text_file_with_line_offset() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+
+        let agent = create_test_agent().await;
+        
+        // Create a temporary file with test content
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let test_content = "Line 1\nLine 2\nLine 3\nLine 4\nLine 5";
+        temp_file.write_all(test_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let params = ReadTextFileParams {
+            session_id: "test_session_123".to_string(),
+            path: temp_file.path().to_string_lossy().to_string(),
+            line: Some(3), // Start from line 3 (1-based)
+            limit: None,
+        };
+
+        let response = agent.handle_read_text_file(params).await.unwrap();
+        assert_eq!(response.content, "Line 3\nLine 4\nLine 5");
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_text_file_with_limit() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+
+        let agent = create_test_agent().await;
+        
+        // Create a temporary file with test content
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let test_content = "Line 1\nLine 2\nLine 3\nLine 4\nLine 5";
+        temp_file.write_all(test_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let params = ReadTextFileParams {
+            session_id: "test_session_123".to_string(),
+            path: temp_file.path().to_string_lossy().to_string(),
+            line: None,
+            limit: Some(3), // Read only first 3 lines
+        };
+
+        let response = agent.handle_read_text_file(params).await.unwrap();
+        assert_eq!(response.content, "Line 1\nLine 2\nLine 3");
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_text_file_with_line_and_limit() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+
+        let agent = create_test_agent().await;
+        
+        // Create a temporary file with test content
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let test_content = "Line 1\nLine 2\nLine 3\nLine 4\nLine 5";
+        temp_file.write_all(test_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let params = ReadTextFileParams {
+            session_id: "test_session_123".to_string(),
+            path: temp_file.path().to_string_lossy().to_string(),
+            line: Some(2), // Start from line 2
+            limit: Some(2), // Read only 2 lines
+        };
+
+        let response = agent.handle_read_text_file(params).await.unwrap();
+        assert_eq!(response.content, "Line 2\nLine 3");
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_text_file_empty_file() {
+        use tempfile::NamedTempFile;
+
+        let agent = create_test_agent().await;
+        
+        // Create an empty temporary file
+        let temp_file = NamedTempFile::new().unwrap();
+
+        let params = ReadTextFileParams {
+            session_id: "test_session_123".to_string(),
+            path: temp_file.path().to_string_lossy().to_string(),
+            line: None,
+            limit: None,
+        };
+
+        let response = agent.handle_read_text_file(params).await.unwrap();
+        assert_eq!(response.content, "");
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_text_file_line_beyond_end() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+
+        let agent = create_test_agent().await;
+        
+        // Create a temporary file with only 2 lines
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let test_content = "Line 1\nLine 2";
+        temp_file.write_all(test_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let params = ReadTextFileParams {
+            session_id: "test_session_123".to_string(),
+            path: temp_file.path().to_string_lossy().to_string(),
+            line: Some(5), // Start beyond end of file
+            limit: None,
+        };
+
+        let response = agent.handle_read_text_file(params).await.unwrap();
+        assert_eq!(response.content, ""); // Should return empty string
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_text_file_invalid_line_zero() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+
+        let agent = create_test_agent().await;
+        
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(b"test content").unwrap();
+        temp_file.flush().unwrap();
+
+        let params = ReadTextFileParams {
+            session_id: "test_session_123".to_string(),
+            path: temp_file.path().to_string_lossy().to_string(),
+            line: Some(0), // Invalid: line numbers are 1-based
+            limit: None,
+        };
+
+        let result = agent.handle_read_text_file(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_text_file_nonexistent_file() {
+        let agent = create_test_agent().await;
+
+        let params = ReadTextFileParams {
+            session_id: "test_session_123".to_string(),
+            path: "/path/to/nonexistent/file.txt".to_string(),
+            line: None,
+            limit: None,
+        };
+
+        let result = agent.handle_read_text_file(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_text_file_relative_path_rejected() {
+        let agent = create_test_agent().await;
+
+        let params = ReadTextFileParams {
+            session_id: "test_session_123".to_string(),
+            path: "relative/path/file.txt".to_string(), // Relative path should be rejected
+            line: None,
+            limit: None,
+        };
+
+        let result = agent.handle_read_text_file(params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_text_file_different_line_endings() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+
+        let agent = create_test_agent().await;
+        
+        // Test with CRLF line endings
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let test_content = "Line 1\r\nLine 2\r\nLine 3";
+        temp_file.write_all(test_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let params = ReadTextFileParams {
+            session_id: "test_session_123".to_string(),
+            path: temp_file.path().to_string_lossy().to_string(),
+            line: Some(2),
+            limit: Some(2),
+        };
+
+        let response = agent.handle_read_text_file(params).await.unwrap();
+        assert_eq!(response.content, "Line 2\nLine 3"); // Should normalize to LF
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_text_file_ext_method_routing() {
+        let agent = create_test_agent().await;
+        
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+
+        // Create a test file
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(b"Test content for ext method").unwrap();
+        temp_file.flush().unwrap();
+
+        // Test through ext_method interface
+        let params = serde_json::json!({
+            "sessionId": "test_session_123",
+            "path": temp_file.path().to_string_lossy(),
+            "line": null,
+            "limit": null
+        });
+
+        let params_raw = agent_client_protocol::RawValue::from_string(params.to_string()).unwrap();
+        let ext_request = agent_client_protocol::ExtRequest {
+            method: "fs/read_text_file".into(),
+            params: Arc::from(params_raw),
+        };
+
+        let result = agent.ext_method(ext_request).await.unwrap();
+        
+        // Parse the response
+        let response: serde_json::Value = serde_json::from_str(result.get()).unwrap();
+        assert_eq!(response["content"], "Test content for ext method");
     }
 }
