@@ -31,6 +31,8 @@ pub mod session_errors;
 pub mod session_loading;
 pub mod session_validation;
 pub mod terminal_manager;
+#[cfg(test)]
+mod tool_call_lifecycle_tests;
 pub mod tool_classification;
 pub mod tool_types;
 pub mod tools;
