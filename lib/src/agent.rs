@@ -1146,57 +1146,26 @@ impl ClaudeAgent {
             .send_agent_thought(&request.session_id, &execution_thought)
             .await;
 
-        // ACP requires validation of content types against agent's prompt capabilities
-        // Validate that all content types in the prompt are supported by this agent
-        for content_block in &request.prompt {
-            match content_block {
-                ContentBlock::Image(_) => {
-                    if !self.capabilities.prompt_capabilities.image {
-                        return Err(agent_client_protocol::Error {
-                            code: -32602,
-                            message:
-                                "Content type not supported: agent does not support image content"
-                                    .to_string(),
-                            data: Some(serde_json::json!({
-                                "content_type": "image",
-                                "required_capability": "promptCapabilities.image",
-                                "declared": false
-                            })),
-                        });
-                    }
-                }
-                ContentBlock::Audio(_) => {
-                    if !self.capabilities.prompt_capabilities.audio {
-                        return Err(agent_client_protocol::Error {
-                            code: -32602,
-                            message:
-                                "Content type not supported: agent does not support audio content"
-                                    .to_string(),
-                            data: Some(serde_json::json!({
-                                "content_type": "audio",
-                                "required_capability": "promptCapabilities.audio",
-                                "declared": false
-                            })),
-                        });
-                    }
-                }
-                ContentBlock::Resource(_) | ContentBlock::ResourceLink(_) => {
-                    if !self.capabilities.prompt_capabilities.embedded_context {
-                        return Err(agent_client_protocol::Error {
-                            code: -32602,
-                            message: "Content type not supported: agent does not support embedded context content".to_string(),
-                            data: Some(serde_json::json!({
-                                "content_type": "embedded_context",
-                                "required_capability": "promptCapabilities.embedded_context",
-                                "declared": false
-                            })),
-                        });
-                    }
-                }
-                ContentBlock::Text(_) => {
-                    // Text content is always supported - no capability check needed
-                }
-            }
+        // Validate content blocks against prompt capabilities before processing
+        let content_validator =
+            ContentCapabilityValidator::new(self.capabilities.prompt_capabilities.clone());
+        if let Err(capability_error) = content_validator.validate_content_blocks(&request.prompt) {
+            tracing::warn!(
+                "Content capability validation failed for session {}: {}",
+                session_id,
+                capability_error
+            );
+
+            // Convert to ACP-compliant error response
+            let acp_error_data = capability_error.to_acp_error();
+            return Err(agent_client_protocol::Error {
+                code: acp_error_data["code"].as_i64().unwrap_or(-32602) as i32,
+                message: acp_error_data["message"]
+                    .as_str()
+                    .unwrap_or("Content capability validation failed")
+                    .to_string(),
+                data: Some(acp_error_data["data"].clone()),
+            });
         }
 
         // Process all content blocks using the comprehensive processor
@@ -4338,6 +4307,87 @@ mod tests {
             meta_2.get("streaming").unwrap(),
             &serde_json::Value::Bool(true)
         );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_prompt_with_resource_link() {
+        let (agent, _notification_receiver) = create_test_agent_with_notifications().await;
+
+        // Create session with streaming capabilities
+        let new_session_request = NewSessionRequest {
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![],
+            meta: Some(serde_json::json!({"streaming": true})),
+        };
+        let session_response = agent.new_session(new_session_request).await.unwrap();
+
+        // Update session to have client capabilities with streaming enabled
+        let session_id = session_response.session_id.0.as_ref().parse().unwrap();
+        agent
+            .session_manager
+            .update_session(&session_id, |session| {
+                session.client_capabilities = Some(agent_client_protocol::ClientCapabilities {
+                    fs: agent_client_protocol::FileSystemCapability {
+                        read_text_file: true,
+                        write_text_file: true,
+                        meta: None,
+                    },
+                    terminal: true,
+                    meta: Some(serde_json::json!({"streaming": true})),
+                });
+            })
+            .unwrap();
+
+        // Send streaming prompt with ResourceLink (baseline capability, should always be accepted)
+        let prompt_request = PromptRequest {
+            session_id: session_response.session_id.clone(),
+            prompt: vec![
+                ContentBlock::Text(TextContent {
+                    text: "Here is a resource to review:".to_string(),
+                    annotations: None,
+                    meta: None,
+                }),
+                ContentBlock::ResourceLink(agent_client_protocol::ResourceLink {
+                    uri: "https://example.com/document.pdf".to_string(),
+                    name: "Example Document".to_string(),
+                    description: Some("A sample PDF document".to_string()),
+                    mime_type: Some("application/pdf".to_string()),
+                    title: Some("Example Document".to_string()),
+                    size: Some(1024),
+                    annotations: None,
+                    meta: None,
+                }),
+            ],
+            meta: None,
+        };
+
+        // Execute streaming prompt - should succeed even with embedded_context: false
+        let response = agent.prompt(prompt_request.clone()).await.unwrap();
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+
+        // Verify streaming metadata is present
+        assert!(response.meta.is_some());
+        let meta = response.meta.unwrap();
+        assert_eq!(
+            meta.get("streaming").unwrap(),
+            &serde_json::Value::Bool(true)
+        );
+
+        // Verify session was updated with both user and assistant messages
+        let session = agent
+            .session_manager
+            .get_session(&session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.context.len(), 2); // user + assistant
+        assert!(matches!(
+            session.context[0].role,
+            crate::session::MessageRole::User
+        ));
+        assert!(matches!(
+            session.context[1].role,
+            crate::session::MessageRole::Assistant
+        ));
     }
 
     // Protocol Compliance Tests
