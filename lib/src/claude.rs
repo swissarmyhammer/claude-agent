@@ -41,6 +41,24 @@ pub enum MessageRole {
 pub struct MessageChunk {
     pub content: String,
     pub chunk_type: ChunkType,
+    /// Tool call information (only present when chunk_type is ToolCall)
+    pub tool_call: Option<ToolCallInfo>,
+    /// Token usage information (only present in Result messages)
+    pub token_usage: Option<TokenUsageInfo>,
+}
+
+/// Tool call information extracted from Message::Tool
+#[derive(Debug, Clone)]
+pub struct ToolCallInfo {
+    pub name: String,
+    pub parameters: serde_json::Value,
+}
+
+/// Token usage information extracted from Message metadata
+#[derive(Debug, Clone)]
+pub struct TokenUsageInfo {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 /// Types of message chunks in streaming responses
@@ -122,22 +140,47 @@ impl ClaudeClient {
                 Ok(Message::Assistant { content, .. }) => MessageChunk {
                     content,
                     chunk_type: ChunkType::Text,
+                    tool_call: None,
+                    token_usage: None,
                 },
-                Ok(Message::Tool { .. }) => MessageChunk {
+                Ok(Message::Tool {
+                    name, parameters, ..
+                }) => MessageChunk {
                     content: String::new(), // Tool calls don't have direct content
                     chunk_type: ChunkType::ToolCall,
+                    tool_call: Some(ToolCallInfo { name, parameters }),
+                    token_usage: None,
                 },
                 Ok(Message::ToolResult { .. }) => MessageChunk {
                     content: String::new(), // Tool results handled separately
                     chunk_type: ChunkType::ToolResult,
+                    tool_call: None,
+                    token_usage: None,
                 },
+                Ok(Message::Result { meta, .. }) => {
+                    // Extract token usage from metadata
+                    let token_usage = meta.tokens_used.map(|tokens| TokenUsageInfo {
+                        input_tokens: tokens.input,
+                        output_tokens: tokens.output,
+                    });
+                    MessageChunk {
+                        content: String::new(),
+                        chunk_type: ChunkType::Text,
+                        tool_call: None,
+                        token_usage,
+                    }
+                }
                 Ok(_) => MessageChunk {
-                    content: String::new(), // Other message types (Init, User, System, Result)
+                    content: String::new(), // Other message types (Init, User, System)
                     chunk_type: ChunkType::Text,
+                    tool_call: None,
+                    token_usage: None,
                 },
                 Err(_) => MessageChunk {
                     content: String::new(), // Error handling - could be improved
                     chunk_type: ChunkType::Text,
+                    tool_call: None,
+                    token_usage: None,
                 },
             }
         });
@@ -223,22 +266,47 @@ impl ClaudeClient {
                 Ok(Message::Assistant { content, .. }) => MessageChunk {
                     content,
                     chunk_type: ChunkType::Text,
+                    tool_call: None,
+                    token_usage: None,
                 },
-                Ok(Message::Tool { .. }) => MessageChunk {
+                Ok(Message::Tool {
+                    name, parameters, ..
+                }) => MessageChunk {
                     content: String::new(), // Tool calls don't have direct content
                     chunk_type: ChunkType::ToolCall,
+                    tool_call: Some(ToolCallInfo { name, parameters }),
+                    token_usage: None,
                 },
                 Ok(Message::ToolResult { .. }) => MessageChunk {
                     content: String::new(), // Tool results handled separately
                     chunk_type: ChunkType::ToolResult,
+                    tool_call: None,
+                    token_usage: None,
                 },
+                Ok(Message::Result { meta, .. }) => {
+                    // Extract token usage from metadata
+                    let token_usage = meta.tokens_used.map(|tokens| TokenUsageInfo {
+                        input_tokens: tokens.input,
+                        output_tokens: tokens.output,
+                    });
+                    MessageChunk {
+                        content: String::new(),
+                        chunk_type: ChunkType::Text,
+                        tool_call: None,
+                        token_usage,
+                    }
+                }
                 Ok(_) => MessageChunk {
-                    content: String::new(), // Other message types (Init, User, System, Result)
+                    content: String::new(), // Other message types (Init, User, System)
                     chunk_type: ChunkType::Text,
+                    tool_call: None,
+                    token_usage: None,
                 },
                 Err(_) => MessageChunk {
                     content: String::new(), // Error handling - could be improved
                     chunk_type: ChunkType::Text,
+                    tool_call: None,
+                    token_usage: None,
                 },
             }
         });
@@ -437,16 +505,35 @@ mod tests {
         let text_chunk = MessageChunk {
             content: "text".to_string(),
             chunk_type: ChunkType::Text,
+            tool_call: None,
+            token_usage: None,
         };
 
         let tool_call_chunk = MessageChunk {
             content: "tool_call".to_string(),
             chunk_type: ChunkType::ToolCall,
+            tool_call: Some(ToolCallInfo {
+                name: "test_tool".to_string(),
+                parameters: serde_json::json!({"arg": "value"}),
+            }),
+            token_usage: None,
         };
 
         let tool_result_chunk = MessageChunk {
             content: "tool_result".to_string(),
             chunk_type: ChunkType::ToolResult,
+            tool_call: None,
+            token_usage: None,
+        };
+
+        let result_chunk = MessageChunk {
+            content: String::new(),
+            chunk_type: ChunkType::Text,
+            tool_call: None,
+            token_usage: Some(TokenUsageInfo {
+                input_tokens: 100,
+                output_tokens: 200,
+            }),
         };
 
         assert!(matches!(text_chunk.chunk_type, ChunkType::Text));
@@ -455,5 +542,16 @@ mod tests {
             tool_result_chunk.chunk_type,
             ChunkType::ToolResult
         ));
+        assert!(tool_call_chunk.tool_call.is_some());
+        assert_eq!(
+            tool_call_chunk.tool_call.as_ref().unwrap().name,
+            "test_tool"
+        );
+        assert!(result_chunk.token_usage.is_some());
+        assert_eq!(result_chunk.token_usage.as_ref().unwrap().input_tokens, 100);
+        assert_eq!(
+            result_chunk.token_usage.as_ref().unwrap().output_tokens,
+            200
+        );
     }
 }
