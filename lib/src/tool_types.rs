@@ -628,4 +628,297 @@ mod tests {
         assert_eq!(locations.len(), 1);
         assert!(locations[0].path.ends_with("path.txt"));
     }
+
+    #[test]
+    fn test_tool_call_content_serialization_content_variant() {
+        let content = ToolCallContent::Content {
+            content: agent_client_protocol::ContentBlock::Text(
+                agent_client_protocol::TextContent {
+                    text: "Test content".to_string(),
+                    annotations: None,
+                    meta: None,
+                },
+            ),
+        };
+
+        let json = serde_json::to_value(&content).expect("Should serialize");
+        assert_eq!(json["type"], "content");
+        assert!(json.get("content").is_some());
+    }
+
+    #[test]
+    fn test_tool_call_content_serialization_diff_variant() {
+        let content = ToolCallContent::Diff {
+            path: "/test/file.rs".to_string(),
+            old_text: Some("old content".to_string()),
+            new_text: "new content".to_string(),
+        };
+
+        let json = serde_json::to_value(&content).expect("Should serialize");
+        assert_eq!(json["type"], "diff");
+        assert_eq!(json["path"], "/test/file.rs");
+        assert_eq!(json["oldText"], "old content");
+        assert_eq!(json["newText"], "new content");
+    }
+
+    #[test]
+    fn test_tool_call_content_serialization_diff_variant_new_file() {
+        let content = ToolCallContent::Diff {
+            path: "/test/new_file.rs".to_string(),
+            old_text: None,
+            new_text: "new file content".to_string(),
+        };
+
+        let json = serde_json::to_value(&content).expect("Should serialize");
+        assert_eq!(json["type"], "diff");
+        assert_eq!(json["path"], "/test/new_file.rs");
+        assert!(json["oldText"].is_null());
+        assert_eq!(json["newText"], "new file content");
+    }
+
+    #[test]
+    fn test_tool_call_content_serialization_terminal_variant() {
+        let content = ToolCallContent::Terminal {
+            terminal_id: "term_abc123xyz".to_string(),
+        };
+
+        let json = serde_json::to_value(&content).expect("Should serialize");
+        assert_eq!(json["type"], "terminal");
+        assert_eq!(json["terminalId"], "term_abc123xyz");
+    }
+
+    #[test]
+    fn test_tool_call_content_deserialization_content_variant() {
+        let json = json!({
+            "type": "content",
+            "content": {
+                "type": "text",
+                "text": "Deserialized content"
+            }
+        });
+
+        let content: ToolCallContent = serde_json::from_value(json).expect("Should deserialize");
+        match content {
+            ToolCallContent::Content { content } => {
+                if let agent_client_protocol::ContentBlock::Text(text) = content {
+                    assert_eq!(text.text, "Deserialized content");
+                } else {
+                    panic!("Expected text content");
+                }
+            }
+            _ => panic!("Expected Content variant"),
+        }
+    }
+
+    #[test]
+    fn test_tool_call_content_deserialization_diff_variant() {
+        let json = json!({
+            "type": "diff",
+            "path": "/src/main.rs",
+            "oldText": "fn main() { }",
+            "newText": "fn main() {\n    println!(\"Hello\");\n}"
+        });
+
+        let content: ToolCallContent = serde_json::from_value(json).expect("Should deserialize");
+        match content {
+            ToolCallContent::Diff {
+                path,
+                old_text,
+                new_text,
+            } => {
+                assert_eq!(path, "/src/main.rs");
+                assert_eq!(old_text.unwrap(), "fn main() { }");
+                assert!(new_text.contains("println"));
+            }
+            _ => panic!("Expected Diff variant"),
+        }
+    }
+
+    #[test]
+    fn test_tool_call_content_deserialization_terminal_variant() {
+        let json = json!({
+            "type": "terminal",
+            "terminalId": "term_987654321"
+        });
+
+        let content: ToolCallContent = serde_json::from_value(json).expect("Should deserialize");
+        match content {
+            ToolCallContent::Terminal { terminal_id } => {
+                assert_eq!(terminal_id, "term_987654321");
+            }
+            _ => panic!("Expected Terminal variant"),
+        }
+    }
+
+    #[test]
+    fn test_tool_call_content_to_acp_content_variant() {
+        let content = ToolCallContent::Content {
+            content: agent_client_protocol::ContentBlock::Text(
+                agent_client_protocol::TextContent {
+                    text: "ACP test".to_string(),
+                    annotations: None,
+                    meta: None,
+                },
+            ),
+        };
+
+        let acp_content = content.to_acp_content();
+        match acp_content {
+            agent_client_protocol::ToolCallContent::Content { content } => {
+                if let agent_client_protocol::ContentBlock::Text(text) = content {
+                    assert_eq!(text.text, "ACP test");
+                } else {
+                    panic!("Expected text content");
+                }
+            }
+            _ => panic!("Expected Content variant"),
+        }
+    }
+
+    #[test]
+    fn test_tool_call_content_to_acp_diff_variant() {
+        let content = ToolCallContent::Diff {
+            path: "/workspace/config.json".to_string(),
+            old_text: Some(r#"{"debug": false}"#.to_string()),
+            new_text: r#"{"debug": true}"#.to_string(),
+        };
+
+        let acp_content = content.to_acp_content();
+        match acp_content {
+            agent_client_protocol::ToolCallContent::Diff { diff } => {
+                assert_eq!(diff.path.to_string_lossy(), "/workspace/config.json");
+                assert_eq!(diff.old_text.unwrap(), r#"{"debug": false}"#);
+                assert_eq!(diff.new_text, r#"{"debug": true}"#);
+                assert!(diff.meta.is_none());
+            }
+            _ => panic!("Expected Diff variant"),
+        }
+    }
+
+    #[test]
+    fn test_tool_call_content_to_acp_terminal_variant() {
+        let content = ToolCallContent::Terminal {
+            terminal_id: "term_unique_id_123".to_string(),
+        };
+
+        let acp_content = content.to_acp_content();
+        match acp_content {
+            agent_client_protocol::ToolCallContent::Terminal { terminal_id } => {
+                assert_eq!(terminal_id.0.as_ref(), "term_unique_id_123");
+            }
+            _ => panic!("Expected Terminal variant"),
+        }
+    }
+
+    #[test]
+    fn test_tool_call_report_with_multiple_content_types() {
+        let mut report = ToolCallReport::new(
+            "test_multi_content".to_string(),
+            "Multi-content test".to_string(),
+            ToolKind::Edit,
+        );
+
+        report.add_content(ToolCallContent::Content {
+            content: agent_client_protocol::ContentBlock::Text(
+                agent_client_protocol::TextContent {
+                    text: "Starting operation".to_string(),
+                    annotations: None,
+                    meta: None,
+                },
+            ),
+        });
+
+        report.add_content(ToolCallContent::Diff {
+            path: "/test/file.txt".to_string(),
+            old_text: Some("before".to_string()),
+            new_text: "after".to_string(),
+        });
+
+        report.add_content(ToolCallContent::Terminal {
+            terminal_id: "term_operation_123".to_string(),
+        });
+
+        assert_eq!(report.content.len(), 3);
+
+        let acp_call = report.to_acp_tool_call();
+        assert_eq!(acp_call.content.len(), 3);
+
+        match &acp_call.content[0] {
+            agent_client_protocol::ToolCallContent::Content { .. } => {}
+            _ => panic!("First content should be Content variant"),
+        }
+
+        match &acp_call.content[1] {
+            agent_client_protocol::ToolCallContent::Diff { .. } => {}
+            _ => panic!("Second content should be Diff variant"),
+        }
+
+        match &acp_call.content[2] {
+            agent_client_protocol::ToolCallContent::Terminal { .. } => {}
+            _ => panic!("Third content should be Terminal variant"),
+        }
+    }
+
+    #[test]
+    fn test_diff_content_with_multiline_text() {
+        let old_content = "line 1\nline 2\nline 3";
+        let new_content = "line 1\nmodified line 2\nline 3\nline 4";
+
+        let content = ToolCallContent::Diff {
+            path: "/src/multi.txt".to_string(),
+            old_text: Some(old_content.to_string()),
+            new_text: new_content.to_string(),
+        };
+
+        let json = serde_json::to_value(&content).expect("Should serialize multiline");
+        assert!(json["oldText"].as_str().unwrap().contains('\n'));
+        assert!(json["newText"].as_str().unwrap().contains('\n'));
+
+        let acp_content = content.to_acp_content();
+        match acp_content {
+            agent_client_protocol::ToolCallContent::Diff { diff } => {
+                assert!(diff.old_text.unwrap().contains('\n'));
+                assert!(diff.new_text.contains('\n'));
+            }
+            _ => panic!("Expected Diff variant"),
+        }
+    }
+
+    #[test]
+    fn test_diff_content_with_unicode() {
+        let content = ToolCallContent::Diff {
+            path: "/docs/unicode.txt".to_string(),
+            old_text: Some("Hello 世界".to_string()),
+            new_text: "Hello 世界! 🌍".to_string(),
+        };
+
+        let json = serde_json::to_value(&content).expect("Should serialize unicode");
+        assert!(json["newText"].as_str().unwrap().contains('🌍'));
+
+        let deserialized: ToolCallContent =
+            serde_json::from_value(json).expect("Should deserialize unicode");
+        match deserialized {
+            ToolCallContent::Diff { new_text, .. } => {
+                assert!(new_text.contains('🌍'));
+                assert!(new_text.contains('世'));
+            }
+            _ => panic!("Expected Diff variant"),
+        }
+    }
+
+    #[test]
+    fn test_empty_content_list_serialization() {
+        let report = ToolCallReport::new(
+            "test_empty_content".to_string(),
+            "No content test".to_string(),
+            ToolKind::Think,
+        );
+
+        let acp_call = report.to_acp_tool_call();
+        assert_eq!(acp_call.content.len(), 0);
+
+        let json = serde_json::to_value(&report).expect("Should serialize empty content");
+        assert!(json["content"].is_array());
+        assert_eq!(json["content"].as_array().unwrap().len(), 0);
+    }
 }
