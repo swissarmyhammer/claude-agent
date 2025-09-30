@@ -2997,6 +2997,8 @@ mod tests {
             buffer_truncated: Arc::new(RwLock::new(false)),
             exit_status: Arc::new(RwLock::new(None)),
             state: Arc::new(RwLock::new(crate::terminal_manager::TerminalState::Created)),
+            output_task: None,
+            timeout_config: crate::terminal_manager::TimeoutConfig::default(),
         };
 
         // Test normal addition within limits

@@ -2925,6 +2925,100 @@ impl Agent for ClaudeAgent {
             return Ok(Arc::from(raw_value));
         }
 
+        // Handle terminal/wait_for_exit extension method
+        if request.method == "terminal/wait_for_exit".into() {
+            // Validate terminal capability
+            {
+                let client_caps = self.client_capabilities.read().await;
+                match &*client_caps {
+                    Some(caps) if caps.terminal => {
+                        tracing::debug!("Terminal capability validated for wait_for_exit");
+                    }
+                    Some(_) => {
+                        tracing::error!("terminal/wait_for_exit capability not declared by client");
+                        return Err(agent_client_protocol::Error::invalid_params());
+                    }
+                    None => {
+                        tracing::error!(
+                            "No client capabilities available for terminal/wait_for_exit validation"
+                        );
+                        return Err(agent_client_protocol::Error::invalid_params());
+                    }
+                }
+            }
+
+            // Parse and validate parameters
+            let params_value: serde_json::Value =
+                serde_json::from_str(request.params.get()).map_err(|e| {
+                    tracing::error!("Failed to parse terminal/wait_for_exit parameters: {}", e);
+                    agent_client_protocol::Error::invalid_params()
+                })?;
+
+            let params: crate::terminal_manager::TerminalOutputParams =
+                serde_json::from_value(params_value).map_err(|e| {
+                    tracing::error!("Failed to deserialize terminal/wait_for_exit parameters: {}", e);
+                    agent_client_protocol::Error::invalid_params()
+                })?;
+
+            // Handle the wait for exit request
+            let response = self.handle_terminal_wait_for_exit(params).await?;
+
+            // Convert response to RawValue
+            let response_json = serde_json::to_value(response)
+                .map_err(|_e| agent_client_protocol::Error::internal_error())?;
+
+            let raw_value = RawValue::from_string(response_json.to_string())
+                .map_err(|_e| agent_client_protocol::Error::internal_error())?;
+
+            return Ok(Arc::from(raw_value));
+        }
+
+        // Handle terminal/kill extension method
+        if request.method == "terminal/kill".into() {
+            // Validate terminal capability
+            {
+                let client_caps = self.client_capabilities.read().await;
+                match &*client_caps {
+                    Some(caps) if caps.terminal => {
+                        tracing::debug!("Terminal capability validated for kill");
+                    }
+                    Some(_) => {
+                        tracing::error!("terminal/kill capability not declared by client");
+                        return Err(agent_client_protocol::Error::invalid_params());
+                    }
+                    None => {
+                        tracing::error!(
+                            "No client capabilities available for terminal/kill validation"
+                        );
+                        return Err(agent_client_protocol::Error::invalid_params());
+                    }
+                }
+            }
+
+            // Parse and validate parameters
+            let params_value: serde_json::Value =
+                serde_json::from_str(request.params.get()).map_err(|e| {
+                    tracing::error!("Failed to parse terminal/kill parameters: {}", e);
+                    agent_client_protocol::Error::invalid_params()
+                })?;
+
+            let params: crate::terminal_manager::TerminalOutputParams =
+                serde_json::from_value(params_value).map_err(|e| {
+                    tracing::error!("Failed to deserialize terminal/kill parameters: {}", e);
+                    agent_client_protocol::Error::invalid_params()
+                })?;
+
+            // Handle the kill request
+            self.handle_terminal_kill(params).await?;
+
+            // Return null result per ACP specification
+            let response_json = serde_json::Value::Null;
+            let raw_value = RawValue::from_string(response_json.to_string())
+                .map_err(|_e| agent_client_protocol::Error::internal_error())?;
+
+            return Ok(Arc::from(raw_value));
+        }
+
         // Return a structured response indicating no other extensions are implemented
         // This maintains ACP compliance while clearly communicating capability limitations
         let response = serde_json::json!({
@@ -3155,6 +3249,48 @@ impl ClaudeAgent {
             .await
             .map_err(|e| {
                 tracing::error!("Failed to release terminal: {}", e);
+                agent_client_protocol::Error::invalid_params()
+            })
+    }
+
+    /// Handle terminal/wait_for_exit ACP extension method
+    pub async fn handle_terminal_wait_for_exit(
+        &self,
+        params: crate::terminal_manager::TerminalOutputParams,
+    ) -> Result<crate::terminal_manager::ExitStatus, agent_client_protocol::Error> {
+        tracing::debug!("Processing terminal/wait_for_exit request: {:?}", params);
+
+        // Get terminal manager from tool handler
+        let tool_handler = self.tool_handler.read().await;
+        let terminal_manager = tool_handler.get_terminal_manager();
+
+        // Wait for terminal exit
+        terminal_manager
+            .wait_for_exit(&self.session_manager, params)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to wait for terminal exit: {}", e);
+                agent_client_protocol::Error::invalid_params()
+            })
+    }
+
+    /// Handle terminal/kill ACP extension method
+    pub async fn handle_terminal_kill(
+        &self,
+        params: crate::terminal_manager::TerminalOutputParams,
+    ) -> Result<(), agent_client_protocol::Error> {
+        tracing::debug!("Processing terminal/kill request: {:?}", params);
+
+        // Get terminal manager from tool handler
+        let tool_handler = self.tool_handler.read().await;
+        let terminal_manager = tool_handler.get_terminal_manager();
+
+        // Kill terminal process
+        terminal_manager
+            .kill_terminal(&self.session_manager, params)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to kill terminal: {}", e);
                 agent_client_protocol::Error::invalid_params()
             })
     }
