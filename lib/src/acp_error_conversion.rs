@@ -1,6 +1,7 @@
 use crate::base64_processor::Base64ProcessorError;
 use crate::content_block_processor::ContentBlockProcessorError;
 use crate::content_security_validator::ContentSecurityError;
+use crate::mime_type_validator::MimeTypeValidationError;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -417,6 +418,97 @@ pub fn convert_base64_error_to_acp(
         Base64ProcessorError::EnhancedSecurityValidationFailed(security_error) => {
             convert_content_security_error_to_acp(security_error, Some(ctx))
         }
+        Base64ProcessorError::MimeTypeValidationFailed(mime_error) => {
+            convert_mime_type_error_to_acp(mime_error, Some(ctx))
+        }
+    }
+}
+
+/// Convert MimeTypeValidationError to ACP-compliant JSON-RPC error
+pub fn convert_mime_type_error_to_acp(
+    error: MimeTypeValidationError,
+    context: Option<ErrorContext>,
+) -> JsonRpcError {
+    let ctx = context.unwrap_or_default();
+
+    match error {
+        MimeTypeValidationError::UnsupportedMimeType {
+            content_type,
+            mime_type,
+            allowed_types,
+            suggestion,
+        } => JsonRpcError {
+            code: -32602,
+            message: format!("Unsupported MIME type for {}: {}", content_type, mime_type),
+            data: Some(json!({
+                "error": "unsupported_mime_type",
+                "contentType": content_type,
+                "providedMimeType": mime_type,
+                "allowedTypes": allowed_types,
+                "suggestion": suggestion.unwrap_or_else(|| format!("Use one of the supported {} MIME types", content_type)),
+                "correlationId": ctx.correlation_id,
+                "stage": ctx.processing_stage
+            })),
+        },
+        MimeTypeValidationError::SecurityBlocked {
+            mime_type,
+            reason,
+            allowed_categories,
+        } => JsonRpcError {
+            code: -32602,
+            message: format!("MIME type blocked for security reasons: {}", mime_type),
+            data: Some(json!({
+                "error": "mime_type_security_blocked",
+                "providedMimeType": mime_type,
+                "reason": reason,
+                "allowedCategories": allowed_categories,
+                "suggestion": "Use a MIME type from allowed categories",
+                "correlationId": ctx.correlation_id,
+                "stage": ctx.processing_stage
+            })),
+        },
+        MimeTypeValidationError::FormatMismatch {
+            expected,
+            detected,
+            mime_type,
+        } => JsonRpcError {
+            code: -32602,
+            message: format!(
+                "MIME type format validation failed: expected {}, detected {}",
+                expected, detected
+            ),
+            data: Some(json!({
+                "error": "mime_type_format_mismatch",
+                "declaredMimeType": mime_type,
+                "expectedFormat": expected,
+                "detectedFormat": detected,
+                "suggestion": "Ensure content data matches the declared MIME type",
+                "correlationId": ctx.correlation_id,
+                "stage": ctx.processing_stage
+            })),
+        },
+        MimeTypeValidationError::InvalidFormat { mime_type } => JsonRpcError {
+            code: -32602,
+            message: format!("Invalid MIME type format: {}", mime_type),
+            data: Some(json!({
+                "error": "invalid_mime_type_format",
+                "providedMimeType": mime_type,
+                "suggestion": "Provide a valid MIME type in format 'type/subtype'",
+                "correlationId": ctx.correlation_id,
+                "stage": ctx.processing_stage
+            })),
+        },
+        MimeTypeValidationError::ContentValidation { details } => JsonRpcError {
+            code: -32602,
+            message: "Content validation failed".to_string(),
+            data: Some(json!({
+                "error": "content_validation_failed",
+                "details": details,
+                "suggestion": "Check content structure and format",
+                "correlationId": ctx.correlation_id,
+                "stage": ctx.processing_stage
+            })),
+        },
     }
 }
 

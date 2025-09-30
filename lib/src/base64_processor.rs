@@ -1,4 +1,5 @@
 use crate::content_security_validator::{ContentSecurityError, ContentSecurityValidator};
+use crate::mime_type_validator::{MimeTypeValidationError, MimeTypeValidator};
 use base64::{engine::general_purpose, Engine as _};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -30,13 +31,13 @@ pub enum Base64ProcessorError {
     EnhancedSecurityValidationFailed(#[from] ContentSecurityError),
     #[error("Content validation failed: {details}")]
     ContentValidationFailed { details: String },
+    #[error("MIME type validation failed: {0}")]
+    MimeTypeValidationFailed(#[from] MimeTypeValidationError),
 }
 
 #[derive(Clone)]
 pub struct Base64Processor {
     max_size: usize,
-    allowed_image_mime_types: HashSet<String>,
-    allowed_audio_mime_types: HashSet<String>,
     allowed_blob_mime_types: HashSet<String>,
     processing_timeout: Duration,
     max_memory_usage: usize,
@@ -44,26 +45,24 @@ pub struct Base64Processor {
     enable_security_validation: bool,
     supported_capabilities: HashSet<String>,
     content_security_validator: Option<ContentSecurityValidator>,
+    mime_type_validator: MimeTypeValidator,
 }
 
 impl Default for Base64Processor {
     fn default() -> Self {
-        let mut allowed_image_mime_types = HashSet::new();
-        allowed_image_mime_types.insert("image/png".to_string());
-        allowed_image_mime_types.insert("image/jpeg".to_string());
-        allowed_image_mime_types.insert("image/gif".to_string());
-        allowed_image_mime_types.insert("image/webp".to_string());
-
-        let mut allowed_audio_mime_types = HashSet::new();
-        allowed_audio_mime_types.insert("audio/wav".to_string());
-        allowed_audio_mime_types.insert("audio/mp3".to_string());
-        allowed_audio_mime_types.insert("audio/mpeg".to_string());
-        allowed_audio_mime_types.insert("audio/ogg".to_string());
-        allowed_audio_mime_types.insert("audio/aac".to_string());
-
         let mut allowed_blob_mime_types = HashSet::new();
-        allowed_blob_mime_types.extend(allowed_image_mime_types.iter().cloned());
-        allowed_blob_mime_types.extend(allowed_audio_mime_types.iter().cloned());
+        // Image types
+        allowed_blob_mime_types.insert("image/png".to_string());
+        allowed_blob_mime_types.insert("image/jpeg".to_string());
+        allowed_blob_mime_types.insert("image/gif".to_string());
+        allowed_blob_mime_types.insert("image/webp".to_string());
+        // Audio types
+        allowed_blob_mime_types.insert("audio/wav".to_string());
+        allowed_blob_mime_types.insert("audio/mp3".to_string());
+        allowed_blob_mime_types.insert("audio/mpeg".to_string());
+        allowed_blob_mime_types.insert("audio/ogg".to_string());
+        allowed_blob_mime_types.insert("audio/aac".to_string());
+        // Other types
         allowed_blob_mime_types.insert("application/pdf".to_string());
         allowed_blob_mime_types.insert("text/plain".to_string());
 
@@ -74,8 +73,6 @@ impl Default for Base64Processor {
 
         Self {
             max_size: 10 * 1024 * 1024, // 10MB default limit
-            allowed_image_mime_types,
-            allowed_audio_mime_types,
             allowed_blob_mime_types,
             processing_timeout: Duration::from_secs(30),
             max_memory_usage: 50 * 1024 * 1024, // 50MB memory limit
@@ -83,6 +80,7 @@ impl Default for Base64Processor {
             enable_security_validation: true,
             supported_capabilities,
             content_security_validator: None, // Default to no enhanced security validation
+            mime_type_validator: MimeTypeValidator::moderate(),
         }
     }
 }
@@ -111,6 +109,7 @@ impl Base64Processor {
             enable_security_validation,
             supported_capabilities,
             content_security_validator: None,
+            mime_type_validator: MimeTypeValidator::moderate(),
             ..Default::default()
         }
     }
@@ -122,6 +121,7 @@ impl Base64Processor {
         Self {
             max_size,
             content_security_validator: Some(content_security_validator),
+            mime_type_validator: MimeTypeValidator::moderate(),
             ..Default::default()
         }
     }
@@ -143,6 +143,7 @@ impl Base64Processor {
             enable_security_validation,
             supported_capabilities,
             content_security_validator: Some(content_security_validator),
+            mime_type_validator: MimeTypeValidator::moderate(),
             ..Default::default()
         }
     }
@@ -243,8 +244,7 @@ impl Base64Processor {
                 .map_err(|_e| Base64ProcessorError::SecurityValidationFailed)?;
         }
 
-        // Validate MIME type and base64 format
-        self.validate_mime_type(mime_type, &self.allowed_image_mime_types)?;
+        // Validate base64 format and size limits
         self.validate_base64_format(data)?;
         self.check_size_limits(data)?;
 
@@ -255,8 +255,9 @@ impl Base64Processor {
                 .map_err(|e| Base64ProcessorError::InvalidBase64(e.to_string()))
         })??;
 
-        // Perform format validation with timeout
-        self.with_timeout(|| self.validate_image_format(&decoded, mime_type))??;
+        // Use centralized MIME type validator with format validation
+        self.mime_type_validator
+            .validate_image_mime_type(mime_type, Some(&decoded))?;
 
         // Security validation
         self.perform_security_validation(&decoded)?;
@@ -279,8 +280,7 @@ impl Base64Processor {
                 .map_err(|_e| Base64ProcessorError::SecurityValidationFailed)?;
         }
 
-        // Validate MIME type and base64 format
-        self.validate_mime_type(mime_type, &self.allowed_audio_mime_types)?;
+        // Validate base64 format and size limits
         self.validate_base64_format(data)?;
         self.check_size_limits(data)?;
 
@@ -291,8 +291,9 @@ impl Base64Processor {
                 .map_err(|e| Base64ProcessorError::InvalidBase64(e.to_string()))
         })??;
 
-        // Perform format validation with timeout
-        self.with_timeout(|| self.validate_audio_format(&decoded, mime_type))??;
+        // Use centralized MIME type validator with format validation
+        self.mime_type_validator
+            .validate_audio_mime_type(mime_type, Some(&decoded))?;
 
         // Security validation
         self.perform_security_validation(&decoded)?;
@@ -393,127 +394,6 @@ impl Base64Processor {
         }
         Ok(())
     }
-
-    fn validate_image_format(
-        &self,
-        data: &[u8],
-        mime_type: &str,
-    ) -> Result<(), Base64ProcessorError> {
-        // Check minimum length based on format requirements
-        let min_length = match mime_type {
-            "image/jpeg" => 2,
-            "image/gif" => 6,
-            "image/png" => 8,
-            "image/webp" => 12,
-            _ => 8,
-        };
-
-        if data.len() < min_length {
-            return Err(Base64ProcessorError::FormatMismatch {
-                expected: mime_type.to_string(),
-                actual: "insufficient data".to_string(),
-            });
-        }
-
-        match mime_type {
-            "image/png" => {
-                if &data[0..8] != b"\x89PNG\r\n\x1a\n" {
-                    return Err(Base64ProcessorError::FormatMismatch {
-                        expected: "PNG".to_string(),
-                        actual: "unknown".to_string(),
-                    });
-                }
-            }
-            "image/jpeg" => {
-                if &data[0..2] != b"\xFF\xD8" {
-                    return Err(Base64ProcessorError::FormatMismatch {
-                        expected: "JPEG".to_string(),
-                        actual: "unknown".to_string(),
-                    });
-                }
-            }
-            "image/gif" => {
-                if data.len() < 6 || (&data[0..6] != b"GIF87a" && &data[0..6] != b"GIF89a") {
-                    return Err(Base64ProcessorError::FormatMismatch {
-                        expected: "GIF".to_string(),
-                        actual: "unknown".to_string(),
-                    });
-                }
-            }
-            "image/webp" => {
-                if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WEBP" {
-                    return Err(Base64ProcessorError::FormatMismatch {
-                        expected: "WebP".to_string(),
-                        actual: "unknown".to_string(),
-                    });
-                }
-            }
-            _ => {
-                return Err(Base64ProcessorError::UnsupportedImageFormat(
-                    mime_type.to_string(),
-                ));
-            }
-        }
-
-        Ok(())
-    }
-
-    fn validate_audio_format(
-        &self,
-        data: &[u8],
-        mime_type: &str,
-    ) -> Result<(), Base64ProcessorError> {
-        if data.len() < 12 {
-            return Err(Base64ProcessorError::FormatMismatch {
-                expected: mime_type.to_string(),
-                actual: "insufficient data".to_string(),
-            });
-        }
-
-        match mime_type {
-            "audio/wav" => {
-                if &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
-                    return Err(Base64ProcessorError::FormatMismatch {
-                        expected: "WAV".to_string(),
-                        actual: "unknown".to_string(),
-                    });
-                }
-            }
-            "audio/mp3" | "audio/mpeg" => {
-                // Check for MPEG frame sync bits
-                if data.len() < 4 || (data[0] != 0xFF || (data[1] & 0xE0) != 0xE0) {
-                    return Err(Base64ProcessorError::FormatMismatch {
-                        expected: "MP3".to_string(),
-                        actual: "unknown".to_string(),
-                    });
-                }
-            }
-            "audio/ogg" => {
-                if data.len() < 4 || &data[0..4] != b"OggS" {
-                    return Err(Base64ProcessorError::FormatMismatch {
-                        expected: "OGG".to_string(),
-                        actual: "unknown".to_string(),
-                    });
-                }
-            }
-            "audio/aac" => {
-                // AAC ADTS sync word
-                if data.len() < 7 || data[0] != 0xFF || (data[1] & 0xF0) != 0xF0 {
-                    return Err(Base64ProcessorError::FormatMismatch {
-                        expected: "AAC".to_string(),
-                        actual: "unknown".to_string(),
-                    });
-                }
-            }
-            _ => {
-                return Err(Base64ProcessorError::UnsupportedAudioFormat(
-                    mime_type.to_string(),
-                ));
-            }
-        }
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -551,36 +431,36 @@ mod tests {
 
     #[test]
     fn test_validate_png_format() {
-        let processor = Base64Processor::default();
+        let validator = MimeTypeValidator::default();
 
         // Valid PNG header
         let png_header = b"\x89PNG\r\n\x1a\n";
-        assert!(processor
-            .validate_image_format(png_header, "image/png")
+        assert!(validator
+            .validate_image_mime_type("image/png", Some(png_header))
             .is_ok());
 
         // Invalid PNG header
         let invalid_header = b"NOTPNG\x00\x00";
-        assert!(processor
-            .validate_image_format(invalid_header, "image/png")
+        assert!(validator
+            .validate_image_mime_type("image/png", Some(invalid_header))
             .is_err());
     }
 
     #[test]
     fn test_validate_jpeg_format() {
-        let processor = Base64Processor::default();
+        let validator = MimeTypeValidator::default();
 
         // Valid JPEG header (SOI marker)
         let jpeg_header = b"\xFF\xD8\xFF\xE0";
 
-        let result = processor.validate_image_format(jpeg_header, "image/jpeg");
+        let result = validator.validate_image_mime_type("image/jpeg", Some(jpeg_header));
         if let Err(e) = result {
             panic!("JPEG validation should have succeeded but got error: {}", e);
         }
 
         // Invalid JPEG header
         let invalid_header = b"NOTJPEG\x00";
-        let result2 = processor.validate_image_format(invalid_header, "image/jpeg");
+        let result2 = validator.validate_image_mime_type("image/jpeg", Some(invalid_header));
         if result2.is_ok() {
             panic!("Invalid JPEG header should have been rejected");
         }
@@ -605,14 +485,14 @@ mod tests {
     fn test_mime_type_validation() {
         let processor = Base64Processor::default();
 
-        // Test allowed image MIME type
+        // Test allowed blob MIME type (image)
         assert!(processor
-            .validate_mime_type("image/png", &processor.allowed_image_mime_types)
+            .validate_mime_type("image/png", &processor.allowed_blob_mime_types)
             .is_ok());
 
         // Test disallowed MIME type
         assert!(processor
-            .validate_mime_type("image/bmp", &processor.allowed_image_mime_types)
+            .validate_mime_type("image/bmp", &processor.allowed_blob_mime_types)
             .is_err());
     }
 }

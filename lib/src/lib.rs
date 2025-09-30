@@ -13,6 +13,7 @@ pub mod config;
 pub mod content_block_processor;
 pub mod content_capability_validator;
 pub mod content_security_validator;
+pub mod mime_type_validator;
 
 #[cfg(test)]
 mod content_security_integration_tests;
