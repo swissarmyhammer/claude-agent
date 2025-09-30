@@ -681,7 +681,9 @@ mod tests {
         let id_str = session_id.to_string();
 
         // Check that it only contains URL-safe characters
-        assert!(id_str.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        assert!(id_str
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_'));
     }
 
     // Session tests

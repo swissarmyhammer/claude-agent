@@ -426,6 +426,7 @@ impl ClaudeAgent {
         let tool_handler = Arc::new(RwLock::new(ToolCallHandler::new_with_mcp_manager(
             config.security.to_tool_permissions(),
             Arc::clone(&mcp_manager),
+            Arc::clone(&session_manager),
         )));
 
         // Get all available tools for capabilities
@@ -3691,7 +3692,8 @@ mod tests {
         assert!(response.meta.is_some());
 
         // Check that mode was set in the session
-        let parsed_session_id = crate::session::SessionId::parse(&session_response.session_id.0).unwrap();
+        let parsed_session_id =
+            crate::session::SessionId::parse(&session_response.session_id.0).unwrap();
         let session = agent
             .session_manager
             .get_session(&parsed_session_id)
@@ -5114,13 +5116,13 @@ mod tests {
                     assert_eq!(acp_plan.entries.len(), 2);
                     assert_eq!(acp_plan.entries[0].content, "Check for syntax errors");
                     assert_eq!(acp_plan.entries[1].content, "Identify potential type issues");
-                    
+
                     // Verify priorities are set correctly
                     let priority_0_json = serde_json::to_value(&acp_plan.entries[0].priority).unwrap();
                     assert_eq!(priority_0_json, "high");
                     let priority_1_json = serde_json::to_value(&acp_plan.entries[1].priority).unwrap();
                     assert_eq!(priority_1_json, "medium");
-                    
+
                     // Verify all entries start as pending
                     let status_0_json = serde_json::to_value(&acp_plan.entries[0].status).unwrap();
                     assert_eq!(status_0_json, "pending");
@@ -5801,7 +5803,8 @@ mod tests {
         use crate::session::Session;
         use std::path::PathBuf;
 
-        let session_id = crate::session::SessionId::parse("sess_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        let session_id =
+            crate::session::SessionId::parse("sess_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
         let cwd = PathBuf::from("/test");
         let mut session = Session::new(session_id, cwd);
 

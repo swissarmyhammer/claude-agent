@@ -22,7 +22,8 @@ mod tests {
             forbidden_paths: vec![],
         };
         
-        let mut handler = ToolCallHandler::new(permissions);
+        let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
+        let mut handler = ToolCallHandler::new(permissions, session_manager);
         let (sender, receiver) = NotificationSender::new(32);
         handler.set_notification_sender(sender);
         
@@ -261,7 +262,8 @@ mod tests {
             forbidden_paths: vec![],
         };
         
-        let handler = ToolCallHandler::new(permissions);
+        let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
+        let handler = ToolCallHandler::new(permissions, session_manager);
         let session_id = SessionId("test_session_no_sender".into());
 
         // Tool call operations should still work without notification sender

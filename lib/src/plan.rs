@@ -9,15 +9,13 @@
 //!
 //! Plans should be realistic, specific, and trackable.
 
+use agent_client_protocol::{
+    Plan as AcpPlan, PlanEntry as AcpPlanEntry, PlanEntryPriority as AcpPriority,
+    PlanEntryStatus as AcpStatus,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use ulid::Ulid;
-use agent_client_protocol::{
-    Plan as AcpPlan,
-    PlanEntry as AcpPlanEntry,
-    PlanEntryPriority as AcpPriority,
-    PlanEntryStatus as AcpStatus,
-};
 
 /// Plan entry status lifecycle according to ACP specification
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -273,11 +271,15 @@ impl AgentPlan {
     /// Convert plan to ACP-compliant format for session/update notifications
     pub fn to_acp_plan(&self) -> AcpPlan {
         AcpPlan {
-            entries: self.entries.iter().map(|entry| entry.to_acp_entry()).collect(),
+            entries: self
+                .entries
+                .iter()
+                .map(|entry| entry.to_acp_entry())
+                .collect(),
             meta: self.metadata.clone(),
         }
     }
-    
+
     /// Deprecated: Use to_acp_plan() instead
     #[deprecated(note = "Use to_acp_plan() to get proper ACP Plan type")]
     pub fn to_acp_format(&self) -> serde_json::Value {
@@ -768,7 +770,9 @@ mod tests {
     #[test]
     fn test_plan_generator_refactor_keyword() {
         let generator = PlanGenerator::new();
-        let plan = generator.generate_plan("refactor the authentication module").unwrap();
+        let plan = generator
+            .generate_plan("refactor the authentication module")
+            .unwrap();
 
         assert!(!plan.entries.is_empty());
         assert!(plan
@@ -783,8 +787,10 @@ mod tests {
         let plan = generator.generate_plan("do something useful").unwrap();
 
         assert!(!plan.entries.is_empty());
-        assert!(plan.entries.iter().any(|entry| entry.content.contains("request")
-            || entry.content.contains("task")));
+        assert!(plan
+            .entries
+            .iter()
+            .any(|entry| entry.content.contains("request") || entry.content.contains("task")));
     }
 
     #[test]

@@ -180,9 +180,11 @@ impl TerminalManager {
             crate::AgentError::Protocol(format!("Invalid session ID format: {}", e))
         })?;
 
-        session_manager.get_session(&parsed_session_id)?.ok_or_else(|| {
-            crate::AgentError::Protocol(format!("Session not found: {}", session_id))
-        })?;
+        session_manager
+            .get_session(&parsed_session_id)?
+            .ok_or_else(|| {
+                crate::AgentError::Protocol(format!("Session not found: {}", session_id))
+            })?;
 
         Ok(())
     }
@@ -210,9 +212,11 @@ impl TerminalManager {
                 crate::AgentError::Protocol(format!("Invalid session ID format: {}", e))
             })?;
 
-            let session = session_manager.get_session(&parsed_session_id)?.ok_or_else(|| {
-                crate::AgentError::Protocol(format!("Session not found: {}", session_id))
-            })?;
+            let session = session_manager
+                .get_session(&parsed_session_id)?
+                .ok_or_else(|| {
+                    crate::AgentError::Protocol(format!("Session not found: {}", session_id))
+                })?;
 
             Ok(session.cwd)
         }
