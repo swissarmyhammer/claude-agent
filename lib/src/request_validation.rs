@@ -521,7 +521,7 @@ mod tests {
 
     fn create_test_load_session_request() -> LoadSessionRequest {
         LoadSessionRequest {
-            session_id: SessionId("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string().into()),
+            session_id: SessionId("sess_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string().into()),
             cwd: std::env::current_dir().unwrap(),
             mcp_servers: vec![],
             meta: None,

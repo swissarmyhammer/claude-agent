@@ -1,14 +1,200 @@
 //! Session management system for tracking conversation contexts and state
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 use ulid::Ulid;
 
-/// Unique identifier for sessions
-pub type SessionId = Ulid;
+/// Session identifier with ACP-compliant format
+///
+/// # Format
+/// `sess_<ULID>`
+///
+/// # Example
+/// `sess_01ARZ3NDEKTSV4RRFFQ69G5FAV`
+///
+/// # ACP Requirements
+/// 1. Unique identifier for conversation context
+/// 2. Must persist across session loads
+/// 3. Used in session/prompt, session/cancel, session/load
+/// 4. Should follow consistent, recognizable format
+/// 5. Must be URL-safe and filesystem-safe
+///
+/// The `sess_` prefix provides human recognition while ULID provides:
+/// - Cryptographic uniqueness
+/// - Sortability by creation time
+/// - URL-safe and filesystem-safe characters
+/// - 128-bit entropy
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionId(Ulid);
+
+impl SessionId {
+    /// Prefix for session IDs
+    pub const PREFIX: &'static str = "sess_";
+
+    /// Create a new session ID with proper format
+    pub fn new() -> Self {
+        Self(Ulid::new())
+    }
+
+    /// Parse a session ID from string
+    ///
+    /// # Format
+    /// Expects format: `sess_<ULID>`
+    ///
+    /// # Errors
+    /// Returns error if:
+    /// - Missing `sess_` prefix
+    /// - Invalid ULID after prefix
+    /// - Empty string
+    pub fn parse(s: &str) -> Result<Self, SessionIdError> {
+        if s.is_empty() {
+            return Err(SessionIdError::Empty);
+        }
+
+        if !s.starts_with(Self::PREFIX) {
+            return Err(SessionIdError::MissingPrefix {
+                provided: s.to_string(),
+                expected_prefix: Self::PREFIX.to_string(),
+            });
+        }
+
+        let ulid_str = &s[Self::PREFIX.len()..];
+        if ulid_str.is_empty() {
+            return Err(SessionIdError::MissingUlid {
+                provided: s.to_string(),
+            });
+        }
+
+        match Ulid::from_string(ulid_str) {
+            Ok(ulid) => Ok(Self(ulid)),
+            Err(e) => Err(SessionIdError::InvalidUlid {
+                provided: ulid_str.to_string(),
+                error: e.to_string(),
+            }),
+        }
+    }
+
+    /// Get the underlying ULID
+    pub fn as_ulid(&self) -> Ulid {
+        self.0
+    }
+
+    /// Get the raw ULID string without the sess_ prefix
+    ///
+    /// This is useful for backward compatibility with internal storage systems
+    /// or when interacting with legacy code that expects raw ULIDs. The ACP
+    /// protocol format (sess_<ULID>) is maintained for external communication,
+    /// while this method allows access to just the ULID portion for internal use.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let session_id = SessionId::parse("sess_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+    /// assert_eq!(session_id.ulid_string(), "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+    /// ```
+    pub fn ulid_string(&self) -> String {
+        self.0.to_string()
+    }
+}
+
+impl Default for SessionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}{}", Self::PREFIX, self.0)
+    }
+}
+
+impl FromStr for SessionId {
+    type Err = SessionIdError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+impl From<Ulid> for SessionId {
+    fn from(ulid: Ulid) -> Self {
+        Self(ulid)
+    }
+}
+
+impl Serialize for SessionId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Errors that can occur when parsing session IDs
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum SessionIdError {
+    /// Session ID is an empty string
+    ///
+    /// This error occurs when attempting to parse an empty string as a session ID.
+    /// Provide a properly formatted session ID with the pattern: sess_<ULID>
+    #[error("Session ID cannot be empty")]
+    Empty,
+
+    /// Session ID is missing the required 'sess_' prefix
+    ///
+    /// This error occurs when the session ID does not start with 'sess_'.
+    /// The ACP protocol requires all session IDs to have a recognizable prefix
+    /// for consistent identification and validation.
+    ///
+    /// # Example
+    /// - Invalid: `01ARZ3NDEKTSV4RRFFQ69G5FAV`
+    /// - Valid: `sess_01ARZ3NDEKTSV4RRFFQ69G5FAV`
+    #[error("Session ID missing required prefix '{expected_prefix}': got '{provided}'")]
+    MissingPrefix {
+        provided: String,
+        expected_prefix: String,
+    },
+
+    /// Session ID has the prefix but no ULID follows
+    ///
+    /// This error occurs when the session ID is exactly 'sess_' with no ULID portion.
+    /// The session ID must include a valid 26-character ULID after the prefix.
+    ///
+    /// # Example
+    /// - Invalid: `sess_`
+    /// - Valid: `sess_01ARZ3NDEKTSV4RRFFQ69G5FAV`
+    #[error("Session ID missing ULID after prefix: got '{provided}'")]
+    MissingUlid { provided: String },
+
+    /// The ULID portion of the session ID is malformed
+    ///
+    /// This error occurs when the characters after 'sess_' do not form a valid ULID.
+    /// ULIDs must be exactly 26 characters using Crockford's Base32 encoding
+    /// (0-9, A-Z excluding I, L, O, U).
+    ///
+    /// # Example
+    /// - Invalid: `sess_INVALID` (too short)
+    /// - Invalid: `sess_01ARZ3NDEKTSV4RRFFQ69G5FAV!!!` (invalid characters)
+    /// - Valid: `sess_01ARZ3NDEKTSV4RRFFQ69G5FAV`
+    #[error("Invalid ULID format in session ID '{provided}': {error}")]
+    InvalidUlid { provided: String, error: String },
+}
 
 /// A conversation session containing context and metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,7 +392,7 @@ impl SessionManager {
             crate::AgentError::Session(format!("Working directory validation failed: {}", e))
         })?;
 
-        let session_id = Ulid::new();
+        let session_id = SessionId::new();
         let session = Session::new(session_id, cwd);
 
         let mut sessions = self
@@ -377,9 +563,131 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    // SessionId tests
+    #[test]
+    fn test_session_id_new() {
+        let id1 = SessionId::new();
+        let id2 = SessionId::new();
+
+        // Should be different
+        assert_ne!(id1, id2);
+
+        // Should have correct format
+        let id_str = id1.to_string();
+        assert!(id_str.starts_with("sess_"));
+        assert_eq!(id_str.len(), 5 + 26); // "sess_" + 26-char ULID
+    }
+
+    #[test]
+    fn test_session_id_parse_valid() {
+        let valid_id = "sess_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let result = SessionId::parse(valid_id);
+        assert!(result.is_ok());
+
+        let session_id = result.unwrap();
+        assert_eq!(session_id.to_string(), valid_id);
+    }
+
+    #[test]
+    fn test_session_id_parse_missing_prefix() {
+        let invalid_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let result = SessionId::parse(invalid_id);
+        assert!(result.is_err());
+
+        match result {
+            Err(SessionIdError::MissingPrefix { .. }) => {}
+            _ => panic!("Expected MissingPrefix error"),
+        }
+    }
+
+    #[test]
+    fn test_session_id_parse_invalid_ulid() {
+        let invalid_id = "sess_invalid-ulid-format";
+        let result = SessionId::parse(invalid_id);
+        assert!(result.is_err());
+
+        match result {
+            Err(SessionIdError::InvalidUlid { .. }) => {}
+            _ => panic!("Expected InvalidUlid error"),
+        }
+    }
+
+    #[test]
+    fn test_session_id_parse_empty() {
+        let result = SessionId::parse("");
+        assert!(result.is_err());
+
+        match result {
+            Err(SessionIdError::Empty) => {}
+            _ => panic!("Expected Empty error"),
+        }
+    }
+
+    #[test]
+    fn test_session_id_parse_missing_ulid() {
+        let invalid_id = "sess_";
+        let result = SessionId::parse(invalid_id);
+        assert!(result.is_err());
+
+        match result {
+            Err(SessionIdError::MissingUlid { .. }) => {}
+            _ => panic!("Expected MissingUlid error"),
+        }
+    }
+
+    #[test]
+    fn test_session_id_serialization() {
+        let session_id = SessionId::new();
+        let serialized = serde_json::to_string(&session_id).unwrap();
+
+        // Should serialize as a string with sess_ prefix
+        assert!(serialized.contains("sess_"));
+
+        // Should be able to deserialize back
+        let deserialized: SessionId = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(session_id, deserialized);
+    }
+
+    #[test]
+    fn test_session_id_from_ulid() {
+        let ulid = Ulid::new();
+        let session_id = SessionId::from(ulid);
+
+        assert_eq!(session_id.as_ulid(), ulid);
+        assert!(session_id.to_string().starts_with("sess_"));
+    }
+
+    #[test]
+    fn test_session_id_display() {
+        let ulid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        let session_id = SessionId::from(ulid);
+
+        assert_eq!(session_id.to_string(), "sess_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+    }
+
+    #[test]
+    fn test_session_id_from_str() {
+        use std::str::FromStr;
+
+        let valid_id = "sess_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let session_id = SessionId::from_str(valid_id).unwrap();
+
+        assert_eq!(session_id.to_string(), valid_id);
+    }
+
+    #[test]
+    fn test_session_id_url_safe() {
+        let session_id = SessionId::new();
+        let id_str = session_id.to_string();
+
+        // Check that it only contains URL-safe characters
+        assert!(id_str.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+    }
+
+    // Session tests
     #[test]
     fn test_session_creation() {
-        let session_id = Ulid::new();
+        let session_id = SessionId::new();
         let cwd = std::env::current_dir().unwrap();
         let session = Session::new(session_id, cwd.clone());
 
@@ -400,7 +708,7 @@ mod tests {
 
     #[test]
     fn test_session_add_message() {
-        let session_id = Ulid::new();
+        let session_id = SessionId::new();
         let cwd = std::env::current_dir().unwrap();
         let mut session = Session::new(session_id, cwd);
         let initial_time = session.last_accessed;
@@ -449,7 +757,7 @@ mod tests {
     #[test]
     fn test_get_nonexistent_session() {
         let manager = SessionManager::new();
-        let nonexistent_id = Ulid::new();
+        let nonexistent_id = SessionId::new();
 
         let session = manager.get_session(&nonexistent_id).unwrap();
         assert!(session.is_none());
@@ -477,7 +785,7 @@ mod tests {
     #[test]
     fn test_update_nonexistent_session() {
         let manager = SessionManager::new();
-        let nonexistent_id = Ulid::new();
+        let nonexistent_id = SessionId::new();
 
         // Should not panic when trying to update a non-existent session
         let result = manager.update_session(&nonexistent_id, |session| {
@@ -508,7 +816,7 @@ mod tests {
     #[test]
     fn test_remove_nonexistent_session() {
         let manager = SessionManager::new();
-        let nonexistent_id = Ulid::new();
+        let nonexistent_id = SessionId::new();
 
         let removed = manager.remove_session(&nonexistent_id).unwrap();
         assert!(removed.is_none());
@@ -585,7 +893,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Session working directory must be absolute path")]
     fn test_session_creation_with_relative_path_panics() {
-        let session_id = Ulid::new();
+        let session_id = SessionId::new();
         let relative_path = PathBuf::from("./relative/path");
         let _session = Session::new(session_id, relative_path);
     }
@@ -671,7 +979,7 @@ mod tests {
 
     #[test]
     fn test_session_serialization_includes_working_directory() {
-        let session_id = Ulid::new();
+        let session_id = SessionId::new();
         let cwd = std::env::current_dir().unwrap();
         let session = Session::new(session_id, cwd.clone());
 
@@ -734,7 +1042,7 @@ mod tests {
 
     #[test]
     fn test_session_has_available_commands_field() {
-        let session_id = Ulid::new();
+        let session_id = SessionId::new();
         let cwd = std::env::current_dir().unwrap();
         let session = Session::new(session_id, cwd);
 
@@ -744,7 +1052,7 @@ mod tests {
 
     #[test]
     fn test_session_update_available_commands() {
-        let session_id = Ulid::new();
+        let session_id = SessionId::new();
         let cwd = std::env::current_dir().unwrap();
         let mut session = Session::new(session_id, cwd);
 
@@ -771,7 +1079,7 @@ mod tests {
 
     #[test]
     fn test_session_detect_available_commands_changes() {
-        let session_id = Ulid::new();
+        let session_id = SessionId::new();
         let cwd = std::env::current_dir().unwrap();
         let mut session = Session::new(session_id, cwd);
 

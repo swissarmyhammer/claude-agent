@@ -176,11 +176,11 @@ impl TerminalManager {
         session_manager: &crate::session::SessionManager,
         session_id: &str,
     ) -> crate::Result<()> {
-        let session_ulid = session_id.parse::<ulid::Ulid>().map_err(|_| {
-            crate::AgentError::Protocol(format!("Invalid session ID format: {}", session_id))
+        let parsed_session_id = crate::session::SessionId::parse(session_id).map_err(|e| {
+            crate::AgentError::Protocol(format!("Invalid session ID format: {}", e))
         })?;
 
-        session_manager.get_session(&session_ulid)?.ok_or_else(|| {
+        session_manager.get_session(&parsed_session_id)?.ok_or_else(|| {
             crate::AgentError::Protocol(format!("Session not found: {}", session_id))
         })?;
 
@@ -206,11 +206,11 @@ impl TerminalManager {
             Ok(path)
         } else {
             // Use session's working directory
-            let session_ulid = session_id.parse::<ulid::Ulid>().map_err(|_| {
-                crate::AgentError::Protocol(format!("Invalid session ID format: {}", session_id))
+            let parsed_session_id = crate::session::SessionId::parse(session_id).map_err(|e| {
+                crate::AgentError::Protocol(format!("Invalid session ID format: {}", e))
             })?;
 
-            let session = session_manager.get_session(&session_ulid)?.ok_or_else(|| {
+            let session = session_manager.get_session(&parsed_session_id)?.ok_or_else(|| {
                 crate::AgentError::Protocol(format!("Session not found: {}", session_id))
             })?;
 

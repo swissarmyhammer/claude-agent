@@ -497,7 +497,7 @@ mod tests {
     use std::time::Duration;
 
     fn create_test_session() -> Session {
-        let session_id = ulid::Ulid::new();
+        let session_id = crate::session::SessionId::new();
         let cwd = std::env::current_dir().unwrap();
         let mut session = Session::new(session_id, cwd);
 
@@ -532,7 +532,7 @@ mod tests {
 
     #[test]
     fn test_validate_session_integrity_future_timestamp() {
-        let session_id = ulid::Ulid::new();
+        let session_id = crate::session::SessionId::new();
         let cwd = std::env::current_dir().unwrap();
         let mut session = Session::new(session_id, cwd);
 
@@ -574,8 +574,8 @@ mod tests {
 
     #[test]
     fn test_validate_session_id_valid() {
-        let valid_ulid = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
-        let result = validate_session_id(valid_ulid);
+        let valid_id = "sess_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let result = validate_session_id(valid_id);
         assert!(result.is_ok());
     }
 

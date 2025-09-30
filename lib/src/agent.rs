@@ -1050,11 +1050,9 @@ impl ClaudeAgent {
     fn parse_session_id(
         &self,
         session_id: &SessionId,
-    ) -> Result<ulid::Ulid, agent_client_protocol::Error> {
-        session_id
-            .0
-            .as_ref()
-            .parse::<ulid::Ulid>()
+    ) -> Result<crate::session::SessionId, agent_client_protocol::Error> {
+        // Parse session ID from ACP format (sess_<ULID>) to internal SessionId type
+        crate::session::SessionId::parse(session_id.0.as_ref())
             .map_err(|_| agent_client_protocol::Error::invalid_params())
     }
 
@@ -1131,7 +1129,7 @@ impl ClaudeAgent {
     /// Handle streaming prompt request
     async fn handle_streaming_prompt(
         &self,
-        session_id: &ulid::Ulid,
+        session_id: &crate::session::SessionId,
         request: &PromptRequest,
         session: &crate::session::Session,
     ) -> Result<PromptResponse, agent_client_protocol::Error> {
@@ -1328,7 +1326,7 @@ impl ClaudeAgent {
     /// Handle non-streaming prompt request
     async fn handle_non_streaming_prompt(
         &self,
-        session_id: &ulid::Ulid,
+        session_id: &crate::session::SessionId,
         request: &PromptRequest,
         session: &crate::session::Session,
     ) -> Result<PromptResponse, agent_client_protocol::Error> {
@@ -1826,14 +1824,14 @@ impl ClaudeAgent {
         session_id: &SessionId,
         commands: Vec<agent_client_protocol::AvailableCommand>,
     ) -> crate::Result<bool> {
-        // Convert SessionId to internal Ulid format
-        let session_ulid = ulid::Ulid::from_string(&session_id.0)
-            .map_err(|_| crate::AgentError::Session("Invalid session ID format".to_string()))?;
+        // Parse SessionId from ACP format (sess_<ULID>)
+        let parsed_session_id = crate::session::SessionId::parse(&session_id.0)
+            .map_err(|e| crate::AgentError::Session(format!("Invalid session ID format: {}", e)))?;
 
         // Update commands in session manager
         let commands_changed = self
             .session_manager
-            .update_available_commands(&session_ulid, commands.clone())?;
+            .update_available_commands(&parsed_session_id, commands.clone())?;
 
         // Send notification if commands changed
         if commands_changed {
@@ -2353,7 +2351,7 @@ impl Agent for ClaudeAgent {
     ) -> Result<SetSessionModeResponse, agent_client_protocol::Error> {
         self.log_request("set_session_mode", &request);
 
-        let session_id_ulid = match ulid::Ulid::from_string(&request.session_id.0) {
+        let parsed_session_id = match crate::session::SessionId::parse(&request.session_id.0) {
             Ok(id) => id,
             Err(_) => {
                 return Err(agent_client_protocol::Error::invalid_request());
@@ -2365,7 +2363,7 @@ impl Agent for ClaudeAgent {
         // Get the current mode to check if it will change
         let current_mode = self
             .session_manager
-            .get_session(&session_id_ulid)
+            .get_session(&parsed_session_id)
             .map_err(|_| agent_client_protocol::Error::internal_error())?
             .map(|session| session.current_mode.clone())
             .unwrap_or(None);
@@ -2374,7 +2372,7 @@ impl Agent for ClaudeAgent {
 
         // Update session with new mode
         self.session_manager
-            .update_session(&session_id_ulid, |session| {
+            .update_session(&parsed_session_id, |session| {
                 session.current_mode = Some(mode_id_string.clone());
             })
             .map_err(|_| agent_client_protocol::Error::internal_error())?;
@@ -3693,10 +3691,10 @@ mod tests {
         assert!(response.meta.is_some());
 
         // Check that mode was set in the session
-        let session_id_ulid = ulid::Ulid::from_string(&session_response.session_id.0).unwrap();
+        let parsed_session_id = crate::session::SessionId::parse(&session_response.session_id.0).unwrap();
         let session = agent
             .session_manager
-            .get_session(&session_id_ulid)
+            .get_session(&parsed_session_id)
             .unwrap()
             .unwrap();
         assert_eq!(session.current_mode, Some("interactive".to_string()));
@@ -5042,10 +5040,10 @@ mod tests {
             content: "implement authentication system".to_string(),
             timestamp: std::time::SystemTime::now(),
         };
-        let session_id_ulid = ulid::Ulid::new();
+        let parsed_session_id = crate::session::SessionId::new();
         agent
             .session_manager
-            .update_session(&session_id_ulid, |session| {
+            .update_session(&parsed_session_id, |session| {
                 session.add_message(message);
             })
             .unwrap();
@@ -5800,10 +5798,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_token_estimation_accuracy() {
-        use crate::session::{Session, SessionId};
+        use crate::session::Session;
         use std::path::PathBuf;
 
-        let session_id = SessionId::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        let session_id = crate::session::SessionId::parse("sess_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
         let cwd = PathBuf::from("/test");
         let mut session = Session::new(session_id, cwd);
 

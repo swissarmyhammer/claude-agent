@@ -136,14 +136,21 @@ fn find_invalid_path_characters(path_str: &str) -> Vec<String> {
 }
 
 /// Validate session ID format according to ACP requirements
-pub fn validate_session_id(session_id: &str) -> SessionSetupResult<ulid::Ulid> {
-    // ACP requires ULID format for session IDs
-    match ulid::Ulid::from_string(session_id) {
+///
+/// Validates that the session ID follows the required format: `sess_<ULID>`
+///
+/// # Examples
+/// Valid: `sess_01ARZ3NDEKTSV4RRFFQ69G5FAV`
+/// Invalid: `01ARZ3NDEKTSV4RRFFQ69G5FAV` (missing prefix)
+/// Invalid: `session_123` (invalid format)
+pub fn validate_session_id(session_id: &str) -> SessionSetupResult<crate::session::SessionId> {
+    // ACP requires consistent session ID format with recognizable prefix
+    match crate::session::SessionId::parse(session_id) {
         Ok(id) => Ok(id),
         Err(_) => Err(SessionSetupError::InvalidSessionId {
             provided_id: session_id.to_string(),
-            expected_format: "ULID format (26 characters, base32 encoded)".to_string(),
-            example: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+            expected_format: "sess_<ULID> format (sess_ prefix + 26-character ULID)".to_string(),
+            example: "sess_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
         }),
     }
 }
@@ -286,14 +293,40 @@ mod tests {
 
     #[test]
     fn test_validate_session_id_valid() {
-        let valid_ulid = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
-        let result = validate_session_id(valid_ulid);
+        let valid_id = "sess_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let result = validate_session_id(valid_id);
         assert!(result.is_ok());
     }
 
     #[test]
-    fn test_validate_session_id_invalid() {
-        let invalid_id = "invalid-session-id";
+    fn test_validate_session_id_missing_prefix() {
+        let invalid_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let result = validate_session_id(invalid_id);
+
+        assert!(result.is_err());
+        if let Err(SessionSetupError::InvalidSessionId { .. }) = result {
+            // Expected error type
+        } else {
+            panic!("Expected InvalidSessionId error");
+        }
+    }
+
+    #[test]
+    fn test_validate_session_id_invalid_ulid() {
+        let invalid_id = "sess_invalid-session-id";
+        let result = validate_session_id(invalid_id);
+
+        assert!(result.is_err());
+        if let Err(SessionSetupError::InvalidSessionId { .. }) = result {
+            // Expected error type
+        } else {
+            panic!("Expected InvalidSessionId error");
+        }
+    }
+
+    #[test]
+    fn test_validate_session_id_empty() {
+        let invalid_id = "";
         let result = validate_session_id(invalid_id);
 
         assert!(result.is_err());
