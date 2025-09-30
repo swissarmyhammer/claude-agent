@@ -210,3 +210,78 @@ impl ToolKindClassifier {
 - Complete test coverage for all tool kind scenarios
 - Performance optimization for classification overhead
 - Integration with existing tool execution and reporting systems
+
+## Analysis
+
+The ToolKind classification system is **already implemented** in the codebase with most requirements met:
+
+### Already Implemented ✅
+1. **Complete ToolKind enum** (lib/src/tool_types.rs:14-34) - All 9 ACP-specified variants
+2. **Automatic classification** (lib/src/tool_classification.rs:10-83) - Based on tool names
+3. **ACP integration** (lib/src/tool_types.rs:352-367) - Conversion to agent_client_protocol::ToolKind
+4. **Used in tool reporting** (lib/src/tools.rs:296) - ToolKind assigned during tool call creation
+5. **File location extraction** - Already tracking file paths for follow-along features
+6. **Comprehensive tests** - Basic classification tests exist for all major kinds
+
+### Missing Implementation ❌
+1. **Think kind classification** - No tools are classified as ToolKind::Think
+2. **Think kind tests** - No tests for the Think classification
+
+## Root Cause
+
+The `ToolKind::Think` variant exists in the enum but is never assigned by `classify_tool()`. The ACP spec states that Think is for "internal reasoning or planning" - but the current classification logic doesn't map any tools to this kind.
+
+## Proposed Solution
+
+### 1. Add Think Kind Classification
+Update `lib/src/tool_classification.rs` to classify thinking/reasoning tools:
+- Add pattern matching for hypothetical planning/reasoning tools
+- Document when Think kind should be used vs Other
+
+### 2. Add Tests for Think Kind
+Add test coverage in `lib/src/tools.rs`:
+- Test Think kind serialization/deserialization
+- Test Think kind conversion to ACP format
+- Document the Think kind usage pattern
+
+### Implementation Approach
+
+The Think kind is designed for internal agent reasoning that isn't a concrete external action. Since this agent doesn't currently have explicit "thinking" or "planning" tool calls (reasoning happens within the agent), we should:
+
+1. Document that Think is reserved for future internal reasoning tools
+2. Add a test showing Think classification works correctly
+3. Ensure Think properly serializes and converts to ACP format
+
+This maintains ACP compliance while acknowledging the current architecture doesn't use explicit reasoning tool calls.
+
+## Implementation Complete ✅
+
+### Changes Made
+
+1. **Added Think Kind Classification** (lib/src/tool_classification.rs:48-55)
+   - Added pattern matching for: `think`, `reason`, `plan`, `analyze_approach`, `generate_strategy`
+   - Documented that Think is for agent internal reasoning
+   - Note that current architecture doesn't use explicit reasoning tool calls, but the kind is available for future features
+
+2. **Comprehensive Test Coverage** (lib/src/tools.rs:3295-3526)
+   - Added tests for all Think kind tool names
+   - Added serialization tests for all 9 ToolKind variants
+   - Added deserialization tests for all 9 ToolKind variants including unknown variant fallback
+   - Added ACP conversion tests for all 9 ToolKind variants
+   - Added lifecycle test ensuring kind is preserved through ToolCallReport creation and ACP conversion
+
+### Test Results
+- All 475 tests pass
+- Cargo fmt: Clean
+- Cargo clippy: No warnings or errors
+
+### Key Implementation Details
+
+The ToolKind classification system is now complete with:
+- All 9 ACP-specified kinds implemented and tested
+- Automatic classification based on tool names
+- Proper serialization to/from snake_case JSON
+- Correct conversion to agent_client_protocol::ToolKind
+- Comprehensive test coverage ensuring all variants work correctly
+
+The Think kind is available for future use when the agent implements explicit reasoning or planning tools, or when MCP servers provide thinking tools.

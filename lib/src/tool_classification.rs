@@ -45,6 +45,15 @@ impl ToolKind {
             // External data fetching
             "fetch" | "http_get" | "download" | "curl" | "wget" => ToolKind::Fetch,
 
+            // Internal reasoning and planning tools
+            // The Think kind is for agent internal reasoning that produces strategic plans,
+            // analyzes approaches, or generates structured thinking before taking action.
+            // Currently no tools in this agent explicitly use this kind, but it's available
+            // for future agent reasoning features or MCP servers that provide thinking tools.
+            "think" | "reason" | "plan" | "analyze_approach" | "generate_strategy" => {
+                ToolKind::Think
+            }
+
             // MCP tools - classify by prefix pattern
             tool if tool.contains("mcp__") => {
                 if tool.contains("read")

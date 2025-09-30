@@ -3292,6 +3292,25 @@ mod tests {
             ToolKind::Fetch
         );
 
+        // Test think operations
+        assert_eq!(
+            ToolKind::classify_tool("think", &json!({})),
+            ToolKind::Think
+        );
+        assert_eq!(
+            ToolKind::classify_tool("reason", &json!({})),
+            ToolKind::Think
+        );
+        assert_eq!(ToolKind::classify_tool("plan", &json!({})), ToolKind::Think);
+        assert_eq!(
+            ToolKind::classify_tool("analyze_approach", &json!({})),
+            ToolKind::Think
+        );
+        assert_eq!(
+            ToolKind::classify_tool("generate_strategy", &json!({})),
+            ToolKind::Think
+        );
+
         // Test default fallback
         assert_eq!(
             ToolKind::classify_tool("unknown_tool", &json!({})),
@@ -3347,6 +3366,151 @@ mod tests {
         // Test snake_case conversion
         let title = ToolCallReport::generate_title("create_backup_file", &json!({}));
         assert_eq!(title, "Create backup file");
+    }
+
+    #[tokio::test]
+    async fn test_tool_kind_serialization() {
+        // Test all ToolKind variants serialize correctly to snake_case
+        assert_eq!(serde_json::to_value(ToolKind::Read).unwrap(), json!("read"));
+        assert_eq!(serde_json::to_value(ToolKind::Edit).unwrap(), json!("edit"));
+        assert_eq!(
+            serde_json::to_value(ToolKind::Delete).unwrap(),
+            json!("delete")
+        );
+        assert_eq!(serde_json::to_value(ToolKind::Move).unwrap(), json!("move"));
+        assert_eq!(
+            serde_json::to_value(ToolKind::Search).unwrap(),
+            json!("search")
+        );
+        assert_eq!(
+            serde_json::to_value(ToolKind::Execute).unwrap(),
+            json!("execute")
+        );
+        assert_eq!(
+            serde_json::to_value(ToolKind::Think).unwrap(),
+            json!("think")
+        );
+        assert_eq!(
+            serde_json::to_value(ToolKind::Fetch).unwrap(),
+            json!("fetch")
+        );
+        assert_eq!(
+            serde_json::to_value(ToolKind::Other).unwrap(),
+            json!("other")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_kind_deserialization() {
+        // Test all ToolKind variants deserialize correctly from snake_case
+        assert_eq!(
+            serde_json::from_value::<ToolKind>(json!("read")).unwrap(),
+            ToolKind::Read
+        );
+        assert_eq!(
+            serde_json::from_value::<ToolKind>(json!("edit")).unwrap(),
+            ToolKind::Edit
+        );
+        assert_eq!(
+            serde_json::from_value::<ToolKind>(json!("delete")).unwrap(),
+            ToolKind::Delete
+        );
+        assert_eq!(
+            serde_json::from_value::<ToolKind>(json!("move")).unwrap(),
+            ToolKind::Move
+        );
+        assert_eq!(
+            serde_json::from_value::<ToolKind>(json!("search")).unwrap(),
+            ToolKind::Search
+        );
+        assert_eq!(
+            serde_json::from_value::<ToolKind>(json!("execute")).unwrap(),
+            ToolKind::Execute
+        );
+        assert_eq!(
+            serde_json::from_value::<ToolKind>(json!("think")).unwrap(),
+            ToolKind::Think
+        );
+        assert_eq!(
+            serde_json::from_value::<ToolKind>(json!("fetch")).unwrap(),
+            ToolKind::Fetch
+        );
+        assert_eq!(
+            serde_json::from_value::<ToolKind>(json!("other")).unwrap(),
+            ToolKind::Other
+        );
+
+        // Test that unknown variants deserialize to Other due to #[serde(other)]
+        assert_eq!(
+            serde_json::from_value::<ToolKind>(json!("unknown_variant")).unwrap(),
+            ToolKind::Other
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_kind_to_acp_conversion() {
+        // Test all ToolKind variants convert correctly to ACP format
+        assert_eq!(
+            ToolKind::Read.to_acp_kind(),
+            agent_client_protocol::ToolKind::Read
+        );
+        assert_eq!(
+            ToolKind::Edit.to_acp_kind(),
+            agent_client_protocol::ToolKind::Edit
+        );
+        assert_eq!(
+            ToolKind::Delete.to_acp_kind(),
+            agent_client_protocol::ToolKind::Delete
+        );
+        assert_eq!(
+            ToolKind::Move.to_acp_kind(),
+            agent_client_protocol::ToolKind::Move
+        );
+        assert_eq!(
+            ToolKind::Search.to_acp_kind(),
+            agent_client_protocol::ToolKind::Search
+        );
+        assert_eq!(
+            ToolKind::Execute.to_acp_kind(),
+            agent_client_protocol::ToolKind::Execute
+        );
+        assert_eq!(
+            ToolKind::Think.to_acp_kind(),
+            agent_client_protocol::ToolKind::Think
+        );
+        assert_eq!(
+            ToolKind::Fetch.to_acp_kind(),
+            agent_client_protocol::ToolKind::Fetch
+        );
+        assert_eq!(
+            ToolKind::Other.to_acp_kind(),
+            agent_client_protocol::ToolKind::Other
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_report_includes_kind() {
+        // Test that ToolCallReport properly includes and maintains kind throughout lifecycle
+        let report = ToolCallReport::new(
+            "call_test123".to_string(),
+            "Test operation".to_string(),
+            ToolKind::Think,
+        );
+
+        assert_eq!(report.kind, ToolKind::Think);
+        assert_eq!(report.tool_call_id, "call_test123");
+        assert_eq!(report.title, "Test operation");
+
+        // Test ACP conversion preserves kind
+        let acp_call = report.to_acp_tool_call();
+        assert_eq!(acp_call.kind, agent_client_protocol::ToolKind::Think);
+
+        // Test ACP update conversion preserves kind
+        let acp_update = report.to_acp_tool_call_update();
+        assert_eq!(
+            acp_update.fields.kind.unwrap(),
+            agent_client_protocol::ToolKind::Think
+        );
     }
 
     #[tokio::test]
