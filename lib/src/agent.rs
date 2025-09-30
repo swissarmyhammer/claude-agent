@@ -1693,54 +1693,26 @@ impl ClaudeAgent {
 
     /// Send plan update notification via session/update for ACP compliance
     ///
-    /// This method sends plan updates using a workaround since SessionUpdate doesn't
-    /// have a direct Plan variant. We use AgentMessageChunk with structured JSON
-    /// content to communicate plan information according to ACP specification.
+    /// Sends plan updates using the proper SessionUpdate::Plan variant
+    /// according to the ACP specification.
     async fn send_plan_update(
         &self,
         session_id: &str,
         plan: &crate::plan::AgentPlan,
     ) -> crate::Result<()> {
-        // Create ACP-compliant plan update content
-        let plan_content = serde_json::json!({
-            "sessionUpdate": "plan",
-            "planId": plan.id,
-            "entries": plan.entries.iter().map(|entry| {
-                serde_json::json!({
-                    "id": entry.id,
-                    "content": entry.content,
-                    "priority": entry.priority,
-                    "status": entry.status
-                })
-            }).collect::<Vec<_>>(),
-            "metadata": {
-                "totalEntries": plan.entries.len(),
-                "completionPercentage": plan.completion_percentage(),
-                "isComplete": plan.is_complete()
-            }
-        });
+        // Convert internal plan to ACP plan format
+        let acp_plan = plan.to_acp_plan();
 
-        // Send as structured agent message chunk with plan metadata
+        // Send proper plan update notification
         let notification = SessionNotification {
             session_id: SessionId(session_id.to_string().into()),
-            update: SessionUpdate::AgentMessageChunk {
-                content: ContentBlock::Text(TextContent {
-                    text: format!(
-                        "🤖 Agent Plan Update\n```json\n{}\n```",
-                        serde_json::to_string_pretty(&plan_content)?
-                    ),
-                    annotations: None,
-                    meta: Some(serde_json::json!({
-                        "type": "plan_update",
-                        "planId": plan.id,
-                        "planData": plan_content
-                    })),
-                }),
-            },
+            update: SessionUpdate::Plan(acp_plan),
             meta: Some(serde_json::json!({
-                "update_type": "plan",
                 "plan_id": plan.id,
                 "session_id": session_id,
+                "total_entries": plan.entries.len(),
+                "completion_percentage": plan.completion_percentage(),
+                "is_complete": plan.is_complete(),
                 "timestamp": std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -5088,28 +5060,34 @@ mod tests {
                 // Verify session ID
                 assert_eq!(notification.session_id.0.as_ref(), session_id);
 
-                // Verify it's an agent message chunk
-                if let SessionUpdate::AgentMessageChunk { content: ContentBlock::Text(text_content) } = notification.update {
-                        // Verify plan update format
-                        assert!(text_content.text.contains("Agent Plan Update"));
-                        assert!(text_content.text.contains("sessionUpdate"));
-                        assert!(text_content.text.contains("entries"));
-
-                        // Verify metadata contains plan information
-                        if let Some(meta) = text_content.meta {
-                            assert!(meta.get("type").is_some());
-                            assert!(meta.get("planId").is_some());
-                            assert!(meta.get("planData").is_some());
-                        }
+                // Verify it's a proper Plan update
+                if let SessionUpdate::Plan(acp_plan) = notification.update {
+                    // Verify plan has expected entries
+                    assert_eq!(acp_plan.entries.len(), 2);
+                    assert_eq!(acp_plan.entries[0].content, "Check for syntax errors");
+                    assert_eq!(acp_plan.entries[1].content, "Identify potential type issues");
+                    
+                    // Verify priorities are set correctly
+                    let priority_0_json = serde_json::to_value(&acp_plan.entries[0].priority).unwrap();
+                    assert_eq!(priority_0_json, "high");
+                    let priority_1_json = serde_json::to_value(&acp_plan.entries[1].priority).unwrap();
+                    assert_eq!(priority_1_json, "medium");
+                    
+                    // Verify all entries start as pending
+                    let status_0_json = serde_json::to_value(&acp_plan.entries[0].status).unwrap();
+                    assert_eq!(status_0_json, "pending");
+                    let status_1_json = serde_json::to_value(&acp_plan.entries[1].status).unwrap();
+                    assert_eq!(status_1_json, "pending");
+                } else {
+                    panic!("Expected SessionUpdate::Plan variant, got: {:?}", notification.update);
                 }
 
                 // Verify top-level metadata
-                if let Some(meta) = notification.meta {
-                    assert_eq!(meta.get("update_type").unwrap(), "plan");
-                    assert_eq!(meta.get("session_id").unwrap(), session_id);
-                    assert!(meta.get("plan_id").is_some());
-                    assert!(meta.get("timestamp").is_some());
-                }
+                let meta = notification.meta.expect("notification.meta should be Some");
+                assert_eq!(meta.get("session_id").and_then(|v| v.as_str()), Some(session_id));
+                assert!(meta.get("plan_id").is_some());
+                assert!(meta.get("timestamp").is_some());
+                assert_eq!(meta.get("total_entries").and_then(|v| v.as_u64()), Some(2));
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
                 panic!("Should have received notification within timeout");
@@ -5775,7 +5753,7 @@ mod tests {
         use crate::session::{Session, SessionId};
         use std::path::PathBuf;
 
-        let session_id = SessionId::new();
+        let session_id = SessionId::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
         let cwd = PathBuf::from("/test");
         let mut session = Session::new(session_id, cwd);
 

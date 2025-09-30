@@ -939,7 +939,14 @@ mod tests {
             actual: 2048,
         };
 
-        let json_rpc_error = convert_base64_error_to_acp(error, None);
+        let context = ErrorContext {
+            correlation_id: "test-456".to_string(),
+            processing_stage: "size_check".to_string(),
+            content_type: None,
+            metadata: HashMap::new(),
+        };
+
+        let json_rpc_error = convert_base64_error_to_acp(error, Some(context));
 
         assert_eq!(json_rpc_error.code, -32602);
         assert_eq!(
@@ -951,6 +958,8 @@ mod tests {
             assert_eq!(data["error"], "content_size_exceeded");
             assert_eq!(data["providedSize"], 2048);
             assert_eq!(data["maxSize"], 1024);
+            assert_eq!(data["correlationId"], "test-456");
+            assert_eq!(data["stage"], "size_check");
         } else {
             panic!("Expected error data to be present");
         }

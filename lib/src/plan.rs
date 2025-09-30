@@ -12,6 +12,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use ulid::Ulid;
+use agent_client_protocol::{
+    Plan as AcpPlan,
+    PlanEntry as AcpPlanEntry,
+    PlanEntryPriority as AcpPriority,
+    PlanEntryStatus as AcpStatus,
+};
 
 /// Plan entry status lifecycle according to ACP specification
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -34,6 +40,26 @@ pub enum PlanEntryStatus {
     Cancelled,
 }
 
+impl PlanEntryStatus {
+    /// Convert to ACP status format.
+    ///
+    /// # ACP Compliance Note
+    /// ACP only supports pending, in_progress, and completed states.
+    /// Internal Failed and Cancelled states are mapped to Completed for ACP compliance,
+    /// allowing clients to see these entries in their final state without exposing
+    /// implementation-specific failure modes.
+    pub fn to_acp_status(&self) -> AcpStatus {
+        match self {
+            PlanEntryStatus::Pending => AcpStatus::Pending,
+            PlanEntryStatus::InProgress => AcpStatus::InProgress,
+            PlanEntryStatus::Completed => AcpStatus::Completed,
+            // ACP only supports pending, in_progress, completed
+            // Map failed and cancelled to completed for ACP compliance
+            PlanEntryStatus::Failed | PlanEntryStatus::Cancelled => AcpStatus::Completed,
+        }
+    }
+}
+
 /// Priority levels for plan entries
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
@@ -47,6 +73,20 @@ pub enum Priority {
     /// Low priority - nice to have or cleanup tasks
     #[serde(rename = "low")]
     Low,
+}
+
+impl Priority {
+    /// Convert to ACP priority format.
+    ///
+    /// Maps internal priority levels to ACP protocol priority values
+    /// for client communication.
+    pub fn to_acp_priority(&self) -> AcpPriority {
+        match self {
+            Priority::High => AcpPriority::High,
+            Priority::Medium => AcpPriority::Medium,
+            Priority::Low => AcpPriority::Low,
+        }
+    }
 }
 
 /// Individual plan entry representing a specific action or step
@@ -111,6 +151,27 @@ impl PlanEntry {
     /// Check if this plan entry is currently being executed
     pub fn is_in_progress(&self) -> bool {
         matches!(self.status, PlanEntryStatus::InProgress)
+    }
+
+    /// Convert to ACP plan entry format.
+    ///
+    /// Creates an ACP-compliant plan entry for client communication.
+    /// The meta field is populated when notes are present and includes
+    /// the entry ID and timestamps for client tracking.
+    pub fn to_acp_entry(&self) -> AcpPlanEntry {
+        AcpPlanEntry {
+            content: self.content.clone(),
+            priority: self.priority.to_acp_priority(),
+            status: self.status.to_acp_status(),
+            meta: self.notes.as_ref().map(|notes| {
+                serde_json::json!({
+                    "id": self.id,
+                    "notes": notes,
+                    "created_at": self.created_at,
+                    "updated_at": self.updated_at
+                })
+            }),
+        }
     }
 }
 
@@ -210,6 +271,15 @@ impl AgentPlan {
     }
 
     /// Convert plan to ACP-compliant format for session/update notifications
+    pub fn to_acp_plan(&self) -> AcpPlan {
+        AcpPlan {
+            entries: self.entries.iter().map(|entry| entry.to_acp_entry()).collect(),
+            meta: self.metadata.clone(),
+        }
+    }
+    
+    /// Deprecated: Use to_acp_plan() instead
+    #[deprecated(note = "Use to_acp_plan() to get proper ACP Plan type")]
     pub fn to_acp_format(&self) -> serde_json::Value {
         serde_json::json!({
             "sessionUpdate": "plan",
@@ -533,10 +603,9 @@ mod tests {
         let mut plan = AgentPlan::new();
         plan.add_entry(PlanEntry::new("Test step".to_string(), Priority::High));
 
-        let acp_format = plan.to_acp_format();
-        assert_eq!(acp_format["sessionUpdate"], "plan");
-        assert!(acp_format["entries"].is_array());
-        assert_eq!(acp_format["entries"].as_array().unwrap().len(), 1);
+        let acp_plan = plan.to_acp_plan();
+        assert_eq!(acp_plan.entries.len(), 1);
+        assert_eq!(acp_plan.entries[0].content, "Test step");
     }
 
     #[test]
@@ -550,5 +619,215 @@ mod tests {
 
         manager.remove_plan(&session_id);
         assert!(manager.get_plan(&session_id).is_none());
+    }
+
+    #[test]
+    fn test_priority_to_acp_conversion() {
+        // Test by serializing to JSON and checking the values
+        let high = Priority::High.to_acp_priority();
+        let high_json = serde_json::to_value(&high).unwrap();
+        assert_eq!(high_json, "high");
+
+        let medium = Priority::Medium.to_acp_priority();
+        let medium_json = serde_json::to_value(&medium).unwrap();
+        assert_eq!(medium_json, "medium");
+
+        let low = Priority::Low.to_acp_priority();
+        let low_json = serde_json::to_value(&low).unwrap();
+        assert_eq!(low_json, "low");
+    }
+
+    #[test]
+    fn test_status_to_acp_conversion() {
+        // Test by serializing to JSON and checking the values
+        let pending = PlanEntryStatus::Pending.to_acp_status();
+        let pending_json = serde_json::to_value(&pending).unwrap();
+        assert_eq!(pending_json, "pending");
+
+        let in_progress = PlanEntryStatus::InProgress.to_acp_status();
+        let in_progress_json = serde_json::to_value(&in_progress).unwrap();
+        assert_eq!(in_progress_json, "in_progress");
+
+        let completed = PlanEntryStatus::Completed.to_acp_status();
+        let completed_json = serde_json::to_value(&completed).unwrap();
+        assert_eq!(completed_json, "completed");
+
+        // Failed and Cancelled map to Completed in ACP
+        let failed = PlanEntryStatus::Failed.to_acp_status();
+        let failed_json = serde_json::to_value(&failed).unwrap();
+        assert_eq!(failed_json, "completed");
+
+        let cancelled = PlanEntryStatus::Cancelled.to_acp_status();
+        let cancelled_json = serde_json::to_value(&cancelled).unwrap();
+        assert_eq!(cancelled_json, "completed");
+    }
+
+    #[test]
+    fn test_plan_entry_to_acp_conversion() {
+        let entry = PlanEntry::new("Test task".to_string(), Priority::High);
+        let acp_entry = entry.to_acp_entry();
+
+        assert_eq!(acp_entry.content, "Test task");
+        let priority_json = serde_json::to_value(&acp_entry.priority).unwrap();
+        assert_eq!(priority_json, "high");
+        let status_json = serde_json::to_value(&acp_entry.status).unwrap();
+        assert_eq!(status_json, "pending");
+    }
+
+    #[test]
+    fn test_plan_entry_to_acp_with_notes() {
+        let mut entry = PlanEntry::new("Task with notes".to_string(), Priority::Medium);
+        entry.set_notes("Important context".to_string());
+        let acp_entry = entry.to_acp_entry();
+
+        assert_eq!(acp_entry.content, "Task with notes");
+        assert!(acp_entry.meta.is_some());
+        let meta = acp_entry.meta.unwrap();
+        assert_eq!(meta["notes"], "Important context");
+        assert_eq!(meta["id"], entry.id);
+    }
+
+    #[test]
+    fn test_agent_plan_to_acp_conversion() {
+        let mut plan = AgentPlan::new();
+        plan.add_entry(PlanEntry::new("Step 1".to_string(), Priority::High));
+        plan.add_entry(PlanEntry::new("Step 2".to_string(), Priority::Medium));
+        plan.add_entry(PlanEntry::new("Step 3".to_string(), Priority::Low));
+
+        let acp_plan = plan.to_acp_plan();
+
+        assert_eq!(acp_plan.entries.len(), 3);
+        assert_eq!(acp_plan.entries[0].content, "Step 1");
+        let priority_0_json = serde_json::to_value(&acp_plan.entries[0].priority).unwrap();
+        assert_eq!(priority_0_json, "high");
+        assert_eq!(acp_plan.entries[1].content, "Step 2");
+        let priority_1_json = serde_json::to_value(&acp_plan.entries[1].priority).unwrap();
+        assert_eq!(priority_1_json, "medium");
+        assert_eq!(acp_plan.entries[2].content, "Step 3");
+        let priority_2_json = serde_json::to_value(&acp_plan.entries[2].priority).unwrap();
+        assert_eq!(priority_2_json, "low");
+    }
+
+    #[test]
+    fn test_plan_to_acp_with_metadata() {
+        let mut plan = AgentPlan::new();
+        plan.metadata = Some(serde_json::json!({
+            "generator": "test",
+            "version": "1.0"
+        }));
+        plan.add_entry(PlanEntry::new("Test".to_string(), Priority::High));
+
+        let acp_plan = plan.to_acp_plan();
+
+        assert_eq!(acp_plan.entries.len(), 1);
+        assert!(acp_plan.meta.is_some());
+        let meta = acp_plan.meta.unwrap();
+        assert_eq!(meta["generator"], "test");
+        assert_eq!(meta["version"], "1.0");
+    }
+
+    #[test]
+    fn test_plan_generator_fix_keyword() {
+        let generator = PlanGenerator::new();
+        let plan = generator.generate_plan("fix the memory leak").unwrap();
+
+        assert!(!plan.entries.is_empty());
+        assert!(plan
+            .entries
+            .iter()
+            .any(|entry| entry.priority == Priority::High));
+    }
+
+    #[test]
+    fn test_plan_generator_implement_keyword() {
+        let generator = PlanGenerator::new();
+        let plan = generator
+            .generate_plan("implement new payment system")
+            .unwrap();
+
+        assert!(!plan.entries.is_empty());
+        assert!(plan
+            .entries
+            .iter()
+            .any(|entry| entry.content.contains("requirements")
+                || entry.content.contains("functionality")));
+    }
+
+    #[test]
+    fn test_plan_generator_test_keyword() {
+        let generator = PlanGenerator::new();
+        let plan = generator.generate_plan("test the new feature").unwrap();
+
+        assert!(!plan.entries.is_empty());
+        assert!(plan
+            .entries
+            .iter()
+            .any(|entry| entry.content.contains("test")));
+    }
+
+    #[test]
+    fn test_plan_generator_refactor_keyword() {
+        let generator = PlanGenerator::new();
+        let plan = generator.generate_plan("refactor the authentication module").unwrap();
+
+        assert!(!plan.entries.is_empty());
+        assert!(plan
+            .entries
+            .iter()
+            .any(|entry| entry.content.contains("code") || entry.content.contains("structure")));
+    }
+
+    #[test]
+    fn test_plan_generator_generic_prompt() {
+        let generator = PlanGenerator::new();
+        let plan = generator.generate_plan("do something useful").unwrap();
+
+        assert!(!plan.entries.is_empty());
+        assert!(plan.entries.iter().any(|entry| entry.content.contains("request")
+            || entry.content.contains("task")));
+    }
+
+    #[test]
+    fn test_plan_generator_respects_max_entries() {
+        let config = PlanGeneratorConfig {
+            max_entries: 2,
+            default_priority: Priority::Medium,
+            include_cleanup_tasks: false,
+        };
+        let generator = PlanGenerator::with_config(config);
+        let plan = generator
+            .generate_plan("fix bug, implement feature, test, refactor, document")
+            .unwrap();
+
+        assert!(plan.entries.len() <= 2);
+    }
+
+    #[test]
+    fn test_plan_next_pending_entry() {
+        let mut plan = AgentPlan::new();
+        plan.add_entry(PlanEntry::new("Step 1".to_string(), Priority::Low));
+        plan.add_entry(PlanEntry::new("Step 2".to_string(), Priority::High));
+        plan.add_entry(PlanEntry::new("Step 3".to_string(), Priority::Medium));
+
+        let next = plan.next_pending_entry();
+        assert!(next.is_some());
+        assert_eq!(next.unwrap().content, "Step 2"); // High priority comes first
+    }
+
+    #[test]
+    fn test_plan_count_by_status() {
+        let mut plan = AgentPlan::new();
+        plan.add_entry(PlanEntry::new("Step 1".to_string(), Priority::High));
+        plan.add_entry(PlanEntry::new("Step 2".to_string(), Priority::High));
+        plan.add_entry(PlanEntry::new("Step 3".to_string(), Priority::High));
+
+        assert_eq!(plan.count_by_status(PlanEntryStatus::Pending), 3);
+        assert_eq!(plan.count_by_status(PlanEntryStatus::Completed), 0);
+
+        let entry_id = plan.entries[0].id.clone();
+        plan.update_entry_status(&entry_id, PlanEntryStatus::Completed);
+
+        assert_eq!(plan.count_by_status(PlanEntryStatus::Pending), 2);
+        assert_eq!(plan.count_by_status(PlanEntryStatus::Completed), 1);
     }
 }
