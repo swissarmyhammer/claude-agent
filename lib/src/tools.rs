@@ -216,7 +216,10 @@ pub struct PermissionRequest {
 
 impl ToolCallHandler {
     /// Create a new tool call handler with the given permissions
-    pub fn new(permissions: ToolPermissions, session_manager: Arc<crate::session::SessionManager>) -> Self {
+    pub fn new(
+        permissions: ToolPermissions,
+        session_manager: Arc<crate::session::SessionManager>,
+    ) -> Self {
         Self {
             permissions,
             terminal_manager: Arc::new(TerminalManager::new()),
@@ -424,6 +427,103 @@ impl ToolCallHandler {
         completed_report
     }
 
+    /// Embed a terminal in a tool call report with ACP-compliant session notification
+    ///
+    /// This method adds terminal content to an existing tool call, enabling clients
+    /// to display live terminal output within the tool call UI. According to the ACP
+    /// specification, terminals embedded in tool calls provide real-time execution
+    /// feedback and remain displayable even after the terminal is released.
+    ///
+    /// # ACP Compliance
+    ///
+    /// Terminal embedding follows the ACP specification for rich tool call content:
+    /// - Terminal content includes the terminal ID for client reference
+    /// - Clients display live output as the terminal streams data
+    /// - Terminal output persists in client UI after tool completion
+    /// - Multiple terminals can be embedded in a single tool call if needed
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - The session ID for notification routing
+    /// * `tool_call_id` - The tool call to embed the terminal in
+    /// * `terminal_id` - The ID of the terminal to embed (must be ACP-compliant with `term_` prefix)
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if embedding succeeds, or an error if the tool call is not found
+    pub async fn embed_terminal_in_tool_call(
+        &self,
+        session_id: &agent_client_protocol::SessionId,
+        tool_call_id: &str,
+        terminal_id: String,
+    ) -> crate::Result<()> {
+        let updated = self
+            .update_tool_call_report(session_id, tool_call_id, |report| {
+                report.add_content(crate::tool_types::ToolCallContent::Terminal { terminal_id });
+            })
+            .await;
+
+        if updated.is_some() {
+            Ok(())
+        } else {
+            Err(crate::AgentError::ToolExecution(format!(
+                "Tool call {} not found for terminal embedding",
+                tool_call_id
+            )))
+        }
+    }
+
+    /// Execute a command with terminal embedding in the tool call
+    ///
+    /// This method creates a terminal session, embeds it in the specified tool call,
+    /// and prepares it for command execution. The terminal is immediately visible to
+    /// the client through the tool call content, enabling live output streaming.
+    ///
+    /// # ACP Terminal Embedding Pattern
+    ///
+    /// This method implements the ACP-recommended pattern for terminal-tool call integration:
+    /// 1. Create terminal session with proper environment and working directory
+    /// 2. Embed terminal in tool call content via tool_call_update notification
+    /// 3. Client displays terminal output in real-time as command executes
+    /// 4. Tool call status updated based on command exit code
+    /// 5. Terminal output persists in client UI after completion
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - The session ID for the tool call
+    /// * `tool_call_id` - The tool call that will execute the command
+    /// * `params` - Terminal creation parameters including command, args, env, cwd
+    ///
+    /// # Returns
+    ///
+    /// Returns the terminal ID on success for further operations, or an error if
+    /// terminal creation or embedding fails
+    pub async fn execute_with_embedded_terminal(
+        &self,
+        session_id: &agent_client_protocol::SessionId,
+        tool_call_id: &str,
+        params: TerminalCreateParams,
+    ) -> crate::Result<String> {
+        // Create terminal session with ACP-compliant parameters
+        let terminal_id = self
+            .terminal_manager
+            .create_terminal_with_command(&self.session_manager, params)
+            .await?;
+
+        // Embed terminal in tool call immediately for live output display
+        self.embed_terminal_in_tool_call(session_id, tool_call_id, terminal_id.clone())
+            .await?;
+
+        tracing::info!(
+            tool_call_id = %tool_call_id,
+            terminal_id = %terminal_id,
+            session_id = %session_id.0,
+            "Embedded terminal in tool call for live output streaming"
+        );
+
+        Ok(terminal_id)
+    }
+
     /// Fail and remove a tool call from tracking with ACP-compliant session notification
     pub async fn fail_tool_call_report(
         &self,
@@ -558,6 +658,12 @@ impl ToolCallHandler {
     /// Set the notification sender for session updates
     pub fn set_notification_sender(&mut self, sender: crate::agent::NotificationSender) {
         self.notification_sender = Some(sender);
+    }
+
+    /// Get the session manager reference for testing and internal operations
+    #[cfg(test)]
+    pub fn get_session_manager(&self) -> &Arc<crate::session::SessionManager> {
+        &self.session_manager
     }
 
     /// Track a file operation for a session
@@ -732,7 +838,11 @@ impl ToolCallHandler {
 
 impl ToolCallHandler {
     /// Route and execute a tool request based on its name
-    async fn execute_tool_request(&self, session_id: &agent_client_protocol::SessionId, request: &InternalToolRequest) -> crate::Result<String> {
+    async fn execute_tool_request(
+        &self,
+        session_id: &agent_client_protocol::SessionId,
+        request: &InternalToolRequest,
+    ) -> crate::Result<String> {
         // Check if this is an MCP tool call
         if let Some(server_name) = self.extract_mcp_server_name(&request.name) {
             if let Some(ref mcp_manager) = self.mcp_manager {
@@ -794,7 +904,11 @@ impl ToolCallHandler {
     }
 
     /// Handle file read operations with security validation
-    async fn handle_fs_read(&self, session_id: &agent_client_protocol::SessionId, request: &InternalToolRequest) -> crate::Result<String> {
+    async fn handle_fs_read(
+        &self,
+        session_id: &agent_client_protocol::SessionId,
+        request: &InternalToolRequest,
+    ) -> crate::Result<String> {
         // ACP requires that we only use features the client declared support for.
         // Always check client capabilities before attempting operations.
         // This prevents protocol violations and ensures compatibility.
@@ -808,12 +922,18 @@ impl ToolCallHandler {
         tracing::debug!("Reading file: {}", path_str);
 
         // Validate session exists and get session context
-        let internal_session_id = session_id.0.to_string().parse::<crate::session::SessionId>()
+        let internal_session_id = session_id
+            .0
+            .to_string()
+            .parse::<crate::session::SessionId>()
             .map_err(|e| crate::AgentError::Session(format!("Invalid session ID: {}", e)))?;
-        let session = self.session_manager
+        let session = self
+            .session_manager
             .get_session(&internal_session_id)
             .map_err(|e| crate::AgentError::Session(format!("Failed to get session: {}", e)))?
-            .ok_or_else(|| crate::AgentError::Session(format!("Session not found: {}", session_id.0)))?;
+            .ok_or_else(|| {
+                crate::AgentError::Session(format!("Session not found: {}", session_id.0))
+            })?;
 
         // Validate path security
         self.validate_file_path(path_str)?;
@@ -823,19 +943,20 @@ impl ToolCallHandler {
         let canonical_path = path.canonicalize().map_err(|e| {
             crate::AgentError::ToolExecution(format!("Failed to resolve path {}: {}", path_str, e))
         })?;
-        
+
         let session_cwd = session.cwd.canonicalize().map_err(|e| {
             crate::AgentError::ToolExecution(format!("Failed to resolve session directory: {}", e))
         })?;
 
         if !canonical_path.starts_with(&session_cwd) {
             self.track_file_operation(
-                &session_id.0.to_string(),
+                session_id.0.as_ref(),
                 FileOperationType::Read,
                 &canonical_path,
-                FileOperationResult::Failed(format!("Path outside session boundary")),
-            ).await;
-            
+                FileOperationResult::Failed("Path outside session boundary".to_string()),
+            )
+            .await;
+
             return Err(crate::AgentError::ToolExecution(format!(
                 "Path outside session boundary: {} not within {}",
                 canonical_path.display(),
@@ -845,37 +966,50 @@ impl ToolCallHandler {
 
         // Read file using tokio::fs for async operation
         let read_result = tokio::fs::read_to_string(path_str).await;
-        
+
         match read_result {
             Ok(content) => {
-                tracing::info!("Successfully read {} bytes from {}", content.len(), path_str);
-                
+                tracing::info!(
+                    "Successfully read {} bytes from {}",
+                    content.len(),
+                    path_str
+                );
+
                 // Track successful operation
                 self.track_file_operation(
-                    &session_id.0.to_string(),
+                    session_id.0.as_ref(),
                     FileOperationType::Read,
                     &canonical_path,
                     FileOperationResult::Success,
-                ).await;
+                )
+                .await;
 
                 Ok(content)
             }
             Err(e) => {
                 // Track failed operation
                 self.track_file_operation(
-                    &session_id.0.to_string(),
+                    session_id.0.as_ref(),
                     FileOperationType::Read,
                     &canonical_path,
                     FileOperationResult::Failed(format!("Failed to read file: {}", e)),
-                ).await;
-                
-                Err(crate::AgentError::ToolExecution(format!("Failed to read file {}: {}", path_str, e)))
+                )
+                .await;
+
+                Err(crate::AgentError::ToolExecution(format!(
+                    "Failed to read file {}: {}",
+                    path_str, e
+                )))
             }
         }
     }
 
     /// Handle file write operations with security validation
-    async fn handle_fs_write(&self, session_id: &agent_client_protocol::SessionId, request: &InternalToolRequest) -> crate::Result<String> {
+    async fn handle_fs_write(
+        &self,
+        session_id: &agent_client_protocol::SessionId,
+        request: &InternalToolRequest,
+    ) -> crate::Result<String> {
         // ACP requires that we only use features the client declared support for.
         // Always check client capabilities before attempting operations.
         // This prevents protocol violations and ensures compatibility.
@@ -895,12 +1029,18 @@ impl ToolCallHandler {
         tracing::debug!("Writing to file: {} ({} bytes)", path_str, content.len());
 
         // Validate session exists and get session context
-        let internal_session_id = session_id.0.to_string().parse::<crate::session::SessionId>()
+        let internal_session_id = session_id
+            .0
+            .to_string()
+            .parse::<crate::session::SessionId>()
             .map_err(|e| crate::AgentError::Session(format!("Invalid session ID: {}", e)))?;
-        let session = self.session_manager
+        let session = self
+            .session_manager
             .get_session(&internal_session_id)
             .map_err(|e| crate::AgentError::Session(format!("Failed to get session: {}", e)))?
-            .ok_or_else(|| crate::AgentError::Session(format!("Session not found: {}", session_id.0)))?;
+            .ok_or_else(|| {
+                crate::AgentError::Session(format!("Session not found: {}", session_id.0))
+            })?;
 
         // Validate path security
         self.validate_file_path(path_str)?;
@@ -917,19 +1057,20 @@ impl ToolCallHandler {
         let canonical_path = check_path.canonicalize().map_err(|e| {
             crate::AgentError::ToolExecution(format!("Failed to resolve path {}: {}", path_str, e))
         })?;
-        
+
         let session_cwd = session.cwd.canonicalize().map_err(|e| {
             crate::AgentError::ToolExecution(format!("Failed to resolve session directory: {}", e))
         })?;
 
         if !canonical_path.starts_with(&session_cwd) {
             self.track_file_operation(
-                &session_id.0.to_string(),
+                session_id.0.as_ref(),
                 FileOperationType::Write,
                 &canonical_path,
-                FileOperationResult::Failed(format!("Path outside session boundary")),
-            ).await;
-            
+                FileOperationResult::Failed("Path outside session boundary".to_string()),
+            )
+            .await;
+
             return Err(crate::AgentError::ToolExecution(format!(
                 "Path outside session boundary: {} not within {}",
                 canonical_path.display(),
@@ -951,18 +1092,19 @@ impl ToolCallHandler {
 
         // Write file using tokio::fs for async operation
         let write_result = tokio::fs::write(path_str, content).await;
-        
+
         match write_result {
             Ok(_) => {
                 tracing::info!("Successfully wrote {} bytes to {}", content.len(), path_str);
-                
+
                 // Track successful operation
                 self.track_file_operation(
-                    &session_id.0.to_string(),
+                    session_id.0.as_ref(),
                     FileOperationType::Write,
                     &canonical_path,
                     FileOperationResult::Success,
-                ).await;
+                )
+                .await;
 
                 Ok(format!(
                     "Successfully wrote {} bytes to {}",
@@ -973,31 +1115,45 @@ impl ToolCallHandler {
             Err(e) => {
                 // Track failed operation
                 self.track_file_operation(
-                    &session_id.0.to_string(),
+                    session_id.0.as_ref(),
                     FileOperationType::Write,
                     &canonical_path,
                     FileOperationResult::Failed(format!("Failed to write file: {}", e)),
-                ).await;
-                
-                Err(crate::AgentError::ToolExecution(format!("Failed to write file {}: {}", path_str, e)))
+                )
+                .await;
+
+                Err(crate::AgentError::ToolExecution(format!(
+                    "Failed to write file {}: {}",
+                    path_str, e
+                )))
             }
         }
     }
 
     /// Handle directory listing operations with security validation
-    async fn handle_fs_list(&self, session_id: &agent_client_protocol::SessionId, request: &InternalToolRequest) -> crate::Result<String> {
+    async fn handle_fs_list(
+        &self,
+        session_id: &agent_client_protocol::SessionId,
+        request: &InternalToolRequest,
+    ) -> crate::Result<String> {
         let args = self.parse_tool_args(&request.arguments)?;
         let path_str = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
         tracing::debug!("Listing directory: {}", path_str);
 
         // Validate session exists and get session context
-        let internal_session_id = session_id.0.to_string().parse::<crate::session::SessionId>()
+        let internal_session_id = session_id
+            .0
+            .to_string()
+            .parse::<crate::session::SessionId>()
             .map_err(|e| crate::AgentError::Session(format!("Invalid session ID: {}", e)))?;
-        let session = self.session_manager
+        let session = self
+            .session_manager
             .get_session(&internal_session_id)
             .map_err(|e| crate::AgentError::Session(format!("Failed to get session: {}", e)))?
-            .ok_or_else(|| crate::AgentError::Session(format!("Session not found: {}", session_id.0)))?;
+            .ok_or_else(|| {
+                crate::AgentError::Session(format!("Session not found: {}", session_id.0))
+            })?;
 
         // Validate path security
         self.validate_file_path(path_str)?;
@@ -1007,19 +1163,20 @@ impl ToolCallHandler {
         let canonical_path = path.canonicalize().map_err(|e| {
             crate::AgentError::ToolExecution(format!("Failed to resolve path {}: {}", path_str, e))
         })?;
-        
+
         let session_cwd = session.cwd.canonicalize().map_err(|e| {
             crate::AgentError::ToolExecution(format!("Failed to resolve session directory: {}", e))
         })?;
 
         if !canonical_path.starts_with(&session_cwd) {
             self.track_file_operation(
-                &session_id.0.to_string(),
+                session_id.0.as_ref(),
                 FileOperationType::List,
                 &canonical_path,
-                FileOperationResult::Failed(format!("Path outside session boundary")),
-            ).await;
-            
+                FileOperationResult::Failed("Path outside session boundary".to_string()),
+            )
+            .await;
+
             return Err(crate::AgentError::ToolExecution(format!(
                 "Path outside session boundary: {} not within {}",
                 canonical_path.display(),
@@ -1028,19 +1185,23 @@ impl ToolCallHandler {
         }
 
         let dir_reader_result = tokio::fs::read_dir(path_str).await;
-        
+
         let mut dir_reader = match dir_reader_result {
             Ok(reader) => reader,
             Err(e) => {
                 // Track failed operation
                 self.track_file_operation(
-                    &session_id.0.to_string(),
+                    session_id.0.as_ref(),
                     FileOperationType::List,
                     &canonical_path,
                     FileOperationResult::Failed(format!("Failed to list directory: {}", e)),
-                ).await;
-                
-                return Err(crate::AgentError::ToolExecution(format!("Failed to list directory {}: {}", path_str, e)));
+                )
+                .await;
+
+                return Err(crate::AgentError::ToolExecution(format!(
+                    "Failed to list directory {}: {}",
+                    path_str, e
+                )));
             }
         };
 
@@ -1079,14 +1240,15 @@ impl ToolCallHandler {
         };
 
         tracing::info!("Listed {} items in directory {}", files.len(), path_str);
-        
+
         // Track successful operation
         self.track_file_operation(
-            &session_id.0.to_string(),
+            session_id.0.as_ref(),
             FileOperationType::List,
             &canonical_path,
             FileOperationResult::Success,
-        ).await;
+        )
+        .await;
 
         Ok(content)
     }
@@ -1582,7 +1744,7 @@ mod tests {
         // Create ACP-compliant session ID with sess_ prefix
         SessionId(std::sync::Arc::from("sess_01ARZ3NDEKTSV4RRFFQ69G5FAV"))
     }
-    
+
     fn create_test_handler_with_session(
         permissions: ToolPermissions,
         session_manager: std::sync::Arc<crate::session::SessionManager>,
@@ -1592,13 +1754,13 @@ mod tests {
         let internal_session_id = session_manager
             .create_session(session_dir.to_path_buf())
             .unwrap();
-        
+
         // Create ACP-compliant session ID
         let acp_session_id = SessionId(internal_session_id.to_string().into());
-        
+
         // Create handler with session manager
         let mut handler = ToolCallHandler::new(permissions, session_manager);
-        
+
         // Set test capabilities
         let test_capabilities = agent_client_protocol::ClientCapabilities {
             fs: agent_client_protocol::FileSystemCapability {
@@ -1610,7 +1772,7 @@ mod tests {
             meta: None,
         };
         handler.set_client_capabilities(test_capabilities);
-        
+
         (handler, acp_session_id)
     }
 
@@ -1706,7 +1868,11 @@ mod tests {
             ToolCallResult::Error(msg) => {
                 // Expected - relative path should be blocked (ACP requires absolute paths)
                 // Also accept session errors since no session was created
-                assert!(msg.contains("must be absolute path") || msg.contains("Session") || msg.contains("session"));
+                assert!(
+                    msg.contains("must be absolute path")
+                        || msg.contains("Session")
+                        || msg.contains("session")
+                );
             }
             _ => panic!("Expected error for relative path"),
         }
@@ -1870,7 +2036,8 @@ mod tests {
             forbidden_paths: vec![],
         };
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let (handler, session_id) = create_test_handler_with_session(permissions, session_manager, temp_dir.path());
+        let (handler, session_id) =
+            create_test_handler_with_session(permissions, session_manager, temp_dir.path());
 
         // Test write
         let write_request = InternalToolRequest {
@@ -1933,7 +2100,8 @@ mod tests {
             forbidden_paths: vec![],
         };
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let (handler, session_id) = create_test_handler_with_session(permissions, session_manager, temp_dir.path());
+        let (handler, session_id) =
+            create_test_handler_with_session(permissions, session_manager, temp_dir.path());
 
         let list_request = InternalToolRequest {
             id: "list-test".to_string(),
@@ -2140,7 +2308,8 @@ mod tests {
             forbidden_paths: vec![],
         };
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let (handler, session_id) = create_test_handler_with_session(permissions, session_manager, temp_dir.path());
+        let (handler, session_id) =
+            create_test_handler_with_session(permissions, session_manager, temp_dir.path());
 
         // Test that absolute path is accepted
         let read_request = InternalToolRequest {
@@ -2535,11 +2704,12 @@ mod tests {
             // Should be a file I/O error or session error, not a capability error
             assert!(!msg.contains("capability"), "Got capability error: {}", msg);
             assert!(
-                msg.contains("Failed to read file") || 
-                msg.contains("absolute") || 
-                msg.contains("Session") || 
-                msg.contains("session"), 
-                "Expected error about file/path/session, but got: {}", msg
+                msg.contains("Failed to read file")
+                    || msg.contains("absolute")
+                    || msg.contains("Session")
+                    || msg.contains("session"),
+                "Expected error about file/path/session, but got: {}",
+                msg
             );
         }
 
@@ -2572,11 +2742,14 @@ mod tests {
 
         // Test with terminal capability disabled
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let mut handler_no_terminal = ToolCallHandler::new(ToolPermissions {
-            auto_approved: vec![],
-            require_permission_for: vec![],
-            forbidden_paths: vec![],
-        }, session_manager.clone());
+        let mut handler_no_terminal = ToolCallHandler::new(
+            ToolPermissions {
+                auto_approved: vec![],
+                require_permission_for: vec![],
+                forbidden_paths: vec![],
+            },
+            session_manager.clone(),
+        );
 
         let caps_no_terminal = agent_client_protocol::ClientCapabilities {
             fs: agent_client_protocol::FileSystemCapability {
@@ -2602,11 +2775,14 @@ mod tests {
         assert!(tools_no_terminal.contains(&"fs_list".to_string()));
 
         // Test with terminal capability enabled
-        let mut handler_with_terminal = ToolCallHandler::new(ToolPermissions {
-            auto_approved: vec![],
-            require_permission_for: vec![],
-            forbidden_paths: vec![],
-        }, session_manager.clone());
+        let mut handler_with_terminal = ToolCallHandler::new(
+            ToolPermissions {
+                auto_approved: vec![],
+                require_permission_for: vec![],
+                forbidden_paths: vec![],
+            },
+            session_manager.clone(),
+        );
 
         let caps_with_terminal = agent_client_protocol::ClientCapabilities {
             fs: agent_client_protocol::FileSystemCapability {
@@ -2631,11 +2807,14 @@ mod tests {
 
         // Test with no client capabilities set
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let handler_no_caps = ToolCallHandler::new(ToolPermissions {
-            auto_approved: vec![],
-            require_permission_for: vec![],
-            forbidden_paths: vec![],
-        }, session_manager.clone());
+        let handler_no_caps = ToolCallHandler::new(
+            ToolPermissions {
+                auto_approved: vec![],
+                require_permission_for: vec![],
+                forbidden_paths: vec![],
+            },
+            session_manager.clone(),
+        );
 
         let tools_no_caps = handler_no_caps.list_all_available_tools().await;
 
@@ -2961,11 +3140,14 @@ mod tests {
     async fn test_improved_terminal_capability_error_messages() {
         // Test that terminal capability validation returns improved error messages
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let mut handler = ToolCallHandler::new(ToolPermissions {
-            auto_approved: vec!["terminal_create".to_string()],
-            require_permission_for: vec![],
-            forbidden_paths: vec![],
-        }, session_manager.clone());
+        let mut handler = ToolCallHandler::new(
+            ToolPermissions {
+                auto_approved: vec!["terminal_create".to_string()],
+                require_permission_for: vec![],
+                forbidden_paths: vec![],
+            },
+            session_manager.clone(),
+        );
         let session_id = create_test_session_id();
 
         // Test with terminal capability explicitly disabled
@@ -3001,11 +3183,14 @@ mod tests {
 
         // Test with no capabilities provided
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let handler_no_caps = ToolCallHandler::new(ToolPermissions {
-            auto_approved: vec!["terminal_create".to_string()],
-            require_permission_for: vec![],
-            forbidden_paths: vec![],
-        }, session_manager.clone());
+        let handler_no_caps = ToolCallHandler::new(
+            ToolPermissions {
+                auto_approved: vec!["terminal_create".to_string()],
+                require_permission_for: vec![],
+                forbidden_paths: vec![],
+            },
+            session_manager.clone(),
+        );
 
         let result_no_caps = handler_no_caps
             .handle_tool_request(
@@ -3387,7 +3572,7 @@ mod tests {
             forbidden_paths: vec![],
         };
         let mut handler = ToolCallHandler::new(permissions, session_manager.clone());
-        
+
         // Set client capabilities for file operations
         let capabilities = agent_client_protocol::ClientCapabilities {
             fs: agent_client_protocol::FileSystemCapability {
@@ -3455,7 +3640,7 @@ mod tests {
             forbidden_paths: vec![],
         };
         let mut handler = ToolCallHandler::new(permissions, session_manager.clone());
-        
+
         // Set client capabilities for file operations
         let capabilities = agent_client_protocol::ClientCapabilities {
             fs: agent_client_protocol::FileSystemCapability {
@@ -3500,8 +3685,10 @@ mod tests {
 
         // This should succeed (currently passes, will continue to pass)
         match result {
-            Ok(ToolCallResult::Success(_)) => {},
-            Ok(ToolCallResult::Error(e)) => panic!("Expected success but got ToolCallResult::Error: {}", e),
+            Ok(ToolCallResult::Success(_)) => {}
+            Ok(ToolCallResult::Error(e)) => {
+                panic!("Expected success but got ToolCallResult::Error: {}", e)
+            }
             Err(e) => panic!("Expected success but got Err: {:?}", e),
             Ok(other) => panic!("Expected success but got: {:?}", other),
         }
@@ -3536,7 +3723,7 @@ mod tests {
             forbidden_paths: vec![],
         };
         let mut handler = ToolCallHandler::new(permissions, session_manager.clone());
-        
+
         // Set client capabilities for file operations
         let capabilities = agent_client_protocol::ClientCapabilities {
             fs: agent_client_protocol::FileSystemCapability {

@@ -278,4 +278,214 @@ mod tests {
         let completed = handler.complete_tool_call_report(&session_id, &report.tool_call_id, None).await;
         assert!(completed.is_some());
     }
+
+    #[tokio::test]
+    async fn test_terminal_embedding_in_tool_call() {
+        let (handler, mut receiver) = create_test_handler().await;
+        let session_id = SessionId("test_session_terminal".into());
+        let tool_name = "execute_command";
+        let arguments = json!({"command": "echo", "args": ["hello"]});
+
+        // Create tool call
+        let report = handler.create_tool_call_report(&session_id, tool_name, &arguments).await;
+        let tool_call_id = report.tool_call_id.clone();
+
+        // Consume initial notification
+        let _ = receiver.recv().await.expect("Should receive initial notification");
+
+        // Embed a terminal in the tool call
+        let terminal_id = "term_01234567890ABCDEFGHIJK".to_string();
+        let result = handler.embed_terminal_in_tool_call(&session_id, &tool_call_id, terminal_id.clone()).await;
+        assert!(result.is_ok(), "Terminal embedding should succeed");
+
+        // Verify notification with terminal content
+        let notification = receiver.recv().await.expect("Should receive terminal embedding notification");
+        match notification.update {
+            SessionUpdate::ToolCallUpdate(update) => {
+                assert_eq!(update.id.0, tool_call_id);
+                assert!(update.fields.content.is_some(), "Should include content");
+
+                let content = update.fields.content.unwrap();
+                assert_eq!(content.len(), 1, "Should have one content item");
+
+                match &content[0] {
+                    agent_client_protocol::ToolCallContent::Terminal { terminal_id: tid } => {
+                        assert_eq!(tid.0, terminal_id, "Terminal ID should match");
+                    }
+                    _ => panic!("Expected Terminal content type"),
+                }
+            }
+            _ => panic!("Expected ToolCallUpdate notification with terminal content"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_terminal_embedding_with_nonexistent_tool_call() {
+        let (handler, _receiver) = create_test_handler().await;
+        let session_id = SessionId("test_session_invalid".into());
+        let nonexistent_tool_call_id = "call_nonexistent";
+        let terminal_id = "term_01234567890ABCDEFGHIJK".to_string();
+
+        // Attempt to embed terminal in nonexistent tool call
+        let result = handler.embed_terminal_in_tool_call(&session_id, nonexistent_tool_call_id, terminal_id).await;
+
+        assert!(result.is_err(), "Embedding should fail for nonexistent tool call");
+        match result {
+            Err(crate::AgentError::ToolExecution(msg)) => {
+                assert!(msg.contains("not found"), "Error should indicate tool call not found");
+            }
+            _ => panic!("Expected ToolExecution error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_multiple_terminals_in_tool_call() {
+        let (handler, mut receiver) = create_test_handler().await;
+        let session_id = SessionId("test_session_multi_terminal".into());
+        let tool_name = "parallel_execute";
+        let arguments = json!({"commands": ["echo hello", "echo world"]});
+
+        // Create tool call
+        let report = handler.create_tool_call_report(&session_id, tool_name, &arguments).await;
+        let tool_call_id = report.tool_call_id.clone();
+
+        // Consume initial notification
+        let _ = receiver.recv().await.expect("Should receive initial notification");
+
+        // Embed first terminal
+        let terminal_id_1 = "term_01111111111111111111111".to_string();
+        handler.embed_terminal_in_tool_call(&session_id, &tool_call_id, terminal_id_1.clone()).await
+            .expect("First terminal embedding should succeed");
+
+        // Consume first terminal notification
+        let _ = receiver.recv().await.expect("Should receive first terminal notification");
+
+        // Embed second terminal
+        let terminal_id_2 = "term_02222222222222222222222".to_string();
+        handler.embed_terminal_in_tool_call(&session_id, &tool_call_id, terminal_id_2.clone()).await
+            .expect("Second terminal embedding should succeed");
+
+        // Verify second notification includes both terminals
+        let notification = receiver.recv().await.expect("Should receive second terminal notification");
+        match notification.update {
+            SessionUpdate::ToolCallUpdate(update) => {
+                assert_eq!(update.id.0, tool_call_id);
+                let content = update.fields.content.expect("Should include content");
+                assert_eq!(content.len(), 2, "Should have two terminal content items");
+
+                // Verify both terminals are present
+                let terminal_ids: Vec<String> = content.iter().filter_map(|c| {
+                    if let agent_client_protocol::ToolCallContent::Terminal { terminal_id } = c {
+                        Some(terminal_id.0.to_string())
+                    } else {
+                        None
+                    }
+                }).collect();
+
+                assert!(terminal_ids.contains(&terminal_id_1), "First terminal should be present");
+                assert!(terminal_ids.contains(&terminal_id_2), "Second terminal should be present");
+            }
+            _ => panic!("Expected ToolCallUpdate with multiple terminals"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_embedded_terminal() {
+        let (handler, mut receiver) = create_test_handler().await;
+        let session_id = SessionId("sess_execute_terminal".into());
+        let tool_name = "bash_execute";
+        let arguments = json!({"command": "echo test"});
+
+        // Create a session first (required for terminal creation)
+        let session_manager = handler.get_session_manager();
+        let parsed_session_id = crate::session::SessionId::parse(session_id.0.as_ref())
+            .expect("Should parse session ID");
+        session_manager.create_session(parsed_session_id.clone(), std::path::PathBuf::from("/tmp"))
+            .expect("Should create session");
+
+        // Create tool call
+        let report = handler.create_tool_call_report(&session_id, tool_name, &arguments).await;
+        let tool_call_id = report.tool_call_id.clone();
+
+        // Consume initial notification
+        let _ = receiver.recv().await.expect("Should receive initial notification");
+
+        // Execute with embedded terminal
+        let params = crate::terminal_manager::TerminalCreateParams {
+            session_id: session_id.0.to_string(),
+            command: "echo".to_string(),
+            args: Some(vec!["test".to_string()]),
+            env: None,
+            cwd: None,
+            output_byte_limit: None,
+        };
+
+        let terminal_id = handler.execute_with_embedded_terminal(&session_id, &tool_call_id, params).await
+            .expect("Execute with embedded terminal should succeed");
+
+        // Verify terminal ID format (ACP-compliant with term_ prefix)
+        assert!(terminal_id.starts_with("term_"), "Terminal ID should have term_ prefix");
+
+        // Verify notification with embedded terminal
+        let notification = receiver.recv().await.expect("Should receive terminal embedding notification");
+        match notification.update {
+            SessionUpdate::ToolCallUpdate(update) => {
+                assert_eq!(update.id.0, tool_call_id);
+                let content = update.fields.content.expect("Should include content");
+                assert_eq!(content.len(), 1, "Should have one terminal content item");
+
+                match &content[0] {
+                    agent_client_protocol::ToolCallContent::Terminal { terminal_id: tid } => {
+                        assert_eq!(tid.0, terminal_id, "Terminal ID should match returned value");
+                    }
+                    _ => panic!("Expected Terminal content type"),
+                }
+            }
+            _ => panic!("Expected ToolCallUpdate with terminal content"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_terminal_embedding_with_tool_call_completion() {
+        let (handler, mut receiver) = create_test_handler().await;
+        let session_id = SessionId("test_session_terminal_complete".into());
+        let tool_name = "execute_with_result";
+        let arguments = json!({"command": "ls"});
+
+        // Create tool call
+        let report = handler.create_tool_call_report(&session_id, tool_name, &arguments).await;
+        let tool_call_id = report.tool_call_id.clone();
+
+        // Consume initial notification
+        let _ = receiver.recv().await.expect("Should receive initial notification");
+
+        // Embed terminal
+        let terminal_id = "term_01234567890ABCDEFGHIJK".to_string();
+        handler.embed_terminal_in_tool_call(&session_id, &tool_call_id, terminal_id.clone()).await
+            .expect("Terminal embedding should succeed");
+
+        // Consume terminal embedding notification
+        let _ = receiver.recv().await.expect("Should receive terminal embedding notification");
+
+        // Complete tool call
+        let output = json!({"exit_code": 0, "terminal_id": terminal_id});
+        handler.complete_tool_call_report(&session_id, &tool_call_id, Some(output.clone())).await
+            .expect("Should complete tool call");
+
+        // Verify completion notification
+        let notification = receiver.recv().await.expect("Should receive completion notification");
+        match notification.update {
+            SessionUpdate::ToolCallUpdate(update) => {
+                assert_eq!(update.id.0, tool_call_id);
+                assert_eq!(update.fields.status, Some(agent_client_protocol::ToolCallStatus::Completed));
+                assert_eq!(update.fields.raw_output, Some(output));
+
+                // Terminal content should still be present in the completed tool call
+                let content = update.fields.content.expect("Should include content");
+                assert!(content.iter().any(|c| matches!(c, agent_client_protocol::ToolCallContent::Terminal { .. })),
+                        "Terminal content should persist through completion");
+            }
+            _ => panic!("Expected ToolCallUpdate completion notification"),
+        }
+    }
 }
