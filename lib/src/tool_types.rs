@@ -94,6 +94,21 @@ pub struct ToolCallLocation {
     pub line: Option<u64>,
 }
 
+/// Lightweight snapshot of tool call state for change detection
+///
+/// This structure tracks the last state sent in an update to enable
+/// ACP-compliant partial updates that only include changed fields.
+#[derive(Debug, Clone, PartialEq)]
+struct ToolCallReportSnapshot {
+    status: ToolCallStatus,
+    title: String,
+    kind: ToolKind,
+    content_len: usize,
+    locations_len: usize,
+    raw_input_present: bool,
+    raw_output_present: bool,
+}
+
 /// Complete ACP-compliant tool call report structure
 ///
 /// This struct contains all metadata required by the ACP specification for
@@ -121,6 +136,12 @@ pub struct ToolCallReport {
     /// The raw output returned by the tool
     #[serde(rename = "rawOutput", skip_serializing_if = "Option::is_none")]
     pub raw_output: Option<serde_json::Value>,
+    /// Shadow copy of the last state sent in an update (for change detection)
+    ///
+    /// ACP partial updates optimize bandwidth by only sending changed fields.
+    /// This tracks the previous state to enable efficient change detection.
+    #[serde(skip)]
+    previous_state: Option<Box<ToolCallReportSnapshot>>,
 }
 
 impl ToolCallReport {
@@ -135,6 +156,7 @@ impl ToolCallReport {
             locations: Vec::new(),
             raw_input: None,
             raw_output: None,
+            previous_state: None,
         }
     }
 
@@ -316,6 +338,23 @@ impl ToolCallReport {
         self.raw_output = Some(output);
     }
 
+    /// Capture current state as the baseline for future change detection
+    ///
+    /// This method should be called after sending a tool call update to mark
+    /// the current state as "sent", enabling ACP-compliant partial updates
+    /// that only include changed fields in subsequent updates.
+    pub fn mark_state_sent(&mut self) {
+        self.previous_state = Some(Box::new(ToolCallReportSnapshot {
+            status: self.status,
+            title: self.title.clone(),
+            kind: self.kind,
+            content_len: self.content.len(),
+            locations_len: self.locations.len(),
+            raw_input_present: self.raw_input.is_some(),
+            raw_output_present: self.raw_output.is_some(),
+        }));
+    }
+
     /// Convert to agent_client_protocol::ToolCall for session notifications
     pub fn to_acp_tool_call(&self) -> agent_client_protocol::ToolCall {
         agent_client_protocol::ToolCall {
@@ -332,10 +371,73 @@ impl ToolCallReport {
     }
 
     /// Convert to agent_client_protocol::ToolCallUpdate for status updates
-    pub fn to_acp_tool_call_update(&self) -> agent_client_protocol::ToolCallUpdate {
-        agent_client_protocol::ToolCallUpdate {
-            id: agent_client_protocol::ToolCallId(self.tool_call_id.clone().into()),
-            fields: agent_client_protocol::ToolCallUpdateFields {
+    ///
+    /// This method implements ACP-compliant partial updates by only including
+    /// fields that have changed since the last update was sent. This optimizes
+    /// bandwidth and processing efficiency as per the ACP specification:
+    /// "All fields except toolCallId are optional in updates. Only the fields
+    /// being changed need to be included."
+    ///
+    /// On the first update (when no previous state exists), all fields are included
+    /// to ensure the client receives complete initial state.
+    ///
+    /// # Parameters
+    /// * `include_context_fields` - If true, always include content and locations even if unchanged
+    ///   (useful for final updates like completion/failure to provide full context)
+    pub fn to_acp_tool_call_update_with_context(
+        &self,
+        include_context_fields: bool,
+    ) -> agent_client_protocol::ToolCallUpdate {
+        let fields = if let Some(prev) = &self.previous_state {
+            // ACP partial update: only include fields that have changed since last update
+            agent_client_protocol::ToolCallUpdateFields {
+                status: if prev.status != self.status {
+                    Some(self.status.to_acp_status())
+                } else {
+                    None
+                },
+                title: if prev.title != self.title {
+                    Some(self.title.clone())
+                } else {
+                    None
+                },
+                kind: if prev.kind != self.kind {
+                    Some(self.kind.to_acp_kind())
+                } else {
+                    None
+                },
+                // Note: Content and location changes are detected by length only
+                // (intentional performance optimization - O(1) vs O(n) deep comparison).
+                // This means modifying existing items without changing count won't trigger
+                // an update, but add/remove operations are always detected.
+                content: if prev.content_len != self.content.len()
+                    || (include_context_fields && !self.content.is_empty())
+                {
+                    Some(self.content.iter().map(|c| c.to_acp_content()).collect())
+                } else {
+                    None
+                },
+                locations: if prev.locations_len != self.locations.len()
+                    || (include_context_fields && !self.locations.is_empty())
+                {
+                    Some(self.locations.iter().map(|l| l.to_acp_location()).collect())
+                } else {
+                    None
+                },
+                raw_input: if prev.raw_input_present != self.raw_input.is_some() {
+                    self.raw_input.clone()
+                } else {
+                    None
+                },
+                raw_output: if prev.raw_output_present != self.raw_output.is_some() {
+                    self.raw_output.clone()
+                } else {
+                    None
+                },
+            }
+        } else {
+            // First update - send all fields to establish initial state
+            agent_client_protocol::ToolCallUpdateFields {
                 kind: Some(self.kind.to_acp_kind()),
                 status: Some(self.status.to_acp_status()),
                 title: Some(self.title.clone()),
@@ -343,9 +445,22 @@ impl ToolCallReport {
                 locations: Some(self.locations.iter().map(|l| l.to_acp_location()).collect()),
                 raw_input: self.raw_input.clone(),
                 raw_output: self.raw_output.clone(),
-            },
+            }
+        };
+
+        agent_client_protocol::ToolCallUpdate {
+            id: agent_client_protocol::ToolCallId(self.tool_call_id.clone().into()),
+            fields,
             meta: None,
         }
+    }
+
+    /// Convert to agent_client_protocol::ToolCallUpdate with default behavior
+    ///
+    /// This is a convenience method that calls `to_acp_tool_call_update_with_context(false)`
+    /// for standard partial updates.
+    pub fn to_acp_tool_call_update(&self) -> agent_client_protocol::ToolCallUpdate {
+        self.to_acp_tool_call_update_with_context(false)
     }
 }
 
@@ -920,5 +1035,291 @@ mod tests {
         let json = serde_json::to_value(&report).expect("Should serialize empty content");
         assert!(json["content"].is_array());
         assert_eq!(json["content"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_partial_update_first_update_includes_all_fields() {
+        // First update should include all fields since there's no previous state
+        let report = ToolCallReport::new(
+            "test_001".to_string(),
+            "Test Tool".to_string(),
+            ToolKind::Read,
+        );
+
+        let update = report.to_acp_tool_call_update();
+
+        // All fields should be present in first update
+        assert!(update.fields.status.is_some());
+        assert!(update.fields.title.is_some());
+        assert!(update.fields.kind.is_some());
+        assert!(update.fields.content.is_some());
+        assert!(update.fields.locations.is_some());
+        assert_eq!(update.fields.title.unwrap(), "Test Tool");
+    }
+
+    #[test]
+    fn test_partial_update_status_only() {
+        // Test that only status field is included when only status changes
+        let mut report = ToolCallReport::new(
+            "test_002".to_string(),
+            "Test Tool".to_string(),
+            ToolKind::Read,
+        );
+
+        // Mark initial state as sent
+        report.mark_state_sent();
+
+        // Now change only the status
+        report.update_status(ToolCallStatus::InProgress);
+
+        let update = report.to_acp_tool_call_update();
+
+        // Only status should be present
+        assert!(update.fields.status.is_some());
+        assert_eq!(
+            update.fields.status.unwrap(),
+            agent_client_protocol::ToolCallStatus::InProgress
+        );
+
+        // All other fields should be None (omitted in serialization)
+        assert!(update.fields.title.is_none());
+        assert!(update.fields.kind.is_none());
+        assert!(update.fields.content.is_none());
+        assert!(update.fields.locations.is_none());
+        assert!(update.fields.raw_input.is_none());
+        assert!(update.fields.raw_output.is_none());
+    }
+
+    #[test]
+    fn test_partial_update_content_only() {
+        // Test that only content field is included when only content changes
+        let mut report = ToolCallReport::new(
+            "test_003".to_string(),
+            "Test Tool".to_string(),
+            ToolKind::Execute,
+        );
+
+        // Mark initial state as sent
+        report.mark_state_sent();
+
+        // Now add content
+        report.add_content(ToolCallContent::Content {
+            content: agent_client_protocol::ContentBlock::Text(
+                agent_client_protocol::TextContent {
+                    text: "Progress update".to_string(),
+                    annotations: None,
+                    meta: None,
+                },
+            ),
+        });
+
+        let update = report.to_acp_tool_call_update();
+
+        // Only content should be present
+        assert!(update.fields.content.is_some());
+        assert_eq!(update.fields.content.as_ref().unwrap().len(), 1);
+
+        // All other fields should be None
+        assert!(update.fields.status.is_none());
+        assert!(update.fields.title.is_none());
+        assert!(update.fields.kind.is_none());
+        assert!(update.fields.locations.is_none());
+        assert!(update.fields.raw_input.is_none());
+        assert!(update.fields.raw_output.is_none());
+    }
+
+    #[test]
+    fn test_partial_update_multiple_fields() {
+        // Test that multiple changed fields are included
+        let mut report = ToolCallReport::new(
+            "test_004".to_string(),
+            "Test Tool".to_string(),
+            ToolKind::Edit,
+        );
+
+        // Mark initial state as sent
+        report.mark_state_sent();
+
+        // Change multiple fields
+        report.update_status(ToolCallStatus::Completed);
+        report.add_content(ToolCallContent::Content {
+            content: agent_client_protocol::ContentBlock::Text(
+                agent_client_protocol::TextContent {
+                    text: "Done".to_string(),
+                    annotations: None,
+                    meta: None,
+                },
+            ),
+        });
+        report.set_raw_output(serde_json::json!({"result": "success"}));
+
+        let update = report.to_acp_tool_call_update();
+
+        // Changed fields should be present
+        assert!(update.fields.status.is_some());
+        assert!(update.fields.content.is_some());
+        assert!(update.fields.raw_output.is_some());
+
+        // Unchanged fields should be None
+        assert!(update.fields.title.is_none());
+        assert!(update.fields.kind.is_none());
+        assert!(update.fields.locations.is_none());
+        assert!(update.fields.raw_input.is_none());
+    }
+
+    #[test]
+    fn test_partial_update_no_changes() {
+        // Test that no fields are included when nothing changes
+        let mut report = ToolCallReport::new(
+            "test_005".to_string(),
+            "Test Tool".to_string(),
+            ToolKind::Search,
+        );
+
+        // Mark initial state as sent
+        report.mark_state_sent();
+
+        // Don't change anything
+        let update = report.to_acp_tool_call_update();
+
+        // All fields should be None since nothing changed
+        assert!(update.fields.status.is_none());
+        assert!(update.fields.title.is_none());
+        assert!(update.fields.kind.is_none());
+        assert!(update.fields.content.is_none());
+        assert!(update.fields.locations.is_none());
+        assert!(update.fields.raw_input.is_none());
+        assert!(update.fields.raw_output.is_none());
+    }
+
+    #[test]
+    fn test_partial_update_location_changes() {
+        // Test that locations field is included when locations change
+        let mut report = ToolCallReport::new(
+            "test_006".to_string(),
+            "Test Tool".to_string(),
+            ToolKind::Read,
+        );
+
+        // Mark initial state as sent
+        report.mark_state_sent();
+
+        // Add a location
+        report.add_location(ToolCallLocation {
+            path: "/test/file.txt".to_string(),
+            line: Some(42),
+        });
+
+        let update = report.to_acp_tool_call_update();
+
+        // Only locations should be present
+        assert!(update.fields.locations.is_some());
+        assert_eq!(update.fields.locations.as_ref().unwrap().len(), 1);
+
+        // All other fields should be None
+        assert!(update.fields.status.is_none());
+        assert!(update.fields.title.is_none());
+        assert!(update.fields.kind.is_none());
+        assert!(update.fields.content.is_none());
+        assert!(update.fields.raw_input.is_none());
+        assert!(update.fields.raw_output.is_none());
+    }
+
+    #[test]
+    fn test_partial_update_title_change() {
+        // Test that title field is included when title changes
+        let mut report = ToolCallReport::new(
+            "test_007".to_string(),
+            "Original Title".to_string(),
+            ToolKind::Edit,
+        );
+
+        // Mark initial state as sent
+        report.mark_state_sent();
+
+        // Change the title
+        report.title = "Updated Title".to_string();
+
+        let update = report.to_acp_tool_call_update();
+
+        // Only title should be present
+        assert!(update.fields.title.is_some());
+        assert_eq!(update.fields.title.as_ref().unwrap(), "Updated Title");
+
+        // All other fields should be None
+        assert!(update.fields.status.is_none());
+        assert!(update.fields.kind.is_none());
+        assert!(update.fields.content.is_none());
+        assert!(update.fields.locations.is_none());
+        assert!(update.fields.raw_input.is_none());
+        assert!(update.fields.raw_output.is_none());
+    }
+
+    #[test]
+    fn test_partial_update_serialization_omits_none_fields() {
+        // Test that None fields are actually omitted in JSON serialization
+        let mut report = ToolCallReport::new(
+            "test_008".to_string(),
+            "Test Tool".to_string(),
+            ToolKind::Execute,
+        );
+
+        // Mark initial state as sent
+        report.mark_state_sent();
+
+        // Change only status
+        report.update_status(ToolCallStatus::InProgress);
+
+        let update = report.to_acp_tool_call_update();
+        let json = serde_json::to_value(&update.fields).expect("Should serialize");
+
+        // Only status should be in the JSON
+        assert!(json.get("status").is_some());
+
+        // These fields should not exist in the JSON at all
+        assert!(json.get("title").is_none());
+        assert!(json.get("kind").is_none());
+        assert!(json.get("content").is_none());
+        assert!(json.get("locations").is_none());
+        assert!(json.get("rawInput").is_none());
+        assert!(json.get("rawOutput").is_none());
+    }
+
+    #[test]
+    fn test_partial_update_with_context_flag() {
+        // Test that context flag includes content/locations even when unchanged
+        let mut report = ToolCallReport::new(
+            "test_009".to_string(),
+            "Test Tool".to_string(),
+            ToolKind::Execute,
+        );
+
+        // Add content
+        report.add_content(ToolCallContent::Terminal {
+            terminal_id: "term_123".to_string(),
+        });
+
+        // Mark state as sent (simulating terminal embedding update)
+        report.mark_state_sent();
+
+        // Now change status (simulating completion)
+        report.update_status(ToolCallStatus::Completed);
+
+        // Generate update with context flag true
+        let update = report.to_acp_tool_call_update_with_context(true);
+
+        // Content should be included even though length didn't change
+        assert!(
+            update.fields.content.is_some(),
+            "Content should be included with context flag"
+        );
+        assert_eq!(update.fields.content.as_ref().unwrap().len(), 1);
+
+        // Status should also be included since it changed
+        assert!(update.fields.status.is_some());
+        assert_eq!(
+            update.fields.status.unwrap(),
+            agent_client_protocol::ToolCallStatus::Completed
+        );
     }
 }

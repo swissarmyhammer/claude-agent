@@ -320,6 +320,10 @@ impl ToolCallHandler {
         // Status updates provide transparency and enable client UI updates.
 
         // Send initial tool_call notification
+        // Note: We intentionally do NOT call report.mark_state_sent() here because:
+        // 1. The initial notification uses to_acp_tool_call() (full object), not to_acp_tool_call_update()
+        // 2. This leaves previous_state as None, which ensures the first update will include all fields
+        // 3. This "bootstrap" behavior guarantees clients receive complete state on first update
         if let Some(sender) = &self.notification_sender {
             let notification = agent_client_protocol::SessionNotification {
                 session_id: session_id.clone(),
@@ -351,33 +355,35 @@ impl ToolCallHandler {
             let mut active_calls = self.active_tool_calls.write().await;
             if let Some(report) = active_calls.get_mut(tool_call_id) {
                 update_fn(report);
+
+                // Send tool_call_update notification for status changes
+                if let Some(sender) = &self.notification_sender {
+                    let notification = agent_client_protocol::SessionNotification {
+                        session_id: session_id.clone(),
+                        update: agent_client_protocol::SessionUpdate::ToolCallUpdate(
+                            report.to_acp_tool_call_update(),
+                        ),
+                        meta: None,
+                    };
+
+                    if let Err(e) = sender.send_update(notification).await {
+                        tracing::warn!(
+                            tool_call_id = %tool_call_id,
+                            session_id = %session_id.0,
+                            error = %e,
+                            "Failed to send tool call update notification"
+                        );
+                    }
+
+                    // Mark state as sent for future partial update optimization
+                    report.mark_state_sent();
+                }
+
                 Some(report.clone())
             } else {
                 None
             }
         };
-
-        // Send tool_call_update notification for status changes
-        if let Some(report) = &updated_report {
-            if let Some(sender) = &self.notification_sender {
-                let notification = agent_client_protocol::SessionNotification {
-                    session_id: session_id.clone(),
-                    update: agent_client_protocol::SessionUpdate::ToolCallUpdate(
-                        report.to_acp_tool_call_update(),
-                    ),
-                    meta: None,
-                };
-
-                if let Err(e) = sender.send_update(notification).await {
-                    tracing::warn!(
-                        tool_call_id = %tool_call_id,
-                        session_id = %session_id.0,
-                        error = %e,
-                        "Failed to send tool call update notification"
-                    );
-                }
-            }
-        }
 
         updated_report
     }
@@ -396,33 +402,33 @@ impl ToolCallHandler {
                 if let Some(output) = raw_output {
                     report.set_raw_output(output);
                 }
+
+                // Send final tool_call_update notification with completed status and results
+                // Include context fields (content/locations) in final update for full context
+                if let Some(sender) = &self.notification_sender {
+                    let notification = agent_client_protocol::SessionNotification {
+                        session_id: session_id.clone(),
+                        update: agent_client_protocol::SessionUpdate::ToolCallUpdate(
+                            report.to_acp_tool_call_update_with_context(true),
+                        ),
+                        meta: None,
+                    };
+
+                    if let Err(e) = sender.send_update(notification).await {
+                        tracing::warn!(
+                            tool_call_id = %tool_call_id,
+                            session_id = %session_id.0,
+                            error = %e,
+                            "Failed to send tool call completion notification"
+                        );
+                    }
+                }
+
                 Some(report)
             } else {
                 None
             }
         };
-
-        // Send final tool_call_update notification with completed status and results
-        if let Some(report) = &completed_report {
-            if let Some(sender) = &self.notification_sender {
-                let notification = agent_client_protocol::SessionNotification {
-                    session_id: session_id.clone(),
-                    update: agent_client_protocol::SessionUpdate::ToolCallUpdate(
-                        report.to_acp_tool_call_update(),
-                    ),
-                    meta: None,
-                };
-
-                if let Err(e) = sender.send_update(notification).await {
-                    tracing::warn!(
-                        tool_call_id = %tool_call_id,
-                        session_id = %session_id.0,
-                        error = %e,
-                        "Failed to send tool call completion notification"
-                    );
-                }
-            }
-        }
 
         completed_report
     }
@@ -538,33 +544,33 @@ impl ToolCallHandler {
                 if let Some(output) = error_output {
                     report.set_raw_output(output);
                 }
+
+                // Send final tool_call_update notification with failed status and error details
+                // Include context fields (content/locations) in final update for full context
+                if let Some(sender) = &self.notification_sender {
+                    let notification = agent_client_protocol::SessionNotification {
+                        session_id: session_id.clone(),
+                        update: agent_client_protocol::SessionUpdate::ToolCallUpdate(
+                            report.to_acp_tool_call_update_with_context(true),
+                        ),
+                        meta: None,
+                    };
+
+                    if let Err(e) = sender.send_update(notification).await {
+                        tracing::warn!(
+                            tool_call_id = %tool_call_id,
+                            session_id = %session_id.0,
+                            error = %e,
+                            "Failed to send tool call failure notification"
+                        );
+                    }
+                }
+
                 Some(report)
             } else {
                 None
             }
         };
-
-        // Send final tool_call_update notification with failed status and error details
-        if let Some(report) = &failed_report {
-            if let Some(sender) = &self.notification_sender {
-                let notification = agent_client_protocol::SessionNotification {
-                    session_id: session_id.clone(),
-                    update: agent_client_protocol::SessionUpdate::ToolCallUpdate(
-                        report.to_acp_tool_call_update(),
-                    ),
-                    meta: None,
-                };
-
-                if let Err(e) = sender.send_update(notification).await {
-                    tracing::warn!(
-                        tool_call_id = %tool_call_id,
-                        session_id = %session_id.0,
-                        error = %e,
-                        "Failed to send tool call failure notification"
-                    );
-                }
-            }
-        }
 
         failed_report
     }
@@ -579,33 +585,33 @@ impl ToolCallHandler {
             let mut active_calls = self.active_tool_calls.write().await;
             if let Some(mut report) = active_calls.remove(tool_call_id) {
                 report.update_status(ToolCallStatus::Cancelled);
+
+                // Send final tool_call_update notification with cancelled status
+                // Include context fields (content/locations) in final update for full context
+                if let Some(sender) = &self.notification_sender {
+                    let notification = agent_client_protocol::SessionNotification {
+                        session_id: session_id.clone(),
+                        update: agent_client_protocol::SessionUpdate::ToolCallUpdate(
+                            report.to_acp_tool_call_update_with_context(true),
+                        ),
+                        meta: None,
+                    };
+
+                    if let Err(e) = sender.send_update(notification).await {
+                        tracing::warn!(
+                            tool_call_id = %tool_call_id,
+                            session_id = %session_id.0,
+                            error = %e,
+                            "Failed to send tool call cancellation notification"
+                        );
+                    }
+                }
+
                 Some(report)
             } else {
                 None
             }
         };
-
-        // Send final tool_call_update notification with cancelled status
-        if let Some(report) = &cancelled_report {
-            if let Some(sender) = &self.notification_sender {
-                let notification = agent_client_protocol::SessionNotification {
-                    session_id: session_id.clone(),
-                    update: agent_client_protocol::SessionUpdate::ToolCallUpdate(
-                        report.to_acp_tool_call_update(),
-                    ),
-                    meta: None,
-                };
-
-                if let Err(e) = sender.send_update(notification).await {
-                    tracing::warn!(
-                        tool_call_id = %tool_call_id,
-                        session_id = %session_id.0,
-                        error = %e,
-                        "Failed to send tool call cancellation notification"
-                    );
-                }
-            }
-        }
 
         cancelled_report
     }
