@@ -2829,6 +2829,54 @@ impl Agent for ClaudeAgent {
             return Ok(Arc::from(raw_value));
         }
 
+        // Handle terminal/output extension method
+        if request.method == "terminal/output".into() {
+            // Validate client capabilities for terminal operations
+            {
+                let client_caps = self.client_capabilities.read().await;
+                match &*client_caps {
+                    Some(caps) if caps.terminal => {
+                        tracing::debug!("Terminal capability validated");
+                    }
+                    Some(_) => {
+                        tracing::error!("terminal/output capability not declared by client");
+                        return Err(agent_client_protocol::Error::invalid_params());
+                    }
+                    None => {
+                        tracing::error!(
+                            "No client capabilities available for terminal/output validation"
+                        );
+                        return Err(agent_client_protocol::Error::invalid_params());
+                    }
+                }
+            }
+
+            // Parse the request parameters from RawValue
+            let params_value: serde_json::Value = serde_json::from_str(request.params.get())
+                .map_err(|e| {
+                    tracing::error!("Failed to parse terminal/output parameters: {}", e);
+                    agent_client_protocol::Error::invalid_params()
+                })?;
+
+            let params: crate::terminal_manager::TerminalOutputParams =
+                serde_json::from_value(params_value).map_err(|e| {
+                    tracing::error!("Failed to deserialize terminal/output parameters: {}", e);
+                    agent_client_protocol::Error::invalid_params()
+                })?;
+
+            // Handle the terminal output request
+            let response = self.handle_terminal_output(params).await?;
+
+            // Convert response to RawValue
+            let response_json = serde_json::to_value(response)
+                .map_err(|_e| agent_client_protocol::Error::internal_error())?;
+
+            let raw_value = RawValue::from_string(response_json.to_string())
+                .map_err(|_e| agent_client_protocol::Error::internal_error())?;
+
+            return Ok(Arc::from(raw_value));
+        }
+
         // Return a structured response indicating no other extensions are implemented
         // This maintains ACP compliance while clearly communicating capability limitations
         let response = serde_json::json!({
@@ -3019,6 +3067,27 @@ impl ClaudeAgent {
 
         // Return null result as per ACP specification
         Ok(serde_json::Value::Null)
+    }
+
+    /// Handle terminal/output ACP extension method
+    pub async fn handle_terminal_output(
+        &self,
+        params: crate::terminal_manager::TerminalOutputParams,
+    ) -> Result<crate::terminal_manager::TerminalOutputResponse, agent_client_protocol::Error> {
+        tracing::debug!("Processing terminal/output request: {:?}", params);
+
+        // Get terminal manager from tool handler
+        let tool_handler = self.tool_handler.read().await;
+        let terminal_manager = tool_handler.get_terminal_manager();
+
+        // Get output from terminal manager
+        terminal_manager
+            .get_output(&self.session_manager, params)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to get terminal output: {}", e);
+                agent_client_protocol::Error::invalid_params()
+            })
     }
 
     /// Read file content with optional line offset and limit
@@ -6382,5 +6451,259 @@ mod tests {
         // Could be transport validation error (-32602) or session not found (-32603)
         // Both are acceptable since validation runs before session lookup
         assert!(error.code == -32602 || error.code == -32603);
+    }
+
+    #[tokio::test]
+    async fn test_terminal_output_basic() {
+        use crate::terminal_manager::{TerminalCreateParams, TerminalOutputParams};
+        use tempfile::TempDir;
+
+        let (agent, session_id) = setup_agent_with_session().await;
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a terminal session
+        let tool_handler = agent.tool_handler.read().await;
+        let terminal_manager = tool_handler.get_terminal_manager();
+
+        let create_params = TerminalCreateParams {
+            session_id: session_id.clone(),
+            command: "echo".to_string(),
+            args: Some(vec!["Hello, Terminal!".to_string()]),
+            env: None,
+            cwd: Some(temp_dir.path().to_string_lossy().to_string()),
+            output_byte_limit: None,
+        };
+
+        let terminal_id = terminal_manager
+            .create_terminal_with_command(&agent.session_manager, create_params)
+            .await
+            .unwrap();
+
+        // Get terminal output
+        let output_params = TerminalOutputParams {
+            session_id: session_id.clone(),
+            terminal_id: terminal_id.clone(),
+        };
+
+        let response = agent.handle_terminal_output(output_params).await.unwrap();
+
+        // Verify response structure
+        assert_eq!(response.output, "");
+        assert!(!response.truncated);
+        assert!(response.exit_status.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_terminal_output_with_data() {
+        use crate::terminal_manager::{TerminalCreateParams, TerminalOutputParams};
+        use tempfile::TempDir;
+
+        let (agent, session_id) = setup_agent_with_session().await;
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create terminal and add output data
+        let tool_handler = agent.tool_handler.read().await;
+        let terminal_manager = tool_handler.get_terminal_manager();
+
+        let create_params = TerminalCreateParams {
+            session_id: session_id.clone(),
+            command: "cat".to_string(),
+            args: None,
+            env: None,
+            cwd: Some(temp_dir.path().to_string_lossy().to_string()),
+            output_byte_limit: None,
+        };
+
+        let terminal_id = terminal_manager
+            .create_terminal_with_command(&agent.session_manager, create_params)
+            .await
+            .unwrap();
+
+        // Manually add output to the terminal session
+        {
+            let terminals = terminal_manager.terminals.read().await;
+            let session = terminals.get(&terminal_id).unwrap();
+            session.add_output(b"Test output data\n").await;
+        }
+
+        // Get output
+        let output_params = TerminalOutputParams {
+            session_id: session_id.clone(),
+            terminal_id: terminal_id.clone(),
+        };
+
+        let response = agent.handle_terminal_output(output_params).await.unwrap();
+
+        assert_eq!(response.output, "Test output data\n");
+        assert!(!response.truncated);
+    }
+
+    #[tokio::test]
+    async fn test_terminal_output_truncation() {
+        use crate::terminal_manager::{TerminalCreateParams, TerminalOutputParams};
+        use tempfile::TempDir;
+
+        let (agent, session_id) = setup_agent_with_session().await;
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create terminal with small byte limit
+        let tool_handler = agent.tool_handler.read().await;
+        let terminal_manager = tool_handler.get_terminal_manager();
+
+        let create_params = TerminalCreateParams {
+            session_id: session_id.clone(),
+            command: "cat".to_string(),
+            args: None,
+            env: None,
+            cwd: Some(temp_dir.path().to_string_lossy().to_string()),
+            output_byte_limit: Some(50),
+        };
+
+        let terminal_id = terminal_manager
+            .create_terminal_with_command(&agent.session_manager, create_params)
+            .await
+            .unwrap();
+
+        // Add more data than the limit
+        {
+            let terminals = terminal_manager.terminals.read().await;
+            let session = terminals.get(&terminal_id).unwrap();
+
+            let large_data = "A".repeat(100);
+            session.add_output(large_data.as_bytes()).await;
+        }
+
+        // Get output
+        let output_params = TerminalOutputParams {
+            session_id: session_id.clone(),
+            terminal_id: terminal_id.clone(),
+        };
+
+        let response = agent.handle_terminal_output(output_params).await.unwrap();
+
+        assert!(response.truncated);
+        assert!(response.output.len() <= 50);
+    }
+
+    #[tokio::test]
+    async fn test_terminal_output_utf8_boundary_truncation() {
+        use crate::terminal_manager::{TerminalCreateParams, TerminalOutputParams};
+        use tempfile::TempDir;
+
+        let (agent, session_id) = setup_agent_with_session().await;
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create terminal with byte limit
+        let tool_handler = agent.tool_handler.read().await;
+        let terminal_manager = tool_handler.get_terminal_manager();
+
+        let create_params = TerminalCreateParams {
+            session_id: session_id.clone(),
+            command: "cat".to_string(),
+            args: None,
+            env: None,
+            cwd: Some(temp_dir.path().to_string_lossy().to_string()),
+            output_byte_limit: Some(20),
+        };
+
+        let terminal_id = terminal_manager
+            .create_terminal_with_command(&agent.session_manager, create_params)
+            .await
+            .unwrap();
+
+        // Add UTF-8 data that will need character-boundary truncation
+        {
+            let terminals = terminal_manager.terminals.read().await;
+            let session = terminals.get(&terminal_id).unwrap();
+
+            let unicode_data = "Hello 世界 Test 🌍";
+            session.add_output(unicode_data.as_bytes()).await;
+        }
+
+        // Get output
+        let output_params = TerminalOutputParams {
+            session_id: session_id.clone(),
+            terminal_id: terminal_id.clone(),
+        };
+
+        let response = agent.handle_terminal_output(output_params).await.unwrap();
+
+        // Output should be valid UTF-8
+        assert!(response.truncated);
+        assert!(std::str::from_utf8(response.output.as_bytes()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_terminal_output_ext_method_routing() {
+        use crate::terminal_manager::TerminalCreateParams;
+        use tempfile::TempDir;
+
+        let (agent, session_id) = setup_agent_with_session().await;
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create terminal
+        let tool_handler = agent.tool_handler.read().await;
+        let terminal_manager = tool_handler.get_terminal_manager();
+
+        let create_params = TerminalCreateParams {
+            session_id: session_id.clone(),
+            command: "echo".to_string(),
+            args: Some(vec!["test".to_string()]),
+            env: None,
+            cwd: Some(temp_dir.path().to_string_lossy().to_string()),
+            output_byte_limit: None,
+        };
+
+        let terminal_id = terminal_manager
+            .create_terminal_with_command(&agent.session_manager, create_params)
+            .await
+            .unwrap();
+
+        // Test through ext_method interface
+        let params = serde_json::json!({
+            "sessionId": session_id,
+            "terminalId": terminal_id
+        });
+
+        let params_raw = agent_client_protocol::RawValue::from_string(params.to_string()).unwrap();
+        let ext_request = agent_client_protocol::ExtRequest {
+            method: "terminal/output".into(),
+            params: Arc::from(params_raw),
+        };
+
+        let result = agent.ext_method(ext_request).await.unwrap();
+
+        // Parse the response
+        let response: serde_json::Value = serde_json::from_str(result.get()).unwrap();
+        assert!(response.get("output").is_some());
+        assert!(response.get("truncated").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_terminal_output_invalid_session() {
+        use crate::terminal_manager::TerminalOutputParams;
+
+        let agent = create_test_agent().await;
+
+        let output_params = TerminalOutputParams {
+            session_id: "invalid-session-id".to_string(),
+            terminal_id: "term_123".to_string(),
+        };
+
+        let result = agent.handle_terminal_output(output_params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_terminal_output_invalid_terminal() {
+        let (agent, session_id) = setup_agent_with_session().await;
+
+        let output_params = crate::terminal_manager::TerminalOutputParams {
+            session_id: session_id.clone(),
+            terminal_id: "term_nonexistent".to_string(),
+        };
+
+        let result = agent.handle_terminal_output(output_params).await;
+        assert!(result.is_err());
     }
 }

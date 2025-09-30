@@ -708,6 +708,13 @@ impl ToolCallHandler {
         Ok(ops.get(session_id).cloned().unwrap_or_default())
     }
 
+    /// Get the terminal manager
+    ///
+    /// Returns a reference to the terminal manager for direct terminal operations
+    pub fn get_terminal_manager(&self) -> Arc<TerminalManager> {
+        Arc::clone(&self.terminal_manager)
+    }
+
     /// Check if client has declared the required file system read capability
     fn validate_fs_read_capability(&self) -> crate::Result<()> {
         match &self.client_capabilities {
@@ -2978,7 +2985,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_terminal_session_output_buffer_management() {
-        let mut session = TerminalSession {
+        let session = TerminalSession {
             process: None,
             working_dir: std::path::PathBuf::from("/tmp"),
             environment: HashMap::new(),
@@ -2986,33 +2993,34 @@ mod tests {
             args: Vec::new(),
             session_id: Some("test".to_string()),
             output_byte_limit: 10, // Very small for testing
-            output_buffer: Vec::new(),
-            buffer_truncated: false,
+            output_buffer: Arc::new(RwLock::new(Vec::new())),
+            buffer_truncated: Arc::new(RwLock::new(false)),
+            exit_status: Arc::new(RwLock::new(None)),
         };
 
         // Test normal addition within limits
-        session.add_output(b"hello");
-        assert_eq!(session.get_output_string(), "hello");
-        assert!(!session.is_output_truncated());
-        assert_eq!(session.get_buffer_size(), 5);
+        session.add_output(b"hello").await;
+        assert_eq!(session.get_output_string().await, "hello");
+        assert!(!session.is_output_truncated().await);
+        assert_eq!(session.get_buffer_size().await, 5);
 
         // Test addition that exceeds limit
-        session.add_output(b" world test");
-        assert_eq!(session.get_output_string(), "world test"); // Truncated from beginning
-        assert!(session.is_output_truncated());
-        assert_eq!(session.get_buffer_size(), 10);
+        session.add_output(b" world test").await;
+        assert_eq!(session.get_output_string().await, "world test"); // Truncated from beginning
+        assert!(session.is_output_truncated().await);
+        assert_eq!(session.get_buffer_size().await, 10);
 
         // Test large addition that fills entire buffer
-        session.add_output(b"replacement");
-        assert_eq!(session.get_output_string(), "eplacement"); // Last 10 bytes within limit
-        assert!(session.is_output_truncated());
-        assert_eq!(session.get_buffer_size(), 10);
+        session.add_output(b"replacement").await;
+        assert_eq!(session.get_output_string().await, "eplacement"); // Last 10 bytes within limit
+        assert!(session.is_output_truncated().await);
+        assert_eq!(session.get_buffer_size().await, 10);
 
         // Test clearing buffer
-        session.clear_output();
-        assert_eq!(session.get_output_string(), "");
-        assert!(!session.is_output_truncated());
-        assert_eq!(session.get_buffer_size(), 0);
+        session.clear_output().await;
+        assert_eq!(session.get_output_string().await, "");
+        assert!(!session.is_output_truncated().await);
+        assert_eq!(session.get_buffer_size().await, 0);
     }
 
     #[tokio::test]

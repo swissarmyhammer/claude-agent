@@ -26,8 +26,9 @@ pub struct TerminalSession {
     pub args: Vec<String>,
     pub session_id: Option<String>,
     pub output_byte_limit: u64,
-    pub output_buffer: Vec<u8>,
-    pub buffer_truncated: bool,
+    pub output_buffer: Arc<RwLock<Vec<u8>>>,
+    pub buffer_truncated: Arc<RwLock<bool>>,
+    pub exit_status: Arc<RwLock<Option<ExitStatus>>>,
 }
 
 /// ACP-compliant request parameters for terminal/create method
@@ -75,6 +76,39 @@ pub struct TerminalCreateResponse {
     pub terminal_id: String,
 }
 
+/// ACP-compliant request parameters for terminal/output method
+#[derive(Debug, Deserialize)]
+pub struct TerminalOutputParams {
+    /// Session identifier
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    /// Terminal identifier
+    #[serde(rename = "terminalId")]
+    pub terminal_id: String,
+}
+
+/// ACP-compliant response for terminal/output method
+#[derive(Debug, Serialize)]
+pub struct TerminalOutputResponse {
+    /// Terminal output as UTF-8 string
+    pub output: String,
+    /// Whether output has been truncated from the beginning
+    pub truncated: bool,
+    /// Exit status (only present when process has completed)
+    #[serde(rename = "exitStatus", skip_serializing_if = "Option::is_none")]
+    pub exit_status: Option<ExitStatus>,
+}
+
+/// Exit status information for completed processes
+#[derive(Debug, Serialize, Clone)]
+pub struct ExitStatus {
+    /// Exit code (0 for success, non-zero for error)
+    #[serde(rename = "exitCode")]
+    pub exit_code: Option<i32>,
+    /// Signal name if process was terminated by signal
+    pub signal: Option<String>,
+}
+
 impl TerminalManager {
     /// Create a new terminal manager
     pub fn new() -> Self {
@@ -105,8 +139,9 @@ impl TerminalManager {
             args: Vec::new(),
             session_id: None,
             output_byte_limit: 1_048_576, // 1MB default
-            output_buffer: Vec::new(),
-            buffer_truncated: false,
+            output_buffer: Arc::new(RwLock::new(Vec::new())),
+            buffer_truncated: Arc::new(RwLock::new(false)),
+            exit_status: Arc::new(RwLock::new(None)),
         };
 
         let mut terminals = self.terminals.write().await;
@@ -158,8 +193,9 @@ impl TerminalManager {
             args: params.args.unwrap_or_default(),
             session_id: Some(params.session_id),
             output_byte_limit: params.output_byte_limit.unwrap_or(1_048_576), // 1MB default
-            output_buffer: Vec::new(),
-            buffer_truncated: false,
+            output_buffer: Arc::new(RwLock::new(Vec::new())),
+            buffer_truncated: Arc::new(RwLock::new(false)),
+            exit_status: Arc::new(RwLock::new(None)),
         };
 
         // 6. Register terminal
@@ -340,6 +376,50 @@ impl TerminalManager {
         }
         Ok(())
     }
+
+    /// Get output from a terminal session (ACP terminal/output method)
+    pub async fn get_output(
+        &self,
+        session_manager: &crate::session::SessionManager,
+        params: TerminalOutputParams,
+    ) -> crate::Result<TerminalOutputResponse> {
+        // 1. Validate session ID
+        let parsed_session_id =
+            crate::session::SessionId::parse(&params.session_id).map_err(|e| {
+                crate::AgentError::Protocol(format!("Invalid session ID format: {}", e))
+            })?;
+
+        session_manager
+            .get_session(&parsed_session_id)?
+            .ok_or_else(|| {
+                crate::AgentError::Protocol(format!("Session not found: {}", params.session_id))
+            })?;
+
+        // 2. Get terminal session
+        let terminals = self.terminals.read().await;
+        let session = terminals.get(&params.terminal_id).ok_or_else(|| {
+            crate::AgentError::Protocol(format!("Terminal not found: {}", params.terminal_id))
+        })?;
+
+        // 3. Get output data
+        let output = session.get_output_string().await;
+        let truncated = session.is_output_truncated().await;
+        let exit_status = session.get_exit_status().await;
+
+        tracing::debug!(
+            "Retrieved output for terminal {}: {} bytes, truncated: {}, exit_status: {:?}",
+            params.terminal_id,
+            output.len(),
+            truncated,
+            exit_status
+        );
+
+        Ok(TerminalOutputResponse {
+            output,
+            truncated,
+            exit_status,
+        })
+    }
 }
 
 impl Default for TerminalManager {
@@ -349,38 +429,78 @@ impl Default for TerminalManager {
 }
 
 impl TerminalSession {
-    /// Add output data to the buffer, enforcing byte limits
-    pub fn add_output(&mut self, data: &[u8]) {
+    /// Add output data to the buffer, enforcing byte limits with character-boundary truncation
+    pub async fn add_output(&self, data: &[u8]) {
+        let mut buffer = self.output_buffer.write().await;
+        let mut truncated = self.buffer_truncated.write().await;
+
         // Always append the new data first
-        self.output_buffer.extend_from_slice(data);
+        buffer.extend_from_slice(data);
 
         // Then truncate from beginning if we exceed the limit
         let limit = self.output_byte_limit as usize;
-        if self.output_buffer.len() > limit {
-            let excess = self.output_buffer.len() - limit;
-            self.output_buffer.drain(0..excess);
-            self.buffer_truncated = true;
+        if buffer.len() > limit {
+            let excess = buffer.len() - limit;
+
+            // Find a safe UTF-8 boundary to truncate at
+            let truncate_point = Self::find_utf8_boundary(&buffer, excess);
+            buffer.drain(0..truncate_point);
+            *truncated = true;
         }
     }
 
+    /// Find the nearest UTF-8 character boundary at or after the given position
+    fn find_utf8_boundary(data: &[u8], min_pos: usize) -> usize {
+        let mut pos = min_pos;
+
+        // Move forward until we find a valid UTF-8 boundary
+        while pos < data.len() {
+            // Check if this position starts a valid UTF-8 sequence
+            // UTF-8 start bytes: 0xxxxxxx, 110xxxxx, 1110xxxx, 11110xxx
+            // Continuation bytes: 10xxxxxx
+            let byte = data[pos];
+
+            // If this is not a continuation byte, it's a valid boundary
+            if (byte & 0b1100_0000) != 0b1000_0000 {
+                return pos;
+            }
+
+            pos += 1;
+        }
+
+        // If we reached the end, return the data length
+        data.len()
+    }
+
     /// Get output as UTF-8 string
-    pub fn get_output_string(&self) -> String {
-        String::from_utf8_lossy(&self.output_buffer).to_string()
+    pub async fn get_output_string(&self) -> String {
+        let buffer = self.output_buffer.read().await;
+        String::from_utf8_lossy(&buffer).to_string()
     }
 
     /// Check if output buffer has been truncated
-    pub fn is_output_truncated(&self) -> bool {
-        self.buffer_truncated
+    pub async fn is_output_truncated(&self) -> bool {
+        *self.buffer_truncated.read().await
     }
 
     /// Get current buffer size in bytes
-    pub fn get_buffer_size(&self) -> usize {
-        self.output_buffer.len()
+    pub async fn get_buffer_size(&self) -> usize {
+        self.output_buffer.read().await.len()
     }
 
     /// Clear the output buffer
-    pub fn clear_output(&mut self) {
-        self.output_buffer.clear();
-        self.buffer_truncated = false;
+    pub async fn clear_output(&self) {
+        self.output_buffer.write().await.clear();
+        *self.buffer_truncated.write().await = false;
+    }
+
+    /// Get the current exit status
+    pub async fn get_exit_status(&self) -> Option<ExitStatus> {
+        self.exit_status.read().await.clone()
+    }
+
+    /// Set the exit status when process completes
+    pub async fn set_exit_status(&self, status: ExitStatus) {
+        *self.exit_status.write().await = Some(status);
     }
 }
