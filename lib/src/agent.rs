@@ -2877,6 +2877,54 @@ impl Agent for ClaudeAgent {
             return Ok(Arc::from(raw_value));
         }
 
+        // Handle terminal/release extension method
+        if request.method == "terminal/release".into() {
+            // Validate client capabilities for terminal operations
+            {
+                let client_caps = self.client_capabilities.read().await;
+                match &*client_caps {
+                    Some(caps) if caps.terminal => {
+                        tracing::debug!("Terminal capability validated");
+                    }
+                    Some(_) => {
+                        tracing::error!("terminal/release capability not declared by client");
+                        return Err(agent_client_protocol::Error::invalid_params());
+                    }
+                    None => {
+                        tracing::error!(
+                            "No client capabilities available for terminal/release validation"
+                        );
+                        return Err(agent_client_protocol::Error::invalid_params());
+                    }
+                }
+            }
+
+            // Parse the request parameters from RawValue
+            let params_value: serde_json::Value = serde_json::from_str(request.params.get())
+                .map_err(|e| {
+                    tracing::error!("Failed to parse terminal/release parameters: {}", e);
+                    agent_client_protocol::Error::invalid_params()
+                })?;
+
+            let params: crate::terminal_manager::TerminalReleaseParams =
+                serde_json::from_value(params_value).map_err(|e| {
+                    tracing::error!("Failed to deserialize terminal/release parameters: {}", e);
+                    agent_client_protocol::Error::invalid_params()
+                })?;
+
+            // Handle the terminal release request
+            let response = self.handle_terminal_release(params).await?;
+
+            // Convert response to RawValue (should be null per ACP spec)
+            let response_json = serde_json::to_value(response)
+                .map_err(|_e| agent_client_protocol::Error::internal_error())?;
+
+            let raw_value = RawValue::from_string(response_json.to_string())
+                .map_err(|_e| agent_client_protocol::Error::internal_error())?;
+
+            return Ok(Arc::from(raw_value));
+        }
+
         // Return a structured response indicating no other extensions are implemented
         // This maintains ACP compliance while clearly communicating capability limitations
         let response = serde_json::json!({
@@ -3086,6 +3134,27 @@ impl ClaudeAgent {
             .await
             .map_err(|e| {
                 tracing::error!("Failed to get terminal output: {}", e);
+                agent_client_protocol::Error::invalid_params()
+            })
+    }
+
+    /// Handle terminal/release ACP extension method
+    pub async fn handle_terminal_release(
+        &self,
+        params: crate::terminal_manager::TerminalReleaseParams,
+    ) -> Result<serde_json::Value, agent_client_protocol::Error> {
+        tracing::debug!("Processing terminal/release request: {:?}", params);
+
+        // Get terminal manager from tool handler
+        let tool_handler = self.tool_handler.read().await;
+        let terminal_manager = tool_handler.get_terminal_manager();
+
+        // Release terminal and return null per ACP specification
+        terminal_manager
+            .release_terminal(&self.session_manager, params)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to release terminal: {}", e);
                 agent_client_protocol::Error::invalid_params()
             })
     }

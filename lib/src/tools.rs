@@ -2996,6 +2996,7 @@ mod tests {
             output_buffer: Arc::new(RwLock::new(Vec::new())),
             buffer_truncated: Arc::new(RwLock::new(false)),
             exit_status: Arc::new(RwLock::new(None)),
+            state: Arc::new(RwLock::new(crate::terminal_manager::TerminalState::Created)),
         };
 
         // Test normal addition within limits
