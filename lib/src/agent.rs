@@ -415,6 +415,14 @@ impl ClaudeAgent {
         let (notification_sender, notification_receiver) =
             NotificationSender::new(config.notification_buffer_size);
 
+        // Create permission policy engine with file-based storage
+        let storage_path = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(".claude-agent")
+            .join("permissions");
+        let storage = FilePermissionStorage::new(storage_path);
+        let permission_engine = Arc::new(PermissionPolicyEngine::new(Box::new(storage)));
+
         // Create and initialize MCP manager
         let mut mcp_manager = crate::mcp::McpServerManager::new();
         mcp_manager
@@ -427,6 +435,7 @@ impl ClaudeAgent {
             config.security.to_tool_permissions(),
             Arc::clone(&mcp_manager),
             Arc::clone(&session_manager),
+            Arc::clone(&permission_engine),
         )));
 
         // Get all available tools for capabilities
@@ -459,14 +468,6 @@ impl ClaudeAgent {
         // Create cancellation manager for session cancellation support
         let (cancellation_manager, _cancellation_receiver) =
             CancellationManager::new(config.cancellation_buffer_size);
-
-        // Create permission policy engine with file-based storage
-        let storage_path = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
-            .join(".claude-agent")
-            .join("permissions");
-        let storage = FilePermissionStorage::new(storage_path);
-        let permission_engine = Arc::new(PermissionPolicyEngine::new(Box::new(storage)));
 
         // Initialize plan generation system for ACP plan reporting
         let plan_generator = Arc::new(PlanGenerator::new());

@@ -104,7 +104,7 @@ pub struct FileOperation {
 }
 
 /// Handles tool request execution with permission management and security validation
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolCallHandler {
     permissions: ToolPermissions,
     terminal_manager: Arc<TerminalManager>,
@@ -119,6 +119,24 @@ pub struct ToolCallHandler {
     file_operations: Arc<RwLock<HashMap<String, Vec<FileOperation>>>>,
     /// Session manager for validating sessions and enforcing boundaries
     session_manager: Arc<crate::session::SessionManager>,
+    /// Permission policy engine for evaluating tool call permissions
+    permission_engine: Arc<crate::permissions::PermissionPolicyEngine>,
+}
+
+impl std::fmt::Debug for ToolCallHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolCallHandler")
+            .field("permissions", &self.permissions)
+            .field("terminal_manager", &self.terminal_manager)
+            .field("mcp_manager", &self.mcp_manager)
+            .field("client_capabilities", &self.client_capabilities)
+            .field("active_tool_calls", &"<RwLock<HashMap>>")
+            .field("notification_sender", &self.notification_sender.is_some())
+            .field("file_operations", &"<RwLock<HashMap>>")
+            .field("session_manager", &"<SessionManager>")
+            .field("permission_engine", &"<PermissionPolicyEngine>")
+            .finish()
+    }
 }
 
 /// Configuration for tool permissions and security policies
@@ -215,10 +233,11 @@ pub struct PermissionRequest {
 }
 
 impl ToolCallHandler {
-    /// Create a new tool call handler with the given permissions
+    /// Create a new tool call handler with the given permissions and permission engine
     pub fn new(
         permissions: ToolPermissions,
         session_manager: Arc<crate::session::SessionManager>,
+        permission_engine: Arc<crate::permissions::PermissionPolicyEngine>,
     ) -> Self {
         Self {
             permissions,
@@ -229,6 +248,7 @@ impl ToolCallHandler {
             notification_sender: None,
             file_operations: Arc::new(RwLock::new(HashMap::new())),
             session_manager,
+            permission_engine,
         }
     }
 
@@ -237,6 +257,7 @@ impl ToolCallHandler {
         permissions: ToolPermissions,
         terminal_manager: Arc<TerminalManager>,
         session_manager: Arc<crate::session::SessionManager>,
+        permission_engine: Arc<crate::permissions::PermissionPolicyEngine>,
     ) -> Self {
         Self {
             permissions,
@@ -247,6 +268,7 @@ impl ToolCallHandler {
             notification_sender: None,
             file_operations: Arc::new(RwLock::new(HashMap::new())),
             session_manager,
+            permission_engine,
         }
     }
 
@@ -621,6 +643,7 @@ impl ToolCallHandler {
         permissions: ToolPermissions,
         mcp_manager: Arc<crate::mcp::McpServerManager>,
         session_manager: Arc<crate::session::SessionManager>,
+        permission_engine: Arc<crate::permissions::PermissionPolicyEngine>,
     ) -> Self {
         Self {
             permissions,
@@ -631,6 +654,7 @@ impl ToolCallHandler {
             notification_sender: None,
             file_operations: Arc::new(RwLock::new(HashMap::new())),
             session_manager,
+            permission_engine,
         }
     }
 
@@ -640,6 +664,7 @@ impl ToolCallHandler {
         terminal_manager: Arc<TerminalManager>,
         mcp_manager: Arc<crate::mcp::McpServerManager>,
         session_manager: Arc<crate::session::SessionManager>,
+        permission_engine: Arc<crate::permissions::PermissionPolicyEngine>,
     ) -> Self {
         Self {
             permissions,
@@ -650,6 +675,7 @@ impl ToolCallHandler {
             notification_sender: None,
             file_operations: Arc::new(RwLock::new(HashMap::new())),
             session_manager,
+            permission_engine,
         }
     }
 
@@ -781,10 +807,58 @@ impl ToolCallHandler {
             .await;
         tracing::debug!("Created tool call report: {}", tool_report.tool_call_id);
 
-        // Check if permission is required for this tool
-        if self.requires_permission(&request.name) {
-            let permission_request = self.create_permission_request(&request)?;
-            return Ok(ToolCallResult::PermissionRequired(permission_request));
+        // Check if tool is in auto_approved list (legacy permission system compatibility)
+        let is_auto_approved = self.permissions.auto_approved.contains(&request.name);
+
+        // Evaluate permission policy for this tool call (unless auto-approved)
+        let policy_evaluation = if is_auto_approved {
+            tracing::debug!("Tool call auto-approved by legacy permissions: {}", request.name);
+            crate::permissions::PolicyEvaluation::Allowed
+        } else {
+            self.permission_engine
+                .evaluate_tool_call(&request.name, &request.arguments)
+                .await?
+        };
+
+        match policy_evaluation {
+            crate::permissions::PolicyEvaluation::Denied { reason } => {
+                // Policy denies this tool call - fail immediately
+                tracing::warn!("Tool call denied by policy: {} - {}", request.name, reason);
+                self.fail_tool_call_report(
+                    session_id,
+                    &tool_report.tool_call_id,
+                    Some(serde_json::json!({"error": reason})),
+                )
+                .await;
+                return Ok(ToolCallResult::Error(reason));
+            }
+            crate::permissions::PolicyEvaluation::RequireUserConsent { options } => {
+                // Policy requires user consent - create permission request
+                tracing::info!("Tool call requires user consent: {}", request.name);
+                let description = self.generate_permission_reason(&request.name, &request.arguments);
+                let permission_request = EnhancedPermissionRequest {
+                    session_id: session_id.0.to_string(),
+                    tool_request_id: request.id.clone(),
+                    tool_name: request.name.clone(),
+                    description,
+                    arguments: request.arguments.clone(),
+                    options,
+                };
+
+                // Convert to simple PermissionRequest for now (will be enhanced later)
+                let simple_request = PermissionRequest {
+                    tool_request_id: permission_request.tool_request_id,
+                    tool_name: permission_request.tool_name,
+                    description: permission_request.description,
+                    arguments: permission_request.arguments,
+                };
+
+                return Ok(ToolCallResult::PermissionRequired(simple_request));
+            }
+            crate::permissions::PolicyEvaluation::Allowed => {
+                // Policy allows this tool call - proceed with execution
+                tracing::debug!("Tool call allowed by policy: {}", request.name);
+            }
         }
 
         // Update status to in_progress and execute the tool request
@@ -838,6 +912,7 @@ impl ToolCallHandler {
     }
 
     /// Check if a tool requires explicit permission
+    #[cfg(test)]
     fn requires_permission(&self, tool_name: &str) -> bool {
         self.permissions
             .require_permission_for
@@ -846,6 +921,56 @@ impl ToolCallHandler {
                 .permissions
                 .auto_approved
                 .contains(&tool_name.to_string())
+    }
+
+    /// Generate a human-readable permission request reason from tool name and arguments
+    fn generate_permission_reason(&self, tool_name: &str, arguments: &serde_json::Value) -> String {
+        match tool_name {
+            "fs_read" => {
+                if let Some(path) = arguments.get("path").and_then(|p| p.as_str()) {
+                    format!("Read file at {}", path)
+                } else {
+                    "Read a file".to_string()
+                }
+            }
+            "fs_write" => {
+                if let Some(path) = arguments.get("path").and_then(|p| p.as_str()) {
+                    format!("Write to file at {}", path)
+                } else {
+                    "Write to a file".to_string()
+                }
+            }
+            "fs_list" => {
+                if let Some(path) = arguments.get("path").and_then(|p| p.as_str()) {
+                    format!("List directory contents at {}", path)
+                } else {
+                    "List directory contents".to_string()
+                }
+            }
+            "terminal_create" => {
+                if let Some(command) = arguments.get("command").and_then(|c| c.as_str()) {
+                    format!("Execute command: {}", command)
+                } else {
+                    "Create a terminal session".to_string()
+                }
+            }
+            "terminal_write" => {
+                if let Some(data) = arguments.get("data").and_then(|d| d.as_str()) {
+                    let preview = if data.len() > 50 {
+                        format!("{}...", &data[..50])
+                    } else {
+                        data.to_string()
+                    };
+                    format!("Write data to terminal: {}", preview)
+                } else {
+                    "Write data to terminal".to_string()
+                }
+            }
+            _ => {
+                // Default: Use tool name with basic description
+                format!("Execute tool: {}", tool_name)
+            }
+        }
     }
 }
 
@@ -1502,6 +1627,7 @@ impl ToolCallHandler {
 
 impl ToolCallHandler {
     /// Create a permission request for a tool that requires authorization
+    #[cfg(test)]
     fn create_permission_request(
         &self,
         request: &InternalToolRequest,
@@ -1716,6 +1842,13 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn create_test_permission_engine() -> Arc<crate::permissions::PermissionPolicyEngine> {
+        use crate::permissions::{FilePermissionStorage, PermissionPolicyEngine};
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = FilePermissionStorage::new(temp_dir.path().to_path_buf());
+        Arc::new(PermissionPolicyEngine::new(Box::new(storage)))
+    }
+
     fn create_test_handler() -> ToolCallHandler {
         let permissions = ToolPermissions {
             require_permission_for: vec!["fs_write".to_string(), "terminal_create".to_string()],
@@ -1737,7 +1870,8 @@ mod tests {
 
     fn create_test_handler_with_permissions(permissions: ToolPermissions) -> ToolCallHandler {
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let mut handler = ToolCallHandler::new(permissions, session_manager);
+        let permission_engine = create_test_permission_engine();
+        let mut handler = ToolCallHandler::new(permissions, session_manager, permission_engine);
 
         // Set up test client capabilities for ACP compliance
         let test_capabilities = agent_client_protocol::ClientCapabilities {
@@ -1772,7 +1906,8 @@ mod tests {
         let acp_session_id = SessionId(internal_session_id.to_string().into());
 
         // Create handler with session manager
-        let mut handler = ToolCallHandler::new(permissions, session_manager);
+        let permission_engine = create_test_permission_engine();
+        let mut handler = ToolCallHandler::new(permissions, session_manager, permission_engine);
 
         // Set test capabilities
         let test_capabilities = agent_client_protocol::ClientCapabilities {
@@ -2608,7 +2743,8 @@ mod tests {
             forbidden_paths: vec![],
         };
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let mut handler = ToolCallHandler::new(permissions, session_manager);
+        let permission_engine = create_test_permission_engine();
+        let mut handler = ToolCallHandler::new(permissions, session_manager, permission_engine);
         let session_id = create_test_session_id();
         let caps_no_read = agent_client_protocol::ClientCapabilities {
             fs: agent_client_protocol::FileSystemCapability {
@@ -2649,7 +2785,8 @@ mod tests {
             forbidden_paths: vec![],
         };
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let mut handler = ToolCallHandler::new(permissions, session_manager);
+        let permission_engine = create_test_permission_engine();
+        let mut handler = ToolCallHandler::new(permissions, session_manager, permission_engine);
         let session_id = create_test_session_id();
         let caps_no_terminal = agent_client_protocol::ClientCapabilities {
             fs: agent_client_protocol::FileSystemCapability {
@@ -2689,7 +2826,8 @@ mod tests {
             forbidden_paths: vec![],
         };
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let mut handler = ToolCallHandler::new(permissions, session_manager);
+        let permission_engine = create_test_permission_engine();
+        let mut handler = ToolCallHandler::new(permissions, session_manager, permission_engine);
         let session_id = create_test_session_id();
         let caps_enabled = agent_client_protocol::ClientCapabilities {
             fs: agent_client_protocol::FileSystemCapability {
@@ -2755,6 +2893,7 @@ mod tests {
 
         // Test with terminal capability disabled
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
+        let permission_engine = create_test_permission_engine();
         let mut handler_no_terminal = ToolCallHandler::new(
             ToolPermissions {
                 auto_approved: vec![],
@@ -2762,6 +2901,7 @@ mod tests {
                 forbidden_paths: vec![],
             },
             session_manager.clone(),
+            permission_engine.clone(),
         );
 
         let caps_no_terminal = agent_client_protocol::ClientCapabilities {
@@ -2795,6 +2935,7 @@ mod tests {
                 forbidden_paths: vec![],
             },
             session_manager.clone(),
+            permission_engine.clone(),
         );
 
         let caps_with_terminal = agent_client_protocol::ClientCapabilities {
@@ -2820,6 +2961,7 @@ mod tests {
 
         // Test with no client capabilities set
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
+        let permission_engine_2 = create_test_permission_engine();
         let handler_no_caps = ToolCallHandler::new(
             ToolPermissions {
                 auto_approved: vec![],
@@ -2827,6 +2969,7 @@ mod tests {
                 forbidden_paths: vec![],
             },
             session_manager.clone(),
+            permission_engine_2,
         );
 
         let tools_no_caps = handler_no_caps.list_all_available_tools().await;
@@ -3157,6 +3300,7 @@ mod tests {
     async fn test_improved_terminal_capability_error_messages() {
         // Test that terminal capability validation returns improved error messages
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
+        let permission_engine = create_test_permission_engine();
         let mut handler = ToolCallHandler::new(
             ToolPermissions {
                 auto_approved: vec!["terminal_create".to_string()],
@@ -3164,6 +3308,7 @@ mod tests {
                 forbidden_paths: vec![],
             },
             session_manager.clone(),
+            permission_engine,
         );
         let session_id = create_test_session_id();
 
@@ -3200,6 +3345,7 @@ mod tests {
 
         // Test with no capabilities provided
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
+        let permission_engine_2 = create_test_permission_engine();
         let handler_no_caps = ToolCallHandler::new(
             ToolPermissions {
                 auto_approved: vec!["terminal_create".to_string()],
@@ -3207,6 +3353,7 @@ mod tests {
                 forbidden_paths: vec![],
             },
             session_manager.clone(),
+            permission_engine_2,
         );
 
         let result_no_caps = handler_no_caps
@@ -3752,7 +3899,8 @@ mod tests {
             auto_approved: vec!["fs_read".to_string()],
             forbidden_paths: vec![],
         };
-        let mut handler = ToolCallHandler::new(permissions, session_manager.clone());
+        let permission_engine = create_test_permission_engine();
+        let mut handler = ToolCallHandler::new(permissions, session_manager.clone(), permission_engine);
 
         // Set client capabilities for file operations
         let capabilities = agent_client_protocol::ClientCapabilities {
@@ -3820,7 +3968,8 @@ mod tests {
             auto_approved: vec!["fs_read".to_string()],
             forbidden_paths: vec![],
         };
-        let mut handler = ToolCallHandler::new(permissions, session_manager.clone());
+        let permission_engine = create_test_permission_engine();
+        let mut handler = ToolCallHandler::new(permissions, session_manager.clone(), permission_engine);
 
         // Set client capabilities for file operations
         let capabilities = agent_client_protocol::ClientCapabilities {
@@ -3903,7 +4052,8 @@ mod tests {
             auto_approved: vec!["fs_read".to_string(), "fs_write".to_string()],
             forbidden_paths: vec![],
         };
-        let mut handler = ToolCallHandler::new(permissions, session_manager.clone());
+        let permission_engine = create_test_permission_engine();
+        let mut handler = ToolCallHandler::new(permissions, session_manager.clone(), permission_engine);
 
         // Set client capabilities for file operations
         let capabilities = agent_client_protocol::ClientCapabilities {

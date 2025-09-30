@@ -12,6 +12,13 @@ mod tests {
     use serde_json::json;
     use tokio::sync::broadcast;
 
+    fn create_test_permission_engine() -> std::sync::Arc<crate::permissions::PermissionPolicyEngine> {
+        use crate::permissions::{FilePermissionStorage, PermissionPolicyEngine};
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = FilePermissionStorage::new(temp_dir.path().to_path_buf());
+        std::sync::Arc::new(PermissionPolicyEngine::new(Box::new(storage)))
+    }
+
     /// Helper to create a test tool call handler with notification sender
     async fn create_test_handler() -> (ToolCallHandler, broadcast::Receiver<SessionNotification>) {
         let permissions = ToolPermissions {
@@ -21,7 +28,8 @@ mod tests {
         };
 
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let mut handler = ToolCallHandler::new(permissions, session_manager);
+        let permission_engine = create_test_permission_engine();
+        let mut handler = ToolCallHandler::new(permissions, session_manager, permission_engine);
         let (sender, receiver) = NotificationSender::new(32);
         handler.set_notification_sender(sender);
 
@@ -362,7 +370,8 @@ mod tests {
         };
 
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let handler = ToolCallHandler::new(permissions, session_manager);
+        let permission_engine = create_test_permission_engine();
+        let handler = ToolCallHandler::new(permissions, session_manager, permission_engine);
         let session_id = SessionId("test_session_no_sender".into());
 
         // Tool call operations should still work without notification sender
