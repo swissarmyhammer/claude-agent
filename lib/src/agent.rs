@@ -379,6 +379,7 @@ pub struct ClaudeAgent {
     plan_manager: Arc<RwLock<PlanManager>>,
     base64_processor: Arc<Base64Processor>,
     content_block_processor: Arc<ContentBlockProcessor>,
+    editor_state_manager: Arc<crate::editor_state::EditorStateManager>,
 }
 
 impl ClaudeAgent {
@@ -483,6 +484,9 @@ impl ClaudeAgent {
             true,             // enable URI validation
         ));
 
+        // Initialize editor state manager for ACP editor integration
+        let editor_state_manager = Arc::new(crate::editor_state::EditorStateManager::new());
+
         let agent = Self {
             session_manager,
             claude_client,
@@ -498,6 +502,7 @@ impl ClaudeAgent {
             plan_manager,
             base64_processor,
             content_block_processor,
+            editor_state_manager,
         };
 
         Ok((agent, notification_receiver))
@@ -3161,6 +3166,14 @@ impl ClaudeAgent {
     }
 
     /// Handle fs/read_text_file ACP extension method
+    ///
+    /// ACP requires integration with client editor state to access unsaved changes.
+    /// This method:
+    /// 1. Checks if an editor buffer is available for the file
+    /// 2. Falls back to disk content if no editor buffer exists
+    /// 3. Applies line filtering if requested
+    ///
+    /// This ensures agents work with current, not stale, file content.
     pub async fn handle_read_text_file(
         &self,
         params: ReadTextFileParams,
@@ -3183,12 +3196,48 @@ impl ClaudeAgent {
             }
         }
 
-        // Read file content with line offset and limit
-        let content = self
-            .read_file_with_options(&params.path, params.line, params.limit)
-            .await?;
+        let path = std::path::Path::new(&params.path);
 
-        Ok(ReadTextFileResponse { content })
+        // ACP requires integration with client editor state for unsaved changes
+        // Try to get content from editor buffer first
+        match self
+            .editor_state_manager
+            .get_file_content(&params.session_id, path)
+            .await
+        {
+            Ok(Some(editor_buffer)) => {
+                tracing::debug!(
+                    "Using editor buffer content for: {} (modified: {})",
+                    params.path,
+                    editor_buffer.modified
+                );
+                // Editor buffer content needs line filtering applied
+                let filtered_content =
+                    self.apply_line_filtering(&editor_buffer.content, params.line, params.limit)?;
+                Ok(ReadTextFileResponse {
+                    content: filtered_content,
+                })
+            }
+            Ok(None) => {
+                // No editor buffer available, read from disk (with line filtering)
+                tracing::trace!("Reading from disk (no editor buffer): {}", params.path);
+                let content = self
+                    .read_file_with_options(&params.path, params.line, params.limit)
+                    .await?;
+                Ok(ReadTextFileResponse { content })
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Editor state query failed for {}: {}, falling back to disk",
+                    params.path,
+                    e
+                );
+                let content = self
+                    .read_file_with_options(&params.path, params.line, params.limit)
+                    .await?;
+                Ok(ReadTextFileResponse { content })
+            }
+        }
     }
 
     /// Handle fs/write_text_file ACP extension method

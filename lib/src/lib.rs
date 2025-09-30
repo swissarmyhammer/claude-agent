@@ -14,6 +14,7 @@ pub mod content_block_processor;
 pub mod content_capability_validator;
 pub mod content_security_validator;
 pub mod conversation_manager;
+pub mod editor_state;
 pub mod mime_type_validator;
 
 #[cfg(test)]
