@@ -7045,15 +7045,24 @@ mod tests {
 
         let collect_notifications = async {
             let mut user_message_chunks = Vec::new();
-            for _ in 0..2 {
+            // Keep receiving notifications until we get 2 UserMessageChunk notifications
+            // Use a reasonable timeout for the entire collection
+            let start = tokio::time::Instant::now();
+            let max_duration = Duration::from_secs(5);
+
+            while user_message_chunks.len() < 2 && start.elapsed() < max_duration {
                 match tokio::time::timeout(Duration::from_millis(100), notification_receiver.recv()).await {
                     Ok(Ok(notification)) => {
                         if let SessionUpdate::UserMessageChunk { content } = notification.update {
                             user_message_chunks.push(content);
                         }
+                        // Continue receiving if we haven't got 2 yet
                     }
-                    Ok(Err(_)) => break,
-                    Err(_) => break,
+                    Ok(Err(_)) => break, // Channel closed
+                    Err(_) => {
+                        // Timeout on this receive, continue to try again
+                        continue;
+                    }
                 }
             }
             user_message_chunks

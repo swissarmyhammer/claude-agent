@@ -1,12 +1,12 @@
 //! Claude SDK wrapper providing session-aware interactions
 
-use claude_sdk_rs::{Client, Config, Message};
+use claude_sdk_rs::{Client, Config, Message, MessageMeta};
 use tokio::time::{sleep, Duration};
 use tokio_stream::{Stream, StreamExt};
 
 use std::time::SystemTime;
 
-use crate::{config::ClaudeConfig, error::Result};
+use crate::{config::ClaudeConfig, error::Result, session::{MessageRole, SessionId}};
 
 /// Claude client wrapper with session management
 pub struct ClaudeClient {
@@ -15,9 +15,15 @@ pub struct ClaudeClient {
 
 /// Session context for managing conversation history
 pub struct SessionContext {
-    pub session_id: String,
+    pub session_id: SessionId,
     pub messages: Vec<ClaudeMessage>,
     pub created_at: SystemTime,
+    /// Total cost in USD for all messages in this session
+    pub total_cost_usd: f64,
+    /// Total input tokens used across all messages
+    pub total_input_tokens: u64,
+    /// Total output tokens used across all messages
+    pub total_output_tokens: u64,
 }
 
 /// Individual message in a conversation
@@ -26,14 +32,8 @@ pub struct ClaudeMessage {
     pub role: MessageRole,
     pub content: String,
     pub timestamp: SystemTime,
-}
-
-/// Message roles in a conversation
-#[derive(Debug, Clone)]
-pub enum MessageRole {
-    User,
-    Assistant,
-    System,
+    /// Optional metadata from Claude SDK including cost, tokens, and duration
+    pub meta: Option<MessageMeta>,
 }
 
 /// Streaming message chunk
@@ -45,6 +45,8 @@ pub struct MessageChunk {
     pub tool_call: Option<ToolCallInfo>,
     /// Token usage information (only present in Result messages)
     pub token_usage: Option<TokenUsageInfo>,
+    /// Optional metadata from SDK Message including cost, tokens, and duration
+    pub meta: Option<MessageMeta>,
 }
 
 /// Tool call information extracted from Message::Tool
@@ -96,7 +98,7 @@ impl ClaudeClient {
     }
 
     /// Execute a simple query without session context
-    pub async fn query(&self, prompt: &str, _session_id: &str) -> Result<String> {
+    pub async fn query(&self, prompt: &str, _session_id: &SessionId) -> Result<String> {
         self.execute_with_retry(|| async {
             if prompt.is_empty() {
                 return Err(crate::error::AgentError::Claude(
@@ -119,7 +121,7 @@ impl ClaudeClient {
     pub async fn query_stream(
         &self,
         prompt: &str,
-        _session_id: &str,
+        _session_id: &SessionId,
     ) -> Result<impl Stream<Item = MessageChunk>> {
         if prompt.is_empty() {
             return Err(crate::error::AgentError::Claude(
@@ -137,29 +139,34 @@ impl ClaudeClient {
         // Convert the MessageStream to our MessageChunk stream
         let chunk_stream = message_stream.map(|result| {
             match result {
-                Ok(Message::Assistant { content, .. }) => MessageChunk {
+                Ok(Message::Assistant { content, meta }) => MessageChunk {
                     content,
                     chunk_type: ChunkType::Text,
                     tool_call: None,
                     token_usage: None,
+                    meta: Some(meta),
                 },
                 Ok(Message::Tool {
-                    name, parameters, ..
+                    name,
+                    parameters,
+                    meta,
                 }) => MessageChunk {
                     content: String::new(), // Tool calls don't have direct content
                     chunk_type: ChunkType::ToolCall,
                     tool_call: Some(ToolCallInfo { name, parameters }),
                     token_usage: None,
+                    meta: Some(meta),
                 },
-                Ok(Message::ToolResult { .. }) => MessageChunk {
+                Ok(Message::ToolResult { meta, .. }) => MessageChunk {
                     content: String::new(), // Tool results handled separately
                     chunk_type: ChunkType::ToolResult,
                     tool_call: None,
                     token_usage: None,
+                    meta: Some(meta),
                 },
                 Ok(Message::Result { meta, .. }) => {
-                    // Extract token usage from metadata
-                    let token_usage = meta.tokens_used.map(|tokens| TokenUsageInfo {
+                    // Extract token usage from metadata for backward compatibility
+                    let token_usage = meta.tokens_used.as_ref().map(|tokens| TokenUsageInfo {
                         input_tokens: tokens.input,
                         output_tokens: tokens.output,
                     });
@@ -168,19 +175,31 @@ impl ClaudeClient {
                         chunk_type: ChunkType::Text,
                         tool_call: None,
                         token_usage,
+                        meta: Some(meta),
                     }
                 }
-                Ok(_) => MessageChunk {
-                    content: String::new(), // Other message types (Init, User, System)
-                    chunk_type: ChunkType::Text,
-                    tool_call: None,
-                    token_usage: None,
-                },
+                Ok(msg) => {
+                    // Other message types (Init, User, System) - extract meta if available
+                    let meta = match msg {
+                        Message::Init { meta } => Some(meta),
+                        Message::User { meta, .. } => Some(meta),
+                        Message::System { meta, .. } => Some(meta),
+                        _ => None,
+                    };
+                    MessageChunk {
+                        content: String::new(),
+                        chunk_type: ChunkType::Text,
+                        tool_call: None,
+                        token_usage: None,
+                        meta,
+                    }
+                }
                 Err(_) => MessageChunk {
                     content: String::new(), // Error handling - could be improved
                     chunk_type: ChunkType::Text,
                     tool_call: None,
                     token_usage: None,
+                    meta: None,
                 },
             }
         });
@@ -263,29 +282,34 @@ impl ClaudeClient {
         // Convert the MessageStream to our MessageChunk stream
         let chunk_stream = message_stream.map(|result| {
             match result {
-                Ok(Message::Assistant { content, .. }) => MessageChunk {
+                Ok(Message::Assistant { content, meta }) => MessageChunk {
                     content,
                     chunk_type: ChunkType::Text,
                     tool_call: None,
                     token_usage: None,
+                    meta: Some(meta),
                 },
                 Ok(Message::Tool {
-                    name, parameters, ..
+                    name,
+                    parameters,
+                    meta,
                 }) => MessageChunk {
                     content: String::new(), // Tool calls don't have direct content
                     chunk_type: ChunkType::ToolCall,
                     tool_call: Some(ToolCallInfo { name, parameters }),
                     token_usage: None,
+                    meta: Some(meta),
                 },
-                Ok(Message::ToolResult { .. }) => MessageChunk {
+                Ok(Message::ToolResult { meta, .. }) => MessageChunk {
                     content: String::new(), // Tool results handled separately
                     chunk_type: ChunkType::ToolResult,
                     tool_call: None,
                     token_usage: None,
+                    meta: Some(meta),
                 },
                 Ok(Message::Result { meta, .. }) => {
-                    // Extract token usage from metadata
-                    let token_usage = meta.tokens_used.map(|tokens| TokenUsageInfo {
+                    // Extract token usage from metadata for backward compatibility
+                    let token_usage = meta.tokens_used.as_ref().map(|tokens| TokenUsageInfo {
                         input_tokens: tokens.input,
                         output_tokens: tokens.output,
                     });
@@ -294,19 +318,31 @@ impl ClaudeClient {
                         chunk_type: ChunkType::Text,
                         tool_call: None,
                         token_usage,
+                        meta: Some(meta),
                     }
                 }
-                Ok(_) => MessageChunk {
-                    content: String::new(), // Other message types (Init, User, System)
-                    chunk_type: ChunkType::Text,
-                    tool_call: None,
-                    token_usage: None,
-                },
+                Ok(msg) => {
+                    // Other message types (Init, User, System) - extract meta if available
+                    let meta = match msg {
+                        Message::Init { meta } => Some(meta),
+                        Message::User { meta, .. } => Some(meta),
+                        Message::System { meta, .. } => Some(meta),
+                        _ => None,
+                    };
+                    MessageChunk {
+                        content: String::new(),
+                        chunk_type: ChunkType::Text,
+                        tool_call: None,
+                        token_usage: None,
+                        meta,
+                    }
+                }
                 Err(_) => MessageChunk {
                     content: String::new(), // Error handling - could be improved
                     chunk_type: ChunkType::Text,
                     tool_call: None,
                     token_usage: None,
+                    meta: None,
                 },
             }
         });
@@ -346,11 +382,14 @@ fn is_retryable(error: &crate::error::AgentError) -> bool {
 
 impl SessionContext {
     /// Create a new session context
-    pub fn new(session_id: String) -> Self {
+    pub fn new(session_id: SessionId) -> Self {
         Self {
             session_id,
             messages: Vec::new(),
             created_at: SystemTime::now(),
+            total_cost_usd: 0.0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
         }
     }
 
@@ -360,8 +399,43 @@ impl SessionContext {
             role,
             content,
             timestamp: SystemTime::now(),
+            meta: None,
         };
         self.messages.push(message);
+    }
+
+    /// Add a message to the session with metadata
+    pub fn add_message_with_meta(&mut self, role: MessageRole, content: String, meta: MessageMeta) {
+        // Aggregate cost and token usage from metadata
+        if let Some(cost) = meta.cost_usd {
+            self.total_cost_usd += cost;
+        }
+        if let Some(ref tokens) = meta.tokens_used {
+            self.total_input_tokens += tokens.input;
+            self.total_output_tokens += tokens.output;
+        }
+
+        let message = ClaudeMessage {
+            role,
+            content,
+            timestamp: SystemTime::now(),
+            meta: Some(meta),
+        };
+        self.messages.push(message);
+    }
+
+    /// Get total tokens used (input + output)
+    pub fn total_tokens(&self) -> u64 {
+        self.total_input_tokens + self.total_output_tokens
+    }
+
+    /// Get the average cost per message (if any messages have been added)
+    pub fn average_cost_per_message(&self) -> Option<f64> {
+        if self.messages.is_empty() {
+            None
+        } else {
+            Some(self.total_cost_usd / self.messages.len() as f64)
+        }
     }
 }
 
@@ -369,9 +443,12 @@ impl SessionContext {
 impl From<crate::session::Session> for SessionContext {
     fn from(session: crate::session::Session) -> Self {
         Self {
-            session_id: session.id.to_string(),
+            session_id: session.id,
             messages: session.context.into_iter().map(|msg| msg.into()).collect(),
             created_at: session.created_at,
+            total_cost_usd: 0.0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
         }
     }
 }
@@ -380,9 +457,12 @@ impl From<crate::session::Session> for SessionContext {
 impl From<&crate::session::Session> for SessionContext {
     fn from(session: &crate::session::Session) -> Self {
         Self {
-            session_id: session.id.to_string(),
+            session_id: session.id,
             messages: session.context.iter().map(|msg| msg.into()).collect(),
             created_at: session.created_at,
+            total_cost_usd: 0.0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
         }
     }
 }
@@ -391,9 +471,10 @@ impl From<&crate::session::Session> for SessionContext {
 impl From<crate::session::Message> for ClaudeMessage {
     fn from(message: crate::session::Message) -> Self {
         Self {
-            role: message.role.into(),
+            role: message.role,
             content: message.content,
             timestamp: message.timestamp,
+            meta: None, // Session messages don't have SDK metadata
         }
     }
 }
@@ -402,20 +483,10 @@ impl From<crate::session::Message> for ClaudeMessage {
 impl From<&crate::session::Message> for ClaudeMessage {
     fn from(message: &crate::session::Message) -> Self {
         Self {
-            role: message.role.clone().into(),
+            role: message.role.clone(),
             content: message.content.clone(),
             timestamp: message.timestamp,
-        }
-    }
-}
-
-/// Convert from session module MessageRole to claude module MessageRole
-impl From<crate::session::MessageRole> for MessageRole {
-    fn from(role: crate::session::MessageRole) -> Self {
-        match role {
-            crate::session::MessageRole::User => MessageRole::User,
-            crate::session::MessageRole::Assistant => MessageRole::Assistant,
-            crate::session::MessageRole::System => MessageRole::System,
+            meta: None, // Session messages don't have SDK metadata
         }
     }
 }
@@ -432,8 +503,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_context() {
-        let mut context = SessionContext::new("test-session".to_string());
-        assert_eq!(context.session_id, "test-session");
+        let session_id = SessionId::new();
+        let mut context = SessionContext::new(session_id);
+        assert_eq!(context.session_id, session_id);
         assert_eq!(context.messages.len(), 0);
 
         context.add_message(MessageRole::User, "Hello".to_string());
@@ -445,7 +517,8 @@ mod tests {
     #[tokio::test]
     async fn test_basic_query() {
         let client = ClaudeClient::new().unwrap();
-        let response = client.query("Hello", "session-1").await.unwrap();
+        let session_id = SessionId::new();
+        let response = client.query("Hello", &session_id).await.unwrap();
         // Claude's response won't necessarily contain the exact prompt
         // Just verify we get a non-empty response
         assert!(
@@ -457,7 +530,8 @@ mod tests {
     #[tokio::test]
     async fn test_query_with_context() {
         let client = ClaudeClient::new().unwrap();
-        let mut context = SessionContext::new("test-session".to_string());
+        let session_id = SessionId::new();
+        let mut context = SessionContext::new(session_id);
         context.add_message(MessageRole::User, "Previous message".to_string());
 
         let response = client
@@ -481,18 +555,21 @@ mod tests {
             role: MessageRole::User,
             content: "User message".to_string(),
             timestamp: SystemTime::now(),
+            meta: None,
         };
 
         let assistant_msg = ClaudeMessage {
             role: MessageRole::Assistant,
             content: "Assistant message".to_string(),
             timestamp: SystemTime::now(),
+            meta: None,
         };
 
         let system_msg = ClaudeMessage {
             role: MessageRole::System,
             content: "System message".to_string(),
             timestamp: SystemTime::now(),
+            meta: None,
         };
 
         assert!(matches!(user_msg.role, MessageRole::User));
@@ -507,6 +584,7 @@ mod tests {
             chunk_type: ChunkType::Text,
             tool_call: None,
             token_usage: None,
+            meta: None,
         };
 
         let tool_call_chunk = MessageChunk {
@@ -517,6 +595,7 @@ mod tests {
                 parameters: serde_json::json!({"arg": "value"}),
             }),
             token_usage: None,
+            meta: None,
         };
 
         let tool_result_chunk = MessageChunk {
@@ -524,6 +603,7 @@ mod tests {
             chunk_type: ChunkType::ToolResult,
             tool_call: None,
             token_usage: None,
+            meta: None,
         };
 
         let result_chunk = MessageChunk {
@@ -534,6 +614,7 @@ mod tests {
                 input_tokens: 100,
                 output_tokens: 200,
             }),
+            meta: None,
         };
 
         assert!(matches!(text_chunk.chunk_type, ChunkType::Text));
@@ -553,5 +634,70 @@ mod tests {
             result_chunk.token_usage.as_ref().unwrap().output_tokens,
             200
         );
+    }
+
+    #[test]
+    fn test_session_context_metadata_aggregation() {
+        use claude_sdk_rs::TokenUsage;
+
+        let session_id = SessionId::new();
+        let mut context = SessionContext::new(session_id);
+
+        // Initial state - no cost or tokens
+        assert_eq!(context.total_cost_usd, 0.0);
+        assert_eq!(context.total_input_tokens, 0);
+        assert_eq!(context.total_output_tokens, 0);
+        assert_eq!(context.total_tokens(), 0);
+        assert_eq!(context.average_cost_per_message(), None);
+
+        // Add message with metadata
+        let meta1 = MessageMeta {
+            session_id: "test-session".to_string(),
+            timestamp: Some(SystemTime::now()),
+            cost_usd: Some(0.0015),
+            duration_ms: Some(1200),
+            tokens_used: Some(TokenUsage {
+                input: 50,
+                output: 100,
+                total: 150,
+            }),
+        };
+        context.add_message_with_meta(MessageRole::User, "Hello".to_string(), meta1);
+
+        // Check aggregated values
+        assert_eq!(context.total_cost_usd, 0.0015);
+        assert_eq!(context.total_input_tokens, 50);
+        assert_eq!(context.total_output_tokens, 100);
+        assert_eq!(context.total_tokens(), 150);
+        assert_eq!(context.average_cost_per_message(), Some(0.0015));
+
+        // Add another message with metadata
+        let meta2 = MessageMeta {
+            session_id: "test-session".to_string(),
+            timestamp: Some(SystemTime::now()),
+            cost_usd: Some(0.0025),
+            duration_ms: Some(800),
+            tokens_used: Some(TokenUsage {
+                input: 30,
+                output: 200,
+                total: 230,
+            }),
+        };
+        context.add_message_with_meta(MessageRole::Assistant, "Response".to_string(), meta2);
+
+        // Check cumulative values
+        assert_eq!(context.total_cost_usd, 0.0040);
+        assert_eq!(context.total_input_tokens, 80);
+        assert_eq!(context.total_output_tokens, 300);
+        assert_eq!(context.total_tokens(), 380);
+        assert_eq!(context.average_cost_per_message(), Some(0.0020));
+
+        // Add message without metadata - should not affect totals
+        context.add_message(MessageRole::User, "No metadata".to_string());
+
+        assert_eq!(context.total_cost_usd, 0.0040);
+        assert_eq!(context.total_input_tokens, 80);
+        assert_eq!(context.total_output_tokens, 300);
+        assert_eq!(context.messages.len(), 3);
     }
 }
