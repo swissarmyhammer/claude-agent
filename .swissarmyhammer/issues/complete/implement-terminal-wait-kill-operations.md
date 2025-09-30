@@ -253,3 +253,188 @@ impl TerminalTimeout {
 - Integration with terminal registry and lifecycle management
 - Proper error handling for all process control scenarios
 - Comprehensive test coverage for wait and kill operations
+
+## Proposed Solution
+
+After examining the existing terminal_manager.rs code, I can see that the `terminal/wait_for_exit` and `terminal/kill` methods have already been implemented:
+
+1. **wait_for_exit** (lines 573-599): Implements blocking wait for process completion
+   - Validates session and terminal
+   - Returns cached exit status if already finished
+   - Blocks waiting for process completion
+   - Updates state to Finished
+
+2. **kill_terminal** (lines 601-623): Implements process termination
+   - Validates session and terminal
+   - Calls session.kill_process() which handles graceful/forceful termination
+   - Logs the kill operation
+
+3. **kill_process** (lines 898-1018): Implements platform-specific process killing
+   - Unix: SIGTERM with graceful shutdown timeout, then SIGKILL
+   - Windows: Direct TerminateProcess
+   - Updates state to Killed
+   - Stores exit status with signal information
+
+4. **execute_with_timeout** (lines 625-683): Implements ACP timeout pattern
+   - Uses tokio::select! for concurrent wait
+   - Automatically kills on timeout
+   - Returns TerminalTimeoutResult enum
+
+The implementation is complete and follows ACP specification. My task is to verify all functionality works correctly through comprehensive testing.
+
+## Implementation Approach
+
+1. Review existing tests (lines 1055-1542) to identify gaps
+2. Add tests for missing scenarios:
+   - Direct wait_for_exit testing with real process
+   - Concurrent wait_for_exit calls on same terminal
+   - Kill operations on running vs finished processes
+   - Platform-specific signal handling verification
+   - Edge cases for timeout patterns
+3. Run all tests to verify correctness
+4. Document any findings in this issue
+
+## Implementation Verification Results
+
+After thorough code review and comprehensive testing, I have verified that the terminal wait and kill operations are fully implemented and working correctly.
+
+### Implementation Status: ✅ COMPLETE
+
+The following ACP methods are fully implemented in `lib/src/terminal_manager.rs`:
+
+1. **terminal/wait_for_exit** (lines 573-599)
+   - ✅ Validates session and terminal
+   - ✅ Returns cached exit status if already finished
+   - ✅ Blocks waiting for process completion
+   - ✅ Updates state to Finished
+   - ✅ Extracts signal information on Unix systems
+
+2. **terminal/kill** (lines 601-623)
+   - ✅ Validates session and terminal
+   - ✅ Calls session.kill_process() for process termination
+   - ✅ Logs kill operation
+
+3. **kill_process** (lines 898-1018)
+   - ✅ Platform-specific implementation (Unix/Windows)
+   - ✅ Unix: SIGTERM with graceful shutdown timeout (default 5s)
+   - ✅ Unix: Escalates to SIGKILL if graceful shutdown fails
+   - ✅ Windows: Direct TerminateProcess
+   - ✅ Updates state to Killed
+   - ✅ Stores exit status with signal information
+
+4. **execute_with_timeout** (lines 625-683)
+   - ✅ Implements ACP timeout pattern
+   - ✅ Uses tokio::select! for concurrent wait
+   - ✅ Automatically kills process on timeout
+   - ✅ Returns TerminalTimeoutResult enum
+
+### Test Coverage Added
+
+Added 4 new comprehensive tests to verify all edge cases:
+
+1. **test_wait_for_exit_with_running_process** (line 1548)
+   - Tests direct wait_for_exit with a real running process
+   - Verifies exit code and state transition to Finished
+
+2. **test_concurrent_wait_for_exit_calls** (line 1602)
+   - Tests multiple concurrent wait_for_exit calls on same terminal
+   - Verifies both calls succeed and return same exit status
+   - Uses Arc wrapper for thread-safe sharing
+
+3. **test_wait_for_exit_on_released_terminal** (line 1676)
+   - Tests wait_for_exit on a released terminal
+   - Verifies proper error handling with "Terminal not found"
+
+4. **test_kill_then_wait_for_exit** (line 1710)
+   - Tests killing a process then waiting for exit
+   - Verifies cached exit status is returned
+   - Verifies state is Killed
+
+### Test Results
+
+All 17 terminal_manager tests pass successfully:
+```
+cargo nextest run --package claude-agent-lib --lib terminal_manager
+Summary [1.028s] 17 tests run: 17 passed, 417 skipped
+```
+
+### Existing Test Coverage (Verified)
+
+The following scenarios were already well-tested:
+- ✅ Terminal state lifecycle
+- ✅ Release terminal success/failure
+- ✅ Buffer clearing on release
+- ✅ Validate not released
+- ✅ Get output on released terminal
+- ✅ State transitions
+- ✅ Timeout triggers kill
+- ✅ Concurrent wait and timeout
+- ✅ Signal handling graceful termination (Unix)
+- ✅ Wait for exit already finished
+- ✅ Kill already finished process
+
+### Code Quality
+
+- ✅ All code formatted with `cargo fmt`
+- ✅ Platform-specific implementations using cfg attributes
+- ✅ Comprehensive error handling
+- ✅ Proper state management
+- ✅ Clear documentation and comments
+- ✅ Thread-safe with Arc and RwLock
+
+### Conclusion
+
+The terminal wait and kill operations are fully implemented according to the ACP specification. All functionality is thoroughly tested and working correctly. No code changes were required - only additional test coverage to verify edge cases.
+
+## Code Review Fixes Applied
+
+### Fix 1: Clippy Warning - Derivable Default Implementation
+**File:** `lib/src/terminal_manager.rs:71`
+
+**Issue:** Manual Default implementation for TimeoutConfig was derivable.
+
+**Fix Applied:** Added `Default` to the derive attributes:
+```rust
+#[derive(Debug, Clone, Default)]
+pub struct TimeoutConfig {
+    pub default_execution_timeout: Option<Duration>,
+    pub graceful_shutdown_timeout: GracefulShutdownTimeout,
+    pub command_timeouts: HashMap<String, Duration>,
+}
+```
+
+**Result:** ✅ Clippy warning eliminated, all clippy checks pass with `-D warnings`
+
+### Fix 2: Memory Leak in test_terminal_state_lifecycle
+**File:** `lib/src/terminal_manager.rs:1082`
+
+**Issue:** Test created a terminal process but never cleaned it up, causing nextest to report a leak.
+
+**Root Cause:** The test verified terminal state but didn't release the terminal, leaving the `echo` process and its resources uncleaned.
+
+**Fix Applied:** Added proper cleanup by releasing the terminal at test end:
+```rust
+// Clean up: release the terminal to avoid resource leak
+let params = TerminalReleaseParams {
+    session_id,
+    terminal_id,
+};
+let _ = manager.release_terminal(&session_manager, params).await;
+```
+
+**Result:** ✅ Memory leak eliminated, all 17 terminal_manager tests pass without leaks
+
+### Verification
+
+All fixes verified with:
+- `cargo nextest run` - All 457 tests pass, no leaks in terminal_manager tests
+- `cargo clippy --all-targets -- -D warnings` - No warnings
+- `cargo fmt` - Code properly formatted
+
+### Summary
+
+Both code review issues have been successfully resolved:
+1. ✅ Clippy derivable_impls warning fixed
+2. ✅ Memory leak in test_terminal_state_lifecycle fixed
+
+The implementation is now clean with no warnings, no leaks, and all tests passing.

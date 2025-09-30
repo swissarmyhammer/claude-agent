@@ -38,7 +38,7 @@ pub enum TerminalState {
 pub const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
 
 /// Newtype wrapper for graceful shutdown timeout duration
-/// 
+///
 /// Provides type safety to prevent mixing up timeout durations with other Duration values.
 /// This ensures that timeout configurations cannot be accidentally confused with other
 /// time-based parameters in the system.
@@ -50,7 +50,7 @@ impl GracefulShutdownTimeout {
     pub fn new(duration: Duration) -> Self {
         Self(duration)
     }
-    
+
     /// Get the timeout as a Duration
     pub fn as_duration(&self) -> Duration {
         self.0
@@ -64,10 +64,10 @@ impl Default for GracefulShutdownTimeout {
 }
 
 /// Configuration for terminal timeout behavior
-/// 
+///
 /// Controls how terminal sessions handle execution timeouts, including default
 /// durations, per-command overrides, and escalation strategies.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TimeoutConfig {
     /// Default timeout for command execution (None means no timeout)
     pub default_execution_timeout: Option<Duration>,
@@ -75,16 +75,6 @@ pub struct TimeoutConfig {
     pub graceful_shutdown_timeout: GracefulShutdownTimeout,
     /// Per-command timeout overrides (command name -> timeout duration)
     pub command_timeouts: HashMap<String, Duration>,
-}
-
-impl Default for TimeoutConfig {
-    fn default() -> Self {
-        Self {
-            default_execution_timeout: None,
-            graceful_shutdown_timeout: GracefulShutdownTimeout::default(),
-            command_timeouts: HashMap::new(),
-        }
-    }
 }
 
 impl TimeoutConfig {
@@ -852,9 +842,10 @@ impl TerminalSession {
         }
 
         // Check if process exists
-        let process = self.process.as_ref().ok_or_else(|| {
-            crate::AgentError::Protocol("No process running".to_string())
-        })?;
+        let process = self
+            .process
+            .as_ref()
+            .ok_or_else(|| crate::AgentError::Protocol("No process running".to_string()))?;
 
         // Wait for process to complete
         let status = {
@@ -912,9 +903,10 @@ impl TerminalSession {
         }
 
         // Check if process exists
-        let process = self.process.as_ref().ok_or_else(|| {
-            crate::AgentError::Protocol("No process running".to_string())
-        })?;
+        let process = self
+            .process
+            .as_ref()
+            .ok_or_else(|| crate::AgentError::Protocol("No process running".to_string()))?;
 
         #[cfg(unix)]
         {
@@ -976,7 +968,10 @@ impl TerminalSession {
             ))),
             Err(_) => {
                 // Timeout - force kill with SIGKILL
-                tracing::debug!("Graceful shutdown timed out, sending SIGKILL to process {}", pid);
+                tracing::debug!(
+                    "Graceful shutdown timed out, sending SIGKILL to process {}",
+                    pid
+                );
                 kill(pid, Signal::SIGKILL).map_err(|e| {
                     crate::AgentError::ToolExecution(format!("Failed to send SIGKILL: {}", e))
                 })?;
@@ -1089,16 +1084,25 @@ mod tests {
         let manager = TerminalManager::new();
         let session_manager = create_test_session_manager().await;
 
-        let (_session_id, terminal_id) = create_terminal_for_testing(&manager, &session_manager)
+        let (session_id, terminal_id) = create_terminal_for_testing(&manager, &session_manager)
             .await
             .unwrap();
 
-        let terminals = manager.terminals.read().await;
-        let session = terminals.get(&terminal_id).unwrap();
-        let state = session.get_state().await;
+        {
+            let terminals = manager.terminals.read().await;
+            let session = terminals.get(&terminal_id).unwrap();
+            let state = session.get_state().await;
 
-        assert_eq!(state, TerminalState::Created);
-        assert!(!session.is_released().await);
+            assert_eq!(state, TerminalState::Created);
+            assert!(!session.is_released().await);
+        }
+
+        // Clean up: release the terminal to avoid resource leak
+        let params = TerminalReleaseParams {
+            session_id,
+            terminal_id,
+        };
+        let _ = manager.release_terminal(&session_manager, params).await;
     }
 
     #[tokio::test]
@@ -1521,10 +1525,14 @@ mod tests {
             let terminals = manager.terminals.read().await;
             let session = terminals.get(&terminal_id).unwrap();
             *session.state.write().await = TerminalState::Finished;
-            
+
             // Test session-level kill (should succeed without process)
             let result = session.kill_process().await;
-            assert!(result.is_ok(), "Session-level kill failed: {:?}", result.err());
+            assert!(
+                result.is_ok(),
+                "Session-level kill failed: {:?}",
+                result.err()
+            );
         }
 
         // Also test manager-level kill
@@ -1535,8 +1543,245 @@ mod tests {
 
         let result = manager.kill_terminal(&session_manager, params).await;
         match result {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => panic!("Manager-level kill failed: {}", e),
         }
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_exit_with_running_process() {
+        let manager = TerminalManager::new();
+        let session_manager = create_test_session_manager().await;
+
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let session_id = session_manager.create_session(cwd).unwrap();
+
+        let params = TerminalCreateParams {
+            session_id: session_id.to_string(),
+            command: "echo".to_string(),
+            args: Some(vec!["hello".to_string()]),
+            env: None,
+            cwd: None,
+            output_byte_limit: None,
+        };
+
+        let terminal_id = manager
+            .create_terminal_with_command(&session_manager, params)
+            .await
+            .unwrap();
+
+        // Start the process
+        {
+            let mut terminals = manager.terminals.write().await;
+            let session = terminals.get_mut(&terminal_id).unwrap();
+
+            let mut cmd = Command::new("echo");
+            cmd.arg("hello")
+                .current_dir(&session.working_dir)
+                .envs(&session.environment)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+
+            let child = cmd.spawn().unwrap();
+            session.process = Some(Arc::new(RwLock::new(child)));
+            *session.state.write().await = TerminalState::Running;
+        }
+
+        // Wait for exit
+        let wait_params = TerminalOutputParams {
+            session_id: session_id.to_string(),
+            terminal_id: terminal_id.clone(),
+        };
+
+        let result = manager.wait_for_exit(&session_manager, wait_params).await;
+        assert!(result.is_ok());
+        let status = result.unwrap();
+        assert_eq!(status.exit_code, Some(0));
+        assert_eq!(status.signal, None);
+
+        // Verify terminal state is finished
+        let terminals = manager.terminals.read().await;
+        let session = terminals.get(&terminal_id).unwrap();
+        let state = session.get_state().await;
+        assert_eq!(state, TerminalState::Finished);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_wait_for_exit_calls() {
+        let manager = Arc::new(TerminalManager::new());
+        let session_manager = Arc::new(create_test_session_manager().await);
+
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let session_id = session_manager.create_session(cwd).unwrap();
+
+        let params = TerminalCreateParams {
+            session_id: session_id.to_string(),
+            command: "sleep".to_string(),
+            args: Some(vec!["1".to_string()]),
+            env: None,
+            cwd: None,
+            output_byte_limit: None,
+        };
+
+        let terminal_id = manager
+            .create_terminal_with_command(&session_manager, params)
+            .await
+            .unwrap();
+
+        // Start the process
+        {
+            let mut terminals = manager.terminals.write().await;
+            let session = terminals.get_mut(&terminal_id).unwrap();
+
+            let mut cmd = Command::new("sleep");
+            cmd.arg("1")
+                .current_dir(&session.working_dir)
+                .envs(&session.environment)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+
+            let child = cmd.spawn().unwrap();
+            session.process = Some(Arc::new(RwLock::new(child)));
+            *session.state.write().await = TerminalState::Running;
+        }
+
+        // Create two concurrent wait calls
+        let wait_params1 = TerminalOutputParams {
+            session_id: session_id.to_string(),
+            terminal_id: terminal_id.clone(),
+        };
+        let wait_params2 = TerminalOutputParams {
+            session_id: session_id.to_string(),
+            terminal_id: terminal_id.clone(),
+        };
+
+        let manager_clone = manager.clone();
+        let session_manager_clone = session_manager.clone();
+
+        let wait1 =
+            tokio::spawn(
+                async move { manager.wait_for_exit(&session_manager, wait_params1).await },
+            );
+
+        let wait2 = tokio::spawn(async move {
+            manager_clone
+                .wait_for_exit(&session_manager_clone, wait_params2)
+                .await
+        });
+
+        // Both should succeed
+        let result1 = wait1.await.unwrap();
+        let result2 = wait2.await.unwrap();
+
+        assert!(result1.is_ok());
+        assert!(result2.is_ok());
+
+        let status1 = result1.unwrap();
+        let status2 = result2.unwrap();
+
+        assert_eq!(status1.exit_code, Some(0));
+        assert_eq!(status2.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_exit_on_released_terminal() {
+        let manager = TerminalManager::new();
+        let session_manager = create_test_session_manager().await;
+
+        let (session_id, terminal_id) = create_terminal_for_testing(&manager, &session_manager)
+            .await
+            .unwrap();
+
+        // Release the terminal
+        let release_params = TerminalReleaseParams {
+            session_id: session_id.clone(),
+            terminal_id: terminal_id.clone(),
+        };
+
+        manager
+            .release_terminal(&session_manager, release_params)
+            .await
+            .unwrap();
+
+        // Try to wait for exit on released terminal
+        let wait_params = TerminalOutputParams {
+            session_id,
+            terminal_id,
+        };
+
+        let result = manager.wait_for_exit(&session_manager, wait_params).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Terminal not found"));
+    }
+
+    #[tokio::test]
+    async fn test_kill_then_wait_for_exit() {
+        let manager = TerminalManager::new();
+        let session_manager = create_test_session_manager().await;
+
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let session_id = session_manager.create_session(cwd).unwrap();
+
+        let params = TerminalCreateParams {
+            session_id: session_id.to_string(),
+            command: "sleep".to_string(),
+            args: Some(vec!["30".to_string()]),
+            env: None,
+            cwd: None,
+            output_byte_limit: None,
+        };
+
+        let terminal_id = manager
+            .create_terminal_with_command(&session_manager, params)
+            .await
+            .unwrap();
+
+        // Start the process
+        {
+            let mut terminals = manager.terminals.write().await;
+            let session = terminals.get_mut(&terminal_id).unwrap();
+
+            let mut cmd = Command::new("sleep");
+            cmd.arg("30")
+                .current_dir(&session.working_dir)
+                .envs(&session.environment)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+
+            let child = cmd.spawn().unwrap();
+            session.process = Some(Arc::new(RwLock::new(child)));
+            *session.state.write().await = TerminalState::Running;
+        }
+
+        // Kill the process
+        let kill_params = TerminalOutputParams {
+            session_id: session_id.to_string(),
+            terminal_id: terminal_id.clone(),
+        };
+
+        let kill_result = manager.kill_terminal(&session_manager, kill_params).await;
+        assert!(kill_result.is_ok());
+
+        // Wait for exit should return cached exit status
+        let wait_params = TerminalOutputParams {
+            session_id: session_id.to_string(),
+            terminal_id: terminal_id.clone(),
+        };
+
+        let wait_result = manager.wait_for_exit(&session_manager, wait_params).await;
+        assert!(wait_result.is_ok());
+        let status = wait_result.unwrap();
+
+        // Process was killed, so should have exit status set
+        assert!(status.exit_code.is_some() || status.signal.is_some());
+
+        // Verify terminal state is killed
+        let terminals = manager.terminals.read().await;
+        let session = terminals.get(&terminal_id).unwrap();
+        let state = session.get_state().await;
+        assert_eq!(state, TerminalState::Killed);
     }
 }

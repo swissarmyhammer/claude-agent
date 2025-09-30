@@ -2948,15 +2948,18 @@ impl Agent for ClaudeAgent {
             }
 
             // Parse and validate parameters
-            let params_value: serde_json::Value =
-                serde_json::from_str(request.params.get()).map_err(|e| {
+            let params_value: serde_json::Value = serde_json::from_str(request.params.get())
+                .map_err(|e| {
                     tracing::error!("Failed to parse terminal/wait_for_exit parameters: {}", e);
                     agent_client_protocol::Error::invalid_params()
                 })?;
 
             let params: crate::terminal_manager::TerminalOutputParams =
                 serde_json::from_value(params_value).map_err(|e| {
-                    tracing::error!("Failed to deserialize terminal/wait_for_exit parameters: {}", e);
+                    tracing::error!(
+                        "Failed to deserialize terminal/wait_for_exit parameters: {}",
+                        e
+                    );
                     agent_client_protocol::Error::invalid_params()
                 })?;
 
@@ -2996,8 +2999,8 @@ impl Agent for ClaudeAgent {
             }
 
             // Parse and validate parameters
-            let params_value: serde_json::Value =
-                serde_json::from_str(request.params.get()).map_err(|e| {
+            let params_value: serde_json::Value = serde_json::from_str(request.params.get())
+                .map_err(|e| {
                     tracing::error!("Failed to parse terminal/kill parameters: {}", e);
                     agent_client_protocol::Error::invalid_params()
                 })?;
