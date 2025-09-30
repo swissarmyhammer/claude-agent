@@ -2428,6 +2428,32 @@ impl Agent for ClaudeAgent {
         // Parse session ID
         let session_id = self.parse_session_id(&request.session_id)?;
 
+        // ACP requires user message chunk updates for conversation transparency:
+        // 1. Echo user input via session/update with user_message_chunk
+        // 2. Send before agent processing begins
+        // 3. Include all content blocks from user prompt
+        // 4. Maintain conversation flow visibility for clients
+        // 5. Support conversation history reconstruction
+        //
+        // User message chunks provide consistent conversation reporting.
+        for content_block in &request.prompt {
+            let notification = SessionNotification {
+                session_id: request.session_id.clone(),
+                update: SessionUpdate::UserMessageChunk {
+                    content: content_block.clone(),
+                },
+                meta: None,
+            };
+
+            if let Err(e) = self.send_session_update(notification).await {
+                tracing::warn!(
+                    "Failed to send user message chunk for session {}: {}",
+                    request.session_id,
+                    e
+                );
+            }
+        }
+
         // Send initial analysis thought
         let analysis_thought = AgentThought::new(
             ReasoningPhase::PromptAnalysis,
@@ -6963,5 +6989,94 @@ mod tests {
 
         let result = agent.handle_terminal_output(output_params).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_user_message_chunks_sent_on_prompt() {
+        let config = AgentConfig::default();
+        let (agent, _notification_receiver) = ClaudeAgent::new(config).await.unwrap();
+        let agent = Arc::new(agent);
+
+        let init_request = InitializeRequest {
+            protocol_version: agent_client_protocol::V1,
+            client_capabilities: agent_client_protocol::ClientCapabilities {
+                fs: agent_client_protocol::FileSystemCapability {
+                    read_text_file: true,
+                    write_text_file: true,
+                    meta: None,
+                },
+                terminal: true,
+                meta: Some(serde_json::json!({"streaming": false})),
+            },
+            meta: Some(serde_json::json!({"test": true})),
+        };
+        agent.initialize(init_request).await.unwrap();
+
+        let mut notification_receiver = agent.notification_sender.sender.subscribe();
+
+        let new_request = NewSessionRequest {
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![],
+            meta: Some(serde_json::json!({"test": true})),
+        };
+        let new_response = agent.new_session(new_request).await.unwrap();
+
+        let prompt_request = PromptRequest {
+            session_id: new_response.session_id.clone(),
+            prompt: vec![
+                ContentBlock::Text(TextContent {
+                    text: "test".to_string(),
+                    annotations: None,
+                    meta: None,
+                }),
+                ContentBlock::Text(TextContent {
+                    text: "test2".to_string(),
+                    annotations: None,
+                    meta: None,
+                }),
+            ],
+            meta: Some(serde_json::json!({"test": true})),
+        };
+
+        let agent_clone = Arc::clone(&agent);
+        let prompt_future = async move {
+            agent_clone.prompt(prompt_request).await
+        };
+
+        let collect_notifications = async {
+            let mut user_message_chunks = Vec::new();
+            for _ in 0..2 {
+                match tokio::time::timeout(Duration::from_millis(100), notification_receiver.recv()).await {
+                    Ok(Ok(notification)) => {
+                        if let SessionUpdate::UserMessageChunk { content } = notification.update {
+                            user_message_chunks.push(content);
+                        }
+                    }
+                    Ok(Err(_)) => break,
+                    Err(_) => break,
+                }
+            }
+            user_message_chunks
+        };
+
+        let (user_message_chunks, _prompt_result) = tokio::join!(collect_notifications, prompt_future);
+
+        assert_eq!(
+            user_message_chunks.len(),
+            2,
+            "Should receive 2 user message chunks"
+        );
+
+        if let ContentBlock::Text(ref text_content) = user_message_chunks[0] {
+            assert_eq!(text_content.text, "test");
+        } else {
+            panic!("First chunk should be text content");
+        }
+
+        if let ContentBlock::Text(ref text_content) = user_message_chunks[1] {
+            assert_eq!(text_content.text, "test2");
+        } else {
+            panic!("Second chunk should be text content");
+        }
     }
 }
