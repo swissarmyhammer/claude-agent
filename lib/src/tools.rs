@@ -812,7 +812,10 @@ impl ToolCallHandler {
 
         // Evaluate permission policy for this tool call (unless auto-approved)
         let policy_evaluation = if is_auto_approved {
-            tracing::debug!("Tool call auto-approved by legacy permissions: {}", request.name);
+            tracing::debug!(
+                "Tool call auto-approved by legacy permissions: {}",
+                request.name
+            );
             crate::permissions::PolicyEvaluation::Allowed
         } else {
             self.permission_engine
@@ -835,7 +838,8 @@ impl ToolCallHandler {
             crate::permissions::PolicyEvaluation::RequireUserConsent { options } => {
                 // Policy requires user consent - create permission request
                 tracing::info!("Tool call requires user consent: {}", request.name);
-                let description = self.generate_permission_reason(&request.name, &request.arguments);
+                let description =
+                    self.generate_permission_reason(&request.name, &request.arguments);
                 let permission_request = EnhancedPermissionRequest {
                     session_id: session_id.0.to_string(),
                     tool_request_id: request.id.clone(),
@@ -3900,7 +3904,8 @@ mod tests {
             forbidden_paths: vec![],
         };
         let permission_engine = create_test_permission_engine();
-        let mut handler = ToolCallHandler::new(permissions, session_manager.clone(), permission_engine);
+        let mut handler =
+            ToolCallHandler::new(permissions, session_manager.clone(), permission_engine);
 
         // Set client capabilities for file operations
         let capabilities = agent_client_protocol::ClientCapabilities {
@@ -3969,7 +3974,8 @@ mod tests {
             forbidden_paths: vec![],
         };
         let permission_engine = create_test_permission_engine();
-        let mut handler = ToolCallHandler::new(permissions, session_manager.clone(), permission_engine);
+        let mut handler =
+            ToolCallHandler::new(permissions, session_manager.clone(), permission_engine);
 
         // Set client capabilities for file operations
         let capabilities = agent_client_protocol::ClientCapabilities {
@@ -4053,7 +4059,8 @@ mod tests {
             forbidden_paths: vec![],
         };
         let permission_engine = create_test_permission_engine();
-        let mut handler = ToolCallHandler::new(permissions, session_manager.clone(), permission_engine);
+        let mut handler =
+            ToolCallHandler::new(permissions, session_manager.clone(), permission_engine);
 
         // Set client capabilities for file operations
         let capabilities = agent_client_protocol::ClientCapabilities {

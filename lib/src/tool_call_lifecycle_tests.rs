@@ -12,7 +12,8 @@ mod tests {
     use serde_json::json;
     use tokio::sync::broadcast;
 
-    fn create_test_permission_engine() -> std::sync::Arc<crate::permissions::PermissionPolicyEngine> {
+    fn create_test_permission_engine() -> std::sync::Arc<crate::permissions::PermissionPolicyEngine>
+    {
         use crate::permissions::{FilePermissionStorage, PermissionPolicyEngine};
         let temp_dir = tempfile::tempdir().unwrap();
         let storage = FilePermissionStorage::new(temp_dir.path().to_path_buf());

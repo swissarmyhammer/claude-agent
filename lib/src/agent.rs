@@ -2028,6 +2028,14 @@ impl ClaudeAgent {
 
 #[async_trait::async_trait(?Send)]
 impl Agent for ClaudeAgent {
+    // ACP AGENT PROTOCOL FLOW WITHOUT AUTHENTICATION:
+    // 1. Client sends initialize request
+    // 2. Agent responds with capabilities and authMethods: []
+    // 3. Client can immediately call session/new (no auth step)
+    // 4. Normal session operations proceed without authentication
+    //
+    // This is the correct flow for local development tools.
+
     async fn initialize(
         &self,
         request: InitializeRequest,
@@ -7039,9 +7047,7 @@ mod tests {
         };
 
         let agent_clone = Arc::clone(&agent);
-        let prompt_future = async move {
-            agent_clone.prompt(prompt_request).await
-        };
+        let prompt_future = async move { agent_clone.prompt(prompt_request).await };
 
         let collect_notifications = async {
             let mut user_message_chunks = Vec::new();
@@ -7051,7 +7057,9 @@ mod tests {
             let max_duration = Duration::from_secs(5);
 
             while user_message_chunks.len() < 2 && start.elapsed() < max_duration {
-                match tokio::time::timeout(Duration::from_millis(100), notification_receiver.recv()).await {
+                match tokio::time::timeout(Duration::from_millis(100), notification_receiver.recv())
+                    .await
+                {
                     Ok(Ok(notification)) => {
                         if let SessionUpdate::UserMessageChunk { content } = notification.update {
                             user_message_chunks.push(content);
@@ -7068,7 +7076,8 @@ mod tests {
             user_message_chunks
         };
 
-        let (user_message_chunks, _prompt_result) = tokio::join!(collect_notifications, prompt_future);
+        let (user_message_chunks, _prompt_result) =
+            tokio::join!(collect_notifications, prompt_future);
 
         assert_eq!(
             user_message_chunks.len(),

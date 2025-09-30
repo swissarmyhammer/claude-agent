@@ -6,7 +6,11 @@ use tokio_stream::{Stream, StreamExt};
 
 use std::time::SystemTime;
 
-use crate::{config::ClaudeConfig, error::Result, session::{MessageRole, SessionId}};
+use crate::{
+    config::ClaudeConfig,
+    error::Result,
+    session::{MessageRole, SessionId},
+};
 
 /// Claude client wrapper with session management
 pub struct ClaudeClient {
