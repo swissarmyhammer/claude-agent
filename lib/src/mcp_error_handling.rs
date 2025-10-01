@@ -72,13 +72,14 @@ impl EnhancedMcpServerManager {
                     // Step 2: Attempt connection with comprehensive error handling
                     match self.connect_server_enhanced(config).await {
                         Ok(connection) => {
+                            let connection_name = connection.name.clone();
                             tracing::info!(
                                 "Successfully connected to MCP server: {} with {} tools",
-                                connection.name,
+                                connection_name,
                                 connection.tools.len()
                             );
                             let mut connections = self.connections.write().await;
-                            connections.insert(connection.name.clone(), connection);
+                            connections.insert(connection_name, connection);
                             results.insert(server_name, Ok("Connected successfully".to_string()));
                         }
                         Err(e) => {
@@ -358,7 +359,7 @@ impl EnhancedMcpServerManager {
         // Test connection and initialize protocol
         let session_id = Arc::new(RwLock::new(None));
         let tools = self
-            .initialize_http_mcp_protocol_enhanced(&client, http_config, session_id.clone())
+            .initialize_http_mcp_protocol_enhanced(&client, http_config, Arc::clone(&session_id))
             .await?;
 
         let transport = TransportConnection::Http {

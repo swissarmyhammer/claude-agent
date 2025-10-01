@@ -69,14 +69,16 @@ impl McpServerManager {
     /// Connect to all configured MCP servers
     pub async fn connect_servers(&mut self, configs: Vec<McpServerConfig>) -> crate::Result<()> {
         for config in configs {
-            match self.connect_server(config.clone()).await {
+            let config_name = config.name().to_string();
+            match self.connect_server(config).await {
                 Ok(connection) => {
-                    tracing::info!("Connected to MCP server: {}", connection.name);
+                    let connection_name = connection.name.clone();
+                    tracing::info!("Connected to MCP server: {}", connection_name);
                     let mut connections = self.connections.write().await;
-                    connections.insert(connection.name.clone(), connection);
+                    connections.insert(connection_name, connection);
                 }
                 Err(e) => {
-                    tracing::error!("Failed to connect to MCP server {}: {}", config.name(), e);
+                    tracing::error!("Failed to connect to MCP server {}: {}", config_name, e);
                     // Continue with other servers instead of failing completely
                 }
             }
@@ -181,7 +183,7 @@ impl McpServerManager {
                 // Initialize MCP connection via HTTP
                 let session_id = Arc::new(RwLock::new(None));
                 let tools = self
-                    .initialize_http_mcp_connection(&client, http_config, session_id.clone())
+                    .initialize_http_mcp_connection(&client, http_config, Arc::clone(&session_id))
                     .await?;
 
                 let transport = TransportConnection::Http {
