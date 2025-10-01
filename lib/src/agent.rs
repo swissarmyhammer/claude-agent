@@ -1955,7 +1955,7 @@ impl ClaudeAgent {
             "Generated {} available commands for session {} (mcp: {}, tool_handler: {})",
             commands.len(),
             session_id,
-            self.mcp_manager.as_ref().map_or(0, |_| commands.iter().filter(|c| c.meta.as_ref().and_then(|m| m.get("source")).and_then(|s| s.as_str()) == Some("mcp_server")).count()),
+            if self.mcp_manager.is_some() { commands.iter().filter(|c| c.meta.as_ref().and_then(|m| m.get("source")).and_then(|s| s.as_str()) == Some("mcp_server")).count() } else { 0 },
             commands.iter().filter(|c| c.meta.as_ref().and_then(|m| m.get("source")).and_then(|s| s.as_str()) == Some("tool_handler")).count()
         );
         commands
@@ -3119,6 +3119,97 @@ impl Agent for ClaudeAgent {
             self.handle_terminal_kill(params).await?;
 
             // Return null result per ACP specification
+            let response_json = serde_json::Value::Null;
+            let raw_value = RawValue::from_string(response_json.to_string())
+                .map_err(|_e| agent_client_protocol::Error::internal_error())?;
+
+            return Ok(Arc::from(raw_value));
+        }
+
+        // Handle editor/update_buffers extension method
+        //
+        // This extension method allows clients to push editor buffer state to the agent,
+        // enabling the agent to access unsaved file content when executing tools that read files.
+        //
+        // ## Protocol Integration
+        //
+        // This implements the ACP (Agent-Client Protocol) requirement for editor state management.
+        // Clients should proactively push editor state updates when buffers change, allowing the
+        // agent to work with current content rather than stale disk versions.
+        //
+        // ## Parameters
+        //
+        // Expects an `EditorBufferResponse` containing:
+        // - `buffers`: HashMap of absolute file paths to EditorBuffer objects with content and metadata
+        // - `unavailable_paths`: List of paths that don't have active editor buffers
+        //
+        // ## Returns
+        //
+        // Returns null on success per ACP specification for notifications.
+        //
+        // ## Client Usage Example
+        //
+        // ```typescript
+        // await agent.ext_method({
+        //   method: "editor/update_buffers",
+        //   params: {
+        //     buffers: {
+        //       "/path/to/file.rs": {
+        //         path: "/path/to/file.rs",
+        //         content: "fn main() { ... }",
+        //         modified: true,
+        //         last_modified: { secs_since_epoch: 1234567890, nanos_since_epoch: 0 },
+        //         encoding: "UTF-8"
+        //       }
+        //     },
+        //     unavailable_paths: []
+        //   }
+        // });
+        // ```
+        if request.method == "editor/update_buffers".into() {
+            // Note: editorState capability is optional for this method
+            // Clients can push editor state updates without advertising the capability.
+            // This allows for flexible integration where clients proactively send updates.
+            {
+                let client_caps = self.client_capabilities.read().await;
+                match &*client_caps {
+                    Some(caps) if crate::editor_state::supports_editor_state(caps) => {
+                        tracing::debug!("Editor state capability declared and validated");
+                    }
+                    Some(_) | None => {
+                        tracing::debug!(
+                            "Processing editor/update_buffers without declared editorState capability"
+                        );
+                    }
+                }
+            }
+
+            // Parse the request parameters from RawValue
+            let params_value: serde_json::Value = serde_json::from_str(request.params.get())
+                .map_err(|e| {
+                    tracing::error!("Failed to parse editor/update_buffers parameters: {}", e);
+                    agent_client_protocol::Error::invalid_params()
+                })?;
+
+            let response: crate::editor_state::EditorBufferResponse =
+                serde_json::from_value(params_value).map_err(|e| {
+                    tracing::error!(
+                        "Failed to deserialize editor/update_buffers parameters: {}",
+                        e
+                    );
+                    agent_client_protocol::Error::invalid_params()
+                })?;
+
+            // Update the editor state manager cache
+            tracing::info!(
+                "Updating editor buffers cache with {} buffers",
+                response.buffers.len()
+            );
+            self.editor_state_manager
+                .update_buffers_from_response(response)
+                .await;
+
+            // Return success with null result
             let response_json = serde_json::Value::Null;
             let raw_value = RawValue::from_string(response_json.to_string())
                 .map_err(|_e| agent_client_protocol::Error::internal_error())?;
@@ -7603,6 +7694,161 @@ mod tests {
         assert!(
             commands.len() >= core_commands.len() + tool_handler_commands.len(),
             "Total commands should include all sources"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_editor_update_buffers_ext_method() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use std::time::SystemTime;
+
+        let agent = create_test_agent().await;
+
+        // Create editor buffer response
+        let path1 = PathBuf::from("/test/file1.rs");
+        let path2 = PathBuf::from("/test/file2.rs");
+
+        let buffer1 = crate::editor_state::EditorBuffer {
+            path: path1.clone(),
+            content: "fn main() {}".to_string(),
+            modified: true,
+            last_modified: SystemTime::now(),
+            encoding: "UTF-8".to_string(),
+        };
+
+        let buffer2 = crate::editor_state::EditorBuffer {
+            path: path2.clone(),
+            content: "fn test() {}".to_string(),
+            modified: false,
+            last_modified: SystemTime::now(),
+            encoding: "UTF-8".to_string(),
+        };
+
+        let mut buffers = HashMap::new();
+        buffers.insert(path1.clone(), buffer1);
+        buffers.insert(path2.clone(), buffer2);
+
+        let response = crate::editor_state::EditorBufferResponse {
+            buffers,
+            unavailable_paths: vec![],
+        };
+
+        // Create extension method request
+        let params_json = serde_json::to_string(&response).unwrap();
+        let params = RawValue::from_string(params_json).unwrap();
+
+        let request = ExtRequest {
+            method: "editor/update_buffers".to_string().into(),
+            params: Arc::from(params),
+        };
+
+        // Call the extension method
+        let result = agent.ext_method(request).await;
+        if let Err(e) = &result {
+            eprintln!("Extension method failed: {:?}", e);
+        }
+        assert!(result.is_ok(), "Extension method should succeed");
+
+        // Check cache size
+        let cache_size = agent.editor_state_manager.cache_size().await;
+        eprintln!("Cache size after update: {}", cache_size);
+
+        // Verify the buffers were cached
+        let cached1 = agent
+            .editor_state_manager
+            .get_file_content("test", &path1)
+            .await
+            .unwrap();
+        assert!(cached1.is_some(), "Buffer 1 should be cached");
+        assert_eq!(cached1.unwrap().content, "fn main() {}");
+
+        let cached2 = agent
+            .editor_state_manager
+            .get_file_content("test", &path2)
+            .await
+            .unwrap();
+        assert!(cached2.is_some(), "Buffer 2 should be cached");
+        assert_eq!(cached2.unwrap().content, "fn test() {}");
+    }
+
+    #[tokio::test]
+    async fn test_editor_state_end_to_end_workflow() {
+        use std::collections::HashMap;
+        use std::time::SystemTime;
+        use tempfile::TempDir;
+
+        // Create a temporary directory and file
+        let temp_dir = TempDir::new().unwrap();
+        let test_file_path = temp_dir.path().join("test.rs");
+        std::fs::write(&test_file_path, "// Old content on disk").unwrap();
+
+        let agent = create_test_agent().await;
+
+        // Step 1: Client pushes editor buffer state with unsaved changes
+        let buffer = crate::editor_state::EditorBuffer {
+            path: test_file_path.clone(),
+            content: "// New unsaved content in editor".to_string(),
+            modified: true,
+            last_modified: SystemTime::now(),
+            encoding: "UTF-8".to_string(),
+        };
+
+        let mut buffers = HashMap::new();
+        buffers.insert(test_file_path.clone(), buffer);
+
+        let response = crate::editor_state::EditorBufferResponse {
+            buffers,
+            unavailable_paths: vec![],
+        };
+
+        // Send editor/update_buffers extension method
+        let params_json = serde_json::to_string(&response).unwrap();
+        let params = RawValue::from_string(params_json).unwrap();
+
+        let request = ExtRequest {
+            method: "editor/update_buffers".to_string().into(),
+            params: Arc::from(params),
+        };
+
+        let result = agent.ext_method(request).await;
+        assert!(result.is_ok(), "Extension method should succeed");
+
+        // Step 2: Verify the buffer is cached
+        let cached = agent
+            .editor_state_manager
+            .get_file_content("test_session", &test_file_path)
+            .await
+            .unwrap();
+        assert!(cached.is_some(), "Buffer should be cached");
+        assert_eq!(
+            cached.unwrap().content,
+            "// New unsaved content in editor",
+            "Cached content should match editor buffer, not disk content"
+        );
+
+        // Step 3: Verify disk content is different (to prove cache is being used)
+        let disk_content = std::fs::read_to_string(&test_file_path).unwrap();
+        assert_eq!(
+            disk_content, "// Old content on disk",
+            "Disk content should remain unchanged"
+        );
+
+        // Step 4: Simulate a tool reading the file
+        // The tool would use editor_state_manager.get_file_content() which returns cached content
+        let tool_sees_content = agent
+            .editor_state_manager
+            .get_file_content("test_session", &test_file_path)
+            .await
+            .unwrap();
+        assert!(
+            tool_sees_content.is_some(),
+            "Tool should see cached editor content"
+        );
+        assert_eq!(
+            tool_sees_content.unwrap().content,
+            "// New unsaved content in editor",
+            "Tool should see editor buffer content, not disk content"
         );
     }
 }

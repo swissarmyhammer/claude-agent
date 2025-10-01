@@ -160,15 +160,20 @@ impl EditorStateManager {
     /// Get file content, checking editor state first
     ///
     /// Returns:
-    /// - `Ok(Some(buffer))` if an editor buffer is available (from cache or client query)
+    /// - `Ok(Some(buffer))` if an editor buffer is available (from cache)
     /// - `Ok(None)` if no editor buffer is available (file not open in editor)
-    /// - `Err(_)` if the client query failed
     ///
     /// # ACP Compliance
     ///
     /// This method implements the ACP requirement to access unsaved editor state
     /// before falling back to disk content. It ensures agents work with current,
     /// not stale, file content.
+    ///
+    /// # Client Integration
+    ///
+    /// Clients should proactively push editor state updates via the
+    /// `editor/update_buffers` extension method. The agent maintains a cache
+    /// of editor buffers that have been pushed by the client.
     pub async fn get_file_content(
         &self,
         _session_id: &str,
@@ -182,11 +187,45 @@ impl EditorStateManager {
 
         tracing::trace!("Editor buffer cache miss for: {}", path.display());
 
-        // Query client for editor buffer
-        // TODO: Implement actual client communication when protocol is extended
-        // For now, return None to indicate editor buffer not available
-        // This allows graceful fallback to disk reads while the protocol is being developed
+        // Return None to indicate editor buffer not available in cache
+        // Clients can proactively push updates via editor/update_buffers
         Ok(None)
+    }
+
+    /// Update cached buffers from client response
+    ///
+    /// This method processes an `EditorBufferResponse` from the client and
+    /// updates the internal cache with the provided buffers. This is typically
+    /// called when handling the `editor/update_buffers` extension method.
+    ///
+    /// # Arguments
+    ///
+    /// * `response` - The editor buffer response containing buffers to cache
+    ///
+    /// # Behavior
+    ///
+    /// - All buffers in the response are cached with the current timestamp
+    /// - Existing cached buffers for the same paths are replaced
+    /// - Unavailable paths are not cached (they remain as cache misses)
+    pub async fn update_buffers_from_response(&self, response: EditorBufferResponse) {
+        let now = SystemTime::now();
+        let mut cache = self.buffer_cache.write().await;
+
+        for (path, buffer) in response.buffers {
+            tracing::debug!("Caching editor buffer for: {}", path.display());
+            cache.insert(
+                path,
+                CachedBuffer {
+                    buffer,
+                    cached_at: now,
+                },
+            );
+        }
+
+        for path in response.unavailable_paths {
+            tracing::debug!("Removing unavailable buffer from cache: {}", path.display());
+            cache.remove(&path);
+        }
     }
 
     /// Get cached buffer if still valid
@@ -442,5 +481,63 @@ mod tests {
         };
 
         assert!(!supports_editor_state(&capabilities));
+    }
+
+    #[tokio::test]
+    async fn test_update_buffers_from_client() {
+        let manager = EditorStateManager::new();
+        let path1 = PathBuf::from("/test/file1.rs");
+        let path2 = PathBuf::from("/test/file2.rs");
+
+        let buffer1 = EditorBuffer {
+            path: path1.clone(),
+            content: "content 1".to_string(),
+            modified: true,
+            last_modified: SystemTime::now(),
+            encoding: "UTF-8".to_string(),
+        };
+
+        let buffer2 = EditorBuffer {
+            path: path2.clone(),
+            content: "content 2".to_string(),
+            modified: false,
+            last_modified: SystemTime::now(),
+            encoding: "UTF-8".to_string(),
+        };
+
+        let mut buffers = HashMap::new();
+        buffers.insert(path1.clone(), buffer1);
+        buffers.insert(path2.clone(), buffer2);
+
+        let response = EditorBufferResponse {
+            buffers,
+            unavailable_paths: vec![],
+        };
+
+        manager.update_buffers_from_response(response).await;
+
+        assert_eq!(manager.cache_size().await, 2);
+        assert!(manager.get_cached_buffer(&path1).await.is_some());
+        assert!(manager.get_cached_buffer(&path2).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_file_content_with_client_pushed_cache() {
+        let manager = EditorStateManager::new();
+        let path = PathBuf::from("/test/file.rs");
+
+        let buffer = EditorBuffer {
+            path: path.clone(),
+            content: "cached content".to_string(),
+            modified: true,
+            last_modified: SystemTime::now(),
+            encoding: "UTF-8".to_string(),
+        };
+
+        manager.cache_buffer(path.clone(), buffer).await;
+
+        let result = manager.get_file_content("sess_123", &path).await.unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().content, "cached content");
     }
 }
