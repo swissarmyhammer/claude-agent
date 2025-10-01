@@ -239,7 +239,7 @@ mod tests {
 
     // Helper functions to create test content blocks
     mod content_blocks {
-        use agent_client_protocol::{AudioContent, ContentBlock, EmbeddedResource, ImageContent, ResourceLink, TextContent};
+        use agent_client_protocol::{AudioContent, ContentBlock, ImageContent, ResourceLink, TextContent};
         
         pub fn text(content: &str) -> ContentBlock {
             ContentBlock::Text(TextContent {
@@ -278,19 +278,7 @@ mod tests {
             audio("audio/wav", VALID_WAV_BASE64)
         }
         
-        pub fn resource_link(uri: &str, name: &str) -> ContentBlock {
-            ContentBlock::ResourceLink(ResourceLink {
-                uri: uri.to_string(),
-                name: name.to_string(),
-                description: None,
-                mime_type: None,
-                title: None,
-                size: None,
-                annotations: None,
-                meta: None,
-            })
-        }
-        
+
         pub fn resource_link_full(
             uri: &str,
             name: &str,
@@ -311,19 +299,7 @@ mod tests {
             })
         }
         
-        pub fn embedded_resource(uri: &str, mime_type: &str, data: &str) -> ContentBlock {
-            let resource_data = serde_json::json!({
-                "uri": uri,
-                "mimeType": mime_type,
-                "text": data
-            });
-            let embedded_resource = EmbeddedResource {
-                resource: serde_json::from_value(resource_data).unwrap(),
-                annotations: None,
-                meta: None,
-            };
-            ContentBlock::Resource(embedded_resource)
-        }
+
     }
 
 

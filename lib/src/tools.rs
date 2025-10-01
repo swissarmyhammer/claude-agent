@@ -304,6 +304,12 @@ impl ToolCallHandler {
         }
     }
 
+    /// Get a read-only snapshot of all active tool calls
+    pub async fn get_active_tool_calls(&self) -> HashMap<String, ToolCallReport> {
+        let active_calls = self.active_tool_calls.read().await;
+        active_calls.clone()
+    }
+
     /// Create and track a new tool call report with ACP-compliant session notification
     pub async fn create_tool_call_report(
         &self,
@@ -315,7 +321,7 @@ impl ToolCallHandler {
         let title = ToolCallReport::generate_title(tool_name, arguments);
         let kind = ToolKind::classify_tool(tool_name, arguments);
 
-        let mut report = ToolCallReport::new(tool_call_id.clone(), title, kind);
+        let mut report = ToolCallReport::new(tool_call_id.clone(), title, kind, tool_name.to_string());
         report.set_raw_input(arguments.clone());
 
         // Extract and add file locations for ACP follow-along features
@@ -3656,6 +3662,7 @@ mod tests {
             "call_test123".to_string(),
             "Test operation".to_string(),
             ToolKind::Think,
+            "test_tool".to_string(),
         );
 
         assert_eq!(report.kind, ToolKind::Think);
@@ -3824,6 +3831,7 @@ mod tests {
             "call_test123".to_string(),
             "Test operation".to_string(),
             ToolKind::Edit,
+            "test_tool".to_string(),
         );
 
         // Add file locations

@@ -136,6 +136,9 @@ pub struct ToolCallReport {
     /// The raw output returned by the tool
     #[serde(rename = "rawOutput", skip_serializing_if = "Option::is_none")]
     pub raw_output: Option<serde_json::Value>,
+    /// The actual tool name (e.g., "Read", "Write", "Bash")
+    #[serde(skip)]
+    pub tool_name: String,
     /// Shadow copy of the last state sent in an update (for change detection)
     ///
     /// ACP partial updates optimize bandwidth by only sending changed fields.
@@ -146,7 +149,7 @@ pub struct ToolCallReport {
 
 impl ToolCallReport {
     /// Create a new tool call report
-    pub fn new(tool_call_id: String, title: String, kind: ToolKind) -> Self {
+    pub fn new(tool_call_id: String, title: String, kind: ToolKind, tool_name: String) -> Self {
         Self {
             tool_call_id,
             title,
@@ -156,6 +159,7 @@ impl ToolCallReport {
             locations: Vec::new(),
             raw_input: None,
             raw_output: None,
+            tool_name,
             previous_state: None,
         }
     }
@@ -660,6 +664,7 @@ mod tests {
             "test_id".to_string(),
             "Test Tool".to_string(),
             ToolKind::Read,
+            "Read".to_string(),
         );
 
         let location = ToolCallLocation {
@@ -679,6 +684,7 @@ mod tests {
             "test_id".to_string(),
             "Reading file".to_string(),
             ToolKind::Read,
+            "Read".to_string(),
         );
 
         report.add_location(ToolCallLocation {
@@ -701,6 +707,7 @@ mod tests {
             "test_id".to_string(),
             "Writing file".to_string(),
             ToolKind::Edit,
+            "test_tool".to_string(),
         );
 
         report.add_location(ToolCallLocation {
@@ -931,6 +938,7 @@ mod tests {
             "test_multi_content".to_string(),
             "Multi-content test".to_string(),
             ToolKind::Edit,
+            "test_tool".to_string(),
         );
 
         report.add_content(ToolCallContent::Content {
@@ -1027,6 +1035,7 @@ mod tests {
             "test_empty_content".to_string(),
             "No content test".to_string(),
             ToolKind::Think,
+            "test_tool".to_string(),
         );
 
         let acp_call = report.to_acp_tool_call();
@@ -1044,6 +1053,7 @@ mod tests {
             "test_001".to_string(),
             "Test Tool".to_string(),
             ToolKind::Read,
+            "test_tool".to_string(),
         );
 
         let update = report.to_acp_tool_call_update();
@@ -1064,6 +1074,7 @@ mod tests {
             "test_002".to_string(),
             "Test Tool".to_string(),
             ToolKind::Read,
+            "test_tool".to_string(),
         );
 
         // Mark initial state as sent
@@ -1097,6 +1108,7 @@ mod tests {
             "test_003".to_string(),
             "Test Tool".to_string(),
             ToolKind::Execute,
+            "test_tool".to_string(),
         );
 
         // Mark initial state as sent
@@ -1135,6 +1147,7 @@ mod tests {
             "test_004".to_string(),
             "Test Tool".to_string(),
             ToolKind::Edit,
+            "test_tool".to_string(),
         );
 
         // Mark initial state as sent
@@ -1174,6 +1187,7 @@ mod tests {
             "test_005".to_string(),
             "Test Tool".to_string(),
             ToolKind::Search,
+            "test_tool".to_string(),
         );
 
         // Mark initial state as sent
@@ -1199,6 +1213,7 @@ mod tests {
             "test_006".to_string(),
             "Test Tool".to_string(),
             ToolKind::Read,
+            "test_tool".to_string(),
         );
 
         // Mark initial state as sent
@@ -1232,6 +1247,7 @@ mod tests {
             "test_007".to_string(),
             "Original Title".to_string(),
             ToolKind::Edit,
+            "test_tool".to_string(),
         );
 
         // Mark initial state as sent
@@ -1262,6 +1278,7 @@ mod tests {
             "test_008".to_string(),
             "Test Tool".to_string(),
             ToolKind::Execute,
+            "test_tool".to_string(),
         );
 
         // Mark initial state as sent
@@ -1292,6 +1309,7 @@ mod tests {
             "test_009".to_string(),
             "Test Tool".to_string(),
             ToolKind::Execute,
+            "test_tool".to_string(),
         );
 
         // Add content

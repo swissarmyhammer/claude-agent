@@ -13,17 +13,8 @@ mod tests {
     const VALID_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
     const VALID_WAV_BASE64: &str = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAAA";
     const MALICIOUS_PE_BASE64: &str = "TVqQAAMAAAAEAAAA//8AALgAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    const MALICIOUS_ELF_BASE64: &str = "f0VMRgIBAQAAAAAAAAAAAA==";
-    
+
     // Helper functions to create content blocks
-    fn text(content: &str) -> ContentBlock {
-        ContentBlock::Text(TextContent {
-            text: content.to_string(),
-            annotations: None,
-            meta: None,
-        })
-    }
-    
     fn image(mime_type: &str, data: &str) -> ContentBlock {
         ContentBlock::Image(ImageContent {
             data: data.to_string(),
@@ -34,10 +25,7 @@ mod tests {
         })
     }
     
-    fn image_png() -> ContentBlock {
-        image("image/png", VALID_PNG_BASE64)
-    }
-    
+
     fn audio(mime_type: &str, data: &str) -> ContentBlock {
         ContentBlock::Audio(agent_client_protocol::AudioContent {
             data: data.to_string(),
@@ -51,18 +39,6 @@ mod tests {
         audio("audio/wav", VALID_WAV_BASE64)
     }
     
-    fn resource_link(uri: &str, name: &str) -> ContentBlock {
-        ContentBlock::ResourceLink(ResourceLink {
-            uri: uri.to_string(),
-            name: name.to_string(),
-            description: None,
-            mime_type: None,
-            title: None,
-            size: None,
-            annotations: None,
-            meta: None,
-        })
-    }
 
     /// Create a ContentBlockProcessor with strict security validation
     fn create_strict_secure_processor() -> ContentBlockProcessor {

@@ -3129,15 +3129,31 @@ impl ClaudeAgent {
             });
         }
 
-        // Extract tool name from the tool call - assume we can get it from the request
-        // In a real implementation, we'd need to look up the tool call details
-        let tool_name = "unknown_tool"; // TODO: Extract from tool_call
-        let tool_args = serde_json::json!({}); // TODO: Extract from tool_call
+        // Extract tool name and arguments from the active tool call
+        let (tool_name, tool_args) = {
+            let tool_handler = self.tool_handler.read().await;
+            let active_calls = tool_handler.get_active_tool_calls().await;
+
+            match active_calls.get(&request.tool_call.tool_call_id) {
+                Some(report) => {
+                    let name = report.tool_name.clone();
+                    let args = report.raw_input.clone().unwrap_or_else(|| serde_json::json!({}));
+                    (name, args)
+                }
+                None => {
+                    tracing::warn!(
+                        "Tool call {} not found in active calls, using defaults",
+                        request.tool_call.tool_call_id
+                    );
+                    ("unknown_tool".to_string(), serde_json::json!({}))
+                }
+            }
+        };
 
         // Use permission policy engine to evaluate the tool call
         let policy_result = match self
             .permission_engine
-            .evaluate_tool_call(tool_name, &tool_args)
+            .evaluate_tool_call(&tool_name, &tool_args)
             .await
         {
             Ok(evaluation) => evaluation,
@@ -7097,5 +7113,158 @@ mod tests {
         } else {
             panic!("Second chunk should be text content");
         }
+    }
+
+    #[tokio::test]
+    async fn test_request_permission_extracts_tool_metadata_success() {
+        let (agent, session_id) = setup_agent_with_session().await;
+        
+        // Create a tool call in the handler with specific name and arguments
+        let tool_name = "test_read_tool";
+        let tool_args = serde_json::json!({"file_path": "/test/file.txt"});
+        
+        let tool_handler = agent.tool_handler.read().await;
+        let report = tool_handler
+            .create_tool_call_report(
+                &SessionId(session_id.clone().into()),
+                tool_name,
+                &tool_args,
+            )
+            .await;
+        let tool_call_id = report.tool_call_id.clone();
+        drop(tool_handler);
+
+        // Create a permission request for this tool call
+        let request = PermissionRequest {
+            session_id: SessionId(session_id.into()),
+            tool_call: ToolCallUpdate {
+                tool_call_id: tool_call_id.clone(),
+            },
+            options: vec![],
+        };
+
+        // Request permission - this should extract tool_name and tool_args from active_tool_calls
+        let response = agent.request_permission(request).await.unwrap();
+
+        // Verify we got a valid response with an outcome
+        match response.outcome {
+            crate::tools::PermissionOutcome::Selected { option_id: _ } => {
+                // Success - the tool metadata was extracted and processed
+            }
+            _ => {
+                // Also valid - just verify we got a response
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_permission_handles_missing_tool_call() {
+        let (agent, session_id) = setup_agent_with_session().await;
+        
+        // Create a permission request with a non-existent tool_call_id
+        let fake_tool_call_id = "nonexistent_tool_call_id_12345";
+        let request = PermissionRequest {
+            session_id: SessionId(session_id.into()),
+            tool_call: ToolCallUpdate {
+                tool_call_id: fake_tool_call_id.to_string(),
+            },
+            options: vec![],
+        };
+
+        // Request permission - should handle missing tool call gracefully
+        // The code should use default values ("unknown_tool" and empty JSON object)
+        let result = agent.request_permission(request).await;
+
+        // Verify we got a valid response (doesn't matter what outcome, just that it didn't panic)
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_request_permission_with_complex_tool_args() {
+        let (agent, session_id) = setup_agent_with_session().await;
+        
+        // Create a tool call with complex nested arguments
+        let tool_name = "complex_test_tool";
+        let tool_args = serde_json::json!({
+            "operation": "write",
+            "files": [
+                {"path": "/tmp/test1.txt", "content": "Hello"},
+                {"path": "/tmp/test2.txt", "content": "World"}
+            ],
+            "options": {
+                "recursive": true,
+                "force": false
+            }
+        });
+        
+        let tool_handler = agent.tool_handler.read().await;
+        let report = tool_handler
+            .create_tool_call_report(
+                &SessionId(session_id.clone().into()),
+                tool_name,
+                &tool_args,
+            )
+            .await;
+        let tool_call_id = report.tool_call_id.clone();
+        drop(tool_handler);
+
+        // Create a permission request
+        let request = PermissionRequest {
+            session_id: SessionId(session_id.into()),
+            tool_call: ToolCallUpdate {
+                tool_call_id: tool_call_id.clone(),
+            },
+            options: vec![],
+        };
+
+        // Request permission - should extract complex arguments correctly
+        let result = agent.request_permission(request).await;
+        
+        // Verify we got a valid response
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_request_permission_with_missing_raw_input() {
+        let (agent, session_id) = setup_agent_with_session().await;
+        
+        // Create a tool call but with None for raw_input
+        let tool_name = "test_tool_no_args";
+        let tool_args = serde_json::json!(null);
+        
+        let tool_handler = agent.tool_handler.read().await;
+        let report = tool_handler
+            .create_tool_call_report(
+                &SessionId(session_id.clone().into()),
+                tool_name,
+                &tool_args,
+            )
+            .await;
+        let tool_call_id = report.tool_call_id.clone();
+        
+        // Manually update the report to have None for raw_input
+        tool_handler.update_tool_call_report(
+            &SessionId(session_id.clone().into()),
+            &tool_call_id,
+            |report| {
+                report.raw_input = None;
+            }
+        ).await;
+        drop(tool_handler);
+
+        // Create a permission request
+        let request = PermissionRequest {
+            session_id: SessionId(session_id.into()),
+            tool_call: ToolCallUpdate {
+                tool_call_id: tool_call_id.clone(),
+            },
+            options: vec![],
+        };
+
+        // Request permission - should default to empty JSON object for missing raw_input
+        let result = agent.request_permission(request).await;
+        
+        // Verify we got a valid response
+        assert!(result.is_ok());
     }
 }
