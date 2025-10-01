@@ -7,6 +7,7 @@
 mod tests {
     use crate::tool_types::ToolCallStatus;
     use crate::tools::ToolCallHandler;
+    use crate::ToolPermissions;
     use agent_client_protocol::{SessionId, SessionNotification, SessionUpdate};
     use serde_json::json;
     use tokio::sync::broadcast;

@@ -3,18 +3,20 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
+use claude_agent_lib::permissions::{FilePermissionStorage, PermissionPolicyEngine};
+use claude_agent_lib::session::SessionManager;
+use claude_agent_lib::tools::ToolPermissions;
 
 /// Create test permission engine with temporary file storage
-pub fn permission_engine() -> Arc<crate::permissions::PermissionPolicyEngine> {
-    use crate::permissions::{FilePermissionStorage, PermissionPolicyEngine};
+pub fn permission_engine() -> Arc<PermissionPolicyEngine> {
     let temp_dir = tempfile::tempdir().unwrap();
     let storage = FilePermissionStorage::new(temp_dir.path().to_path_buf());
     Arc::new(PermissionPolicyEngine::new(Box::new(storage)))
 }
 
 /// Create test session manager
-pub fn session_manager() -> Arc<crate::session::SessionManager> {
-    Arc::new(crate::session::SessionManager::new())
+pub fn session_manager() -> Arc<SessionManager> {
+    Arc::new(SessionManager::new())
 }
 
 /// Create temporary directory for testing
@@ -26,8 +28,8 @@ pub fn temp_storage() -> (TempDir, PathBuf) {
 }
 
 /// Create default test tool permissions with auto-approved test tool
-pub fn tool_permissions() -> crate::tools::ToolPermissions {
-    crate::tools::ToolPermissions {
+pub fn tool_permissions() -> ToolPermissions {
+    ToolPermissions {
         require_permission_for: vec![],
         auto_approved: vec!["test_tool".to_string()],
         forbidden_paths: vec![],
@@ -39,8 +41,8 @@ pub fn tool_permissions_with(
     require_permission_for: Vec<String>,
     auto_approved: Vec<String>,
     forbidden_paths: Vec<String>,
-) -> crate::tools::ToolPermissions {
-    crate::tools::ToolPermissions {
+) -> ToolPermissions {
+    ToolPermissions {
         require_permission_for,
         auto_approved,
         forbidden_paths,

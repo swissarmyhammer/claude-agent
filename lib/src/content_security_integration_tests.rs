@@ -1,7 +1,7 @@
 use crate::base64_processor::Base64Processor;
 use crate::content_block_processor::ContentBlockProcessor;
 use crate::content_security_validator::ContentSecurityValidator;
-use agent_client_protocol::{AudioContent, ContentBlock, ImageContent, ResourceLink, TextContent};
+use agent_client_protocol::{ContentBlock, ImageContent, ResourceLink, TextContent};
 use std::collections::HashMap;
 use std::time::Duration;
 

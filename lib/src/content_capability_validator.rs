@@ -222,9 +222,7 @@ impl ContentCapabilityValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::{
-        AudioContent, EmbeddedResource, ImageContent, ResourceLink, TextContent,
-    };
+    use agent_client_protocol::EmbeddedResource;
 
     fn create_test_capabilities(
         image: bool,

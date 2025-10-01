@@ -75,7 +75,7 @@ pub fn resource_link_full(
         description: Some(description.to_string()),
         mime_type: Some(mime_type.to_string()),
         title: Some(title.to_string()),
-        size: Some(size),
+        size: Some(size.try_into().unwrap()),
         annotations: None,
         meta: None,
     })

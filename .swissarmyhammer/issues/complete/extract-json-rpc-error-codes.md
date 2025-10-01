@@ -125,3 +125,31 @@ match code {
 - Easier to maintain and update
 - Helper functions for validation and description
 - Compliance with JSON-RPC 2.0 specification
+
+
+## Proposed Solution
+
+I will implement this refactoring using Test Driven Development:
+
+1. **Create the constants module** (`lib/src/json_rpc_codes.rs`)
+   - Define all 6 JSON-RPC error code constants
+   - Implement helper functions: `is_standard_error`, `is_server_error`, `error_description`
+   - Write comprehensive unit tests for all helper functions
+
+2. **Systematic replacement strategy**
+   - Replace magic numbers file by file in order of smallest to largest impact
+   - Start with `error.rs` (~20 occurrences) - core error mapping
+   - Then `session_errors.rs` (~10 occurrences) - session error handling
+   - Then `acp_error_conversion.rs` (~80 occurrences) - ACP error conversions
+   - Finally `agent.rs` (~50 occurrences) - agent error responses
+
+3. **Testing approach**
+   - Write tests for the constants module first (TDD)
+   - Run full test suite after each file update
+   - Ensure no behavioral changes, only code clarity improvements
+
+4. **Module registration**
+   - Add the new module to `lib/src/lib.rs`
+   - Export constants for use across the codebase
+
+This approach ensures we have tests validating the constants module before using it, and we verify no regressions after each file update.
