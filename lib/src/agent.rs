@@ -23,7 +23,10 @@ use agent_client_protocol::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+
+/// Default timeout for user permission prompts in seconds
+const PERMISSION_PROMPT_TIMEOUT_SECS: u64 = 60;
 
 /// ACP tool call information for permission requests
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -381,6 +384,17 @@ pub struct ClaudeAgent {
     base64_processor: Arc<Base64Processor>,
     content_block_processor: Arc<ContentBlockProcessor>,
     editor_state_manager: Arc<crate::editor_state::EditorStateManager>,
+    /// Handler for interactive user prompts during tool execution
+    ///
+    /// Used to prompt the user for permission decisions when tool calls require user approval.
+    /// Supports both console-based prompts and mock implementations for testing.
+    user_prompt_handler: Arc<dyn crate::user_prompt::UserPromptHandler>,
+    /// Storage for user permission preferences
+    ///
+    /// Stores "always" decisions (allow-always, reject-always) across tool calls
+    /// to avoid re-prompting the user for the same tool. Preferences are stored
+    /// in-memory and do not persist across agent restarts.
+    permission_storage: Arc<crate::permission_storage::PermissionStorage>,
 }
 
 impl ClaudeAgent {
@@ -504,6 +518,115 @@ impl ClaudeAgent {
             base64_processor,
             content_block_processor,
             editor_state_manager,
+            user_prompt_handler: Arc::new(crate::user_prompt::ConsolePromptHandler::new()),
+            permission_storage: Arc::new(crate::permission_storage::PermissionStorage::new()),
+        };
+
+        Ok((agent, notification_receiver))
+    }
+
+    /// Create a new Claude Agent with a custom user prompt handler (for testing)
+    #[cfg(test)]
+    pub async fn new_with_prompt_handler(
+        config: AgentConfig,
+        user_prompt_handler: Arc<dyn crate::user_prompt::UserPromptHandler>,
+    ) -> crate::Result<(Self, broadcast::Receiver<SessionNotification>)> {
+        // Validate configuration including MCP servers
+        config.validate()?;
+
+        let session_manager = Arc::new(SessionManager::new());
+        let claude_client = Arc::new(ClaudeClient::new_with_config(&config.claude)?);
+
+        let (notification_sender, notification_receiver) =
+            NotificationSender::new(config.notification_buffer_size);
+
+        // Create permission policy engine with file-based storage
+        let storage_path = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(".claude-agent")
+            .join("permissions");
+        let storage = FilePermissionStorage::new(storage_path);
+        let permission_engine = Arc::new(PermissionPolicyEngine::new(Box::new(storage)));
+
+        // Create and initialize MCP manager
+        let mut mcp_manager = crate::mcp::McpServerManager::new();
+        mcp_manager
+            .connect_servers(config.mcp_servers.clone())
+            .await?;
+        let mcp_manager = Arc::new(mcp_manager);
+
+        // Create tool handler with MCP support
+        let tool_handler = Arc::new(RwLock::new(ToolCallHandler::new_with_mcp_manager(
+            config.security.to_tool_permissions(),
+            Arc::clone(&mcp_manager),
+            Arc::clone(&session_manager),
+            Arc::clone(&permission_engine),
+        )));
+
+        // Get all available tools for capabilities
+        let available_tools = {
+            let handler = tool_handler.read().await;
+            handler.list_all_available_tools().await
+        };
+
+        let capabilities = AgentCapabilities {
+            load_session: true,
+            prompt_capabilities: agent_client_protocol::PromptCapabilities {
+                audio: true,
+                embedded_context: true,
+                image: true,
+                meta: Some(serde_json::json!({"streaming": true})),
+            },
+            mcp_capabilities: agent_client_protocol::McpCapabilities {
+                http: true,
+                sse: false,
+                meta: None,
+            },
+            meta: Some(serde_json::json!({
+                "tools": available_tools,
+                "streaming": true
+            })),
+        };
+
+        // Create cancellation manager for session cancellation support
+        let (cancellation_manager, _cancellation_receiver) =
+            CancellationManager::new(config.cancellation_buffer_size);
+
+        // Initialize plan generation system for ACP plan reporting
+        let plan_generator = Arc::new(PlanGenerator::new());
+        let plan_manager = Arc::new(RwLock::new(PlanManager::new()));
+
+        // Initialize base64 processor with default size limits
+        let base64_processor = Arc::new(Base64Processor::default());
+
+        // Initialize content block processor with base64 processor
+        let content_block_processor = Arc::new(ContentBlockProcessor::new(
+            (*base64_processor).clone(),
+            sizes::content::MAX_RESOURCE_MODERATE,
+            true,
+        ));
+
+        // Initialize editor state manager for ACP editor integration
+        let editor_state_manager = Arc::new(crate::editor_state::EditorStateManager::new());
+
+        let agent = Self {
+            session_manager,
+            claude_client,
+            tool_handler,
+            mcp_manager: Some(mcp_manager),
+            config,
+            capabilities,
+            client_capabilities: Arc::new(RwLock::new(None)),
+            notification_sender: Arc::new(notification_sender),
+            cancellation_manager: Arc::new(cancellation_manager),
+            permission_engine,
+            plan_generator,
+            plan_manager,
+            base64_processor,
+            content_block_processor,
+            editor_state_manager,
+            user_prompt_handler,
+            permission_storage: Arc::new(crate::permission_storage::PermissionStorage::new()),
         };
 
         Ok((agent, notification_receiver))
@@ -3358,23 +3481,93 @@ impl ClaudeAgent {
                 tracing::info!("Tool '{}' requires user consent", tool_name);
 
                 // If options were provided in request, use those; otherwise use policy-generated options
-                let _permission_options = if !request.options.is_empty() {
+                let permission_options = if !request.options.is_empty() {
                     request.options
                 } else {
                     options
                 };
 
-                // For now, we'll still auto-select "allow-once" but in a real implementation
-                // this would present the options to the user and wait for their choice
-                // TODO: Implement actual user interaction
-                tracing::warn!(
-                    "Auto-selecting 'allow-once' - user interaction not yet implemented"
+                // Check if there's a stored preference for this tool
+                if let Some(stored_kind) = self.permission_storage.get_preference(&tool_name).await
+                {
+                    let option_id = match stored_kind {
+                        crate::tools::PermissionOptionKind::AllowAlways => "allow-always",
+                        crate::tools::PermissionOptionKind::RejectAlways => "reject-always",
+                        _ => {
+                            tracing::warn!(
+                                "Unexpected stored permission kind: {:?}",
+                                stored_kind
+                            );
+                            "allow-once"
+                        }
+                    };
+
+                    tracing::info!(
+                        "Using stored permission preference for '{}': {}",
+                        tool_name,
+                        option_id
+                    );
+
+                    return Ok(PermissionResponse {
+                        outcome: crate::tools::PermissionOutcome::Selected {
+                            option_id: option_id.to_string(),
+                        },
+                    });
+                }
+
+                // Create a description from tool arguments
+                let description = format!(
+                    "Execute {} with arguments: {}",
+                    tool_name,
+                    serde_json::to_string_pretty(&tool_args).unwrap_or_else(|_| "{}".to_string())
                 );
 
-                // Store the permission decision if user selected "always" option
-                // This is where we'd handle the user's actual choice
+                // Prompt user for permission with timeout
+                let prompt_result = tokio::time::timeout(
+                    Duration::from_secs(PERMISSION_PROMPT_TIMEOUT_SECS),
+                    self.user_prompt_handler.prompt_for_permission(
+                        &tool_name,
+                        &description,
+                        &permission_options,
+                    ),
+                )
+                .await;
+
+                let selected_option_id = match prompt_result {
+                    Ok(Ok(option_id)) => option_id,
+                    Ok(Err(e)) => {
+                        tracing::error!("User prompt failed: {}", e);
+                        return Ok(PermissionResponse {
+                            outcome: crate::tools::PermissionOutcome::Cancelled,
+                        });
+                    }
+                    Err(_) => {
+                        tracing::warn!("User permission prompt timed out after 60 seconds");
+                        return Ok(PermissionResponse {
+                            outcome: crate::tools::PermissionOutcome::Cancelled,
+                        });
+                    }
+                };
+
+                // Find the selected option to get its kind
+                if let Some(selected_option) = permission_options
+                    .iter()
+                    .find(|opt| opt.option_id == selected_option_id)
+                {
+                    // Store the permission decision if user selected "always" option
+                    self.permission_storage
+                        .store_preference(&tool_name, selected_option.kind.clone())
+                        .await;
+
+                    tracing::info!(
+                        "User selected permission option: {} ({:?})",
+                        selected_option.name,
+                        selected_option.kind
+                    );
+                }
+
                 crate::tools::PermissionOutcome::Selected {
-                    option_id: "allow-once".to_string(),
+                    option_id: selected_option_id,
                 }
             }
         };
@@ -3384,8 +3577,9 @@ impl ClaudeAgent {
         };
 
         tracing::info!(
-            "Permission request completed for session: {} with outcome: allow-once",
-            session_id
+            "Permission request completed for session: {} with outcome: {:?}",
+            session_id,
+            response.outcome
         );
 
         self.log_response("request_permission", &response);
@@ -3819,7 +4013,13 @@ mod tests {
 
     async fn create_test_agent() -> ClaudeAgent {
         let config = AgentConfig::default();
-        ClaudeAgent::new(config).await.unwrap().0
+        let mock_handler = Arc::new(crate::user_prompt::MockPromptHandler::new(Some(
+            "allow-once".to_string(),
+        )));
+        ClaudeAgent::new_with_prompt_handler(config, mock_handler)
+            .await
+            .unwrap()
+            .0
     }
 
     async fn setup_agent_with_session() -> (ClaudeAgent, String) {

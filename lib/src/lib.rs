@@ -23,9 +23,12 @@ pub mod mime_type_validator;
 #[cfg(test)]
 mod content_security_integration_tests;
 pub mod error;
+#[cfg(test)]
+mod permission_interaction_tests;
 pub mod mcp;
 pub mod mcp_error_handling;
 pub mod path_validator;
+pub mod permission_storage;
 pub mod permissions;
 pub mod plan;
 pub mod request_validation;
@@ -42,6 +45,7 @@ pub mod tool_classification;
 pub mod tool_types;
 pub mod tools;
 pub mod url_validation;
+pub mod user_prompt;
 pub mod validation_utils;
 
 pub use agent::ClaudeAgent;

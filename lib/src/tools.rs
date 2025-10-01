@@ -171,7 +171,7 @@ pub struct PermissionOption {
 }
 
 /// ACP permission option kinds as defined in the specification
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionOptionKind {
     /// Allow this specific tool call once
