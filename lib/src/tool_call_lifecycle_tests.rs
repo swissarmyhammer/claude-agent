@@ -8,16 +8,31 @@ mod tests {
     use crate::tool_types::ToolCallStatus;
     use crate::tools::ToolCallHandler;
     use crate::ToolPermissions;
+    use crate::agent::NotificationSender;
+    use crate::permissions::{FilePermissionStorage, PermissionPolicyEngine};
+    use crate::session::SessionManager;
     use agent_client_protocol::{SessionId, SessionNotification, SessionUpdate};
     use serde_json::json;
     use tokio::sync::broadcast;
-
-    // Import shared test fixtures
-    use crate::tests::common::{fixtures, handler_utils};
+    use std::sync::Arc;
 
     /// Helper to create a test tool call handler with notification sender
     async fn create_test_handler() -> (ToolCallHandler, broadcast::Receiver<SessionNotification>) {
-        handler_utils::create_handler_with_notifications().await
+        let permissions = ToolPermissions {
+            require_permission_for: vec![],
+            auto_approved: vec!["test_tool".to_string()],
+            forbidden_paths: vec![],
+        };
+        let session_manager = Arc::new(SessionManager::new());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = FilePermissionStorage::new(temp_dir.path().to_path_buf());
+        let permission_engine = Arc::new(PermissionPolicyEngine::new(Box::new(storage)));
+
+        let mut handler = ToolCallHandler::new(permissions, session_manager, permission_engine);
+        let (sender, receiver) = NotificationSender::new(32);
+        handler.set_notification_sender(sender);
+
+        (handler, receiver)
     }
 
     #[tokio::test]
@@ -353,8 +368,10 @@ mod tests {
             forbidden_paths: vec![],
         };
 
-        let session_manager = fixtures::session_manager();
-        let permission_engine = fixtures::permission_engine();
+        let session_manager = Arc::new(SessionManager::new());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = FilePermissionStorage::new(temp_dir.path().to_path_buf());
+        let permission_engine = Arc::new(PermissionPolicyEngine::new(Box::new(storage)));
         let handler = ToolCallHandler::new(permissions, session_manager, permission_engine);
         let session_id = SessionId("test_session_no_sender".into());
 

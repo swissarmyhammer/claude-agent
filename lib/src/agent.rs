@@ -4,6 +4,7 @@ use crate::{
     base64_processor::Base64Processor,
     claude::ClaudeClient,
     config::AgentConfig,
+    constants::sizes,
     content_block_processor::ContentBlockProcessor,
     content_capability_validator::ContentCapabilityValidator,
     permissions::{FilePermissionStorage, PermissionPolicyEngine, PolicyEvaluation},
@@ -480,8 +481,8 @@ impl ClaudeAgent {
         // Initialize content block processor with base64 processor
         let content_block_processor = Arc::new(ContentBlockProcessor::new(
             (*base64_processor).clone(),
-            50 * 1024 * 1024, // 50MB max resource size
-            true,             // enable URI validation
+            sizes::content::MAX_RESOURCE_MODERATE,
+            true,
         ));
 
         // Initialize editor state manager for ACP editor integration

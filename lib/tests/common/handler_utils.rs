@@ -54,6 +54,7 @@ pub fn create_handler_without_notifications() -> ToolCallHandler {
 
 /// Consume and return the next notification from a receiver
 /// Panics if no notification is received
+#[allow(dead_code)]
 pub async fn consume_notification(
     receiver: &mut broadcast::Receiver<SessionNotification>,
 ) -> SessionNotification {

@@ -1,4 +1,5 @@
 use crate::base64_validation;
+use crate::constants::sizes;
 use crate::content_security_validator::{ContentSecurityError, ContentSecurityValidator};
 use crate::error::ToJsonRpcError;
 use crate::mime_type_validator::{MimeTypeValidationError, MimeTypeValidator};
@@ -179,11 +180,11 @@ impl Default for Base64Processor {
         Self {
             allowed_blob_mime_types,
             processing_timeout: Duration::from_secs(30),
-            max_memory_usage: 50 * 1024 * 1024, // 50MB memory limit
+            max_memory_usage: sizes::memory::MAX_BASE64_MEMORY,
             enable_capability_validation: true,
             enable_security_validation: true,
             supported_capabilities,
-            content_security_validator: None, // Default to no enhanced security validation
+            content_security_validator: None,
             mime_type_validator: MimeTypeValidator::moderate(),
             size_validator,
         }

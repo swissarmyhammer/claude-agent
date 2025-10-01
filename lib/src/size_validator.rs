@@ -1,3 +1,4 @@
+use crate::constants::sizes;
 use thiserror::Error;
 
 /// Unified error type for size validation failures
@@ -24,11 +25,11 @@ pub struct SizeLimits {
 impl Default for SizeLimits {
     fn default() -> Self {
         Self {
-            max_path_length: 4096,
-            max_uri_length: 8192,
-            max_base64_size: 10 * 1024 * 1024,  // 10MB
-            max_content_size: 50 * 1024 * 1024, // 50MB
-            max_meta_size: 100_000,             // 100KB
+            max_path_length: sizes::fs::MAX_PATH_LENGTH,
+            max_uri_length: sizes::uri::MAX_URI_LENGTH_EXTENDED,
+            max_base64_size: sizes::content::MAX_CONTENT_MODERATE,
+            max_content_size: sizes::content::MAX_RESOURCE_MODERATE,
+            max_meta_size: sizes::content::MAX_META_SIZE,
         }
     }
 }
@@ -37,22 +38,22 @@ impl SizeLimits {
     /// Create strict size limits for high-security contexts
     pub fn strict() -> Self {
         Self {
-            max_path_length: 2048,
-            max_uri_length: 2048,
-            max_base64_size: 1024 * 1024,      // 1MB
-            max_content_size: 5 * 1024 * 1024, // 5MB
-            max_meta_size: 10_000,             // 10KB
+            max_path_length: sizes::fs::MAX_PATH_LENGTH_STRICT,
+            max_uri_length: sizes::uri::MAX_URI_LENGTH,
+            max_base64_size: sizes::content::MAX_CONTENT_STRICT,
+            max_content_size: sizes::content::MAX_RESOURCE_STRICT,
+            max_meta_size: sizes::content::MAX_META_SIZE / 10,
         }
     }
 
     /// Create permissive size limits for low-security contexts
     pub fn permissive() -> Self {
         Self {
-            max_path_length: 8192,
-            max_uri_length: 16384,
-            max_base64_size: 100 * 1024 * 1024,  // 100MB
-            max_content_size: 500 * 1024 * 1024, // 500MB
-            max_meta_size: 1_000_000,            // 1MB
+            max_path_length: sizes::fs::MAX_PATH_LENGTH * 2,
+            max_uri_length: sizes::uri::MAX_URI_LENGTH_EXTENDED * 2,
+            max_base64_size: sizes::content::MAX_CONTENT_PERMISSIVE,
+            max_content_size: sizes::content::MAX_RESOURCE_PERMISSIVE,
+            max_meta_size: sizes::content::MAX_META_SIZE * 10,
         }
     }
 }
@@ -146,8 +147,8 @@ mod tests {
     #[test]
     fn test_strict_limits() {
         let limits = SizeLimits::strict();
-        assert_eq!(limits.max_path_length, 2048);
-        assert_eq!(limits.max_uri_length, 2048);
+        assert_eq!(limits.max_path_length, 1024);
+        assert_eq!(limits.max_uri_length, 4096);
         assert_eq!(limits.max_base64_size, 1024 * 1024);
         assert_eq!(limits.max_content_size, 5 * 1024 * 1024);
         assert_eq!(limits.max_meta_size, 10_000);

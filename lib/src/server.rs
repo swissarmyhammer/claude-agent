@@ -425,6 +425,7 @@ impl Default for ConnectionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::sizes;
     use tokio::io::duplex;
 
     async fn create_test_server() -> ClaudeAgentServer {
@@ -464,7 +465,7 @@ mod tests {
     async fn test_stream_server_startup() {
         let _server = create_test_server().await;
 
-        let (_client_stream, _server_stream) = duplex(1024);
+        let (_client_stream, _server_stream) = duplex(sizes::buffers::DUPLEX_STREAM_BUFFER);
 
         // For now, just test that we can create the server without panicking
         // Full integration testing would require more sophisticated test setup

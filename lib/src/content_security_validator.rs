@@ -1,4 +1,5 @@
 use crate::base64_validation;
+use crate::constants::sizes;
 use crate::error::ToJsonRpcError;
 use crate::size_validator::{SizeValidationError, SizeValidator};
 use crate::url_validation;
@@ -216,8 +217,8 @@ impl SecurityPolicy {
 
         Self {
             level: SecurityLevel::Strict,
-            max_base64_size: 1024 * 1024,            // 1MB
-            max_total_content_size: 5 * 1024 * 1024, // 5MB
+            max_base64_size: sizes::content::MAX_CONTENT_STRICT,
+            max_total_content_size: sizes::content::MAX_RESOURCE_STRICT,
             max_content_array_length: 10,
             base64_decode_timeout: Duration::from_secs(5),
             processing_timeout: Duration::from_secs(10),
@@ -241,7 +242,7 @@ impl SecurityPolicy {
                 "192.168.0.0/16".to_string(),
                 "::1/128".to_string(),
             ],
-            max_uri_length: 2048,
+            max_uri_length: sizes::uri::MAX_URI_LENGTH,
             enable_rate_limiting: true,
             rate_limit_requests_per_minute: 60,
         }
@@ -255,8 +256,8 @@ impl SecurityPolicy {
 
         Self {
             level: SecurityLevel::Moderate,
-            max_base64_size: 10 * 1024 * 1024,        // 10MB
-            max_total_content_size: 50 * 1024 * 1024, // 50MB
+            max_base64_size: sizes::content::MAX_CONTENT_MODERATE,
+            max_total_content_size: sizes::content::MAX_RESOURCE_MODERATE,
             max_content_array_length: 50,
             base64_decode_timeout: Duration::from_secs(15),
             processing_timeout: Duration::from_secs(30),
@@ -268,7 +269,7 @@ impl SecurityPolicy {
             enable_malicious_pattern_detection: true,
             blocked_uri_patterns: vec![r"127\.0\.0\.1".to_string(), r"localhost".to_string()],
             blocked_ip_ranges: vec!["127.0.0.0/8".to_string(), "::1/128".to_string()],
-            max_uri_length: 4096,
+            max_uri_length: sizes::uri::MAX_URI_LENGTH,
             enable_rate_limiting: true,
             rate_limit_requests_per_minute: 300,
         }
@@ -284,9 +285,9 @@ impl SecurityPolicy {
 
         Self {
             level: SecurityLevel::Permissive,
-            max_base64_size: 100 * 1024 * 1024,        // 100MB
-            max_total_content_size: 500 * 1024 * 1024, // 500MB
-            max_content_array_length: 1000,
+            max_base64_size: sizes::content::MAX_CONTENT_PERMISSIVE,
+            max_total_content_size: sizes::content::MAX_RESOURCE_PERMISSIVE,
+            max_content_array_length: sizes::messages::MAX_CONTENT_ARRAY_LENGTH,
             base64_decode_timeout: Duration::from_secs(60),
             processing_timeout: Duration::from_secs(120),
             allowed_uri_schemes: allowed_schemes,
@@ -297,7 +298,7 @@ impl SecurityPolicy {
             enable_malicious_pattern_detection: false,
             blocked_uri_patterns: vec![],
             blocked_ip_ranges: vec![],
-            max_uri_length: 8192,
+            max_uri_length: sizes::uri::MAX_URI_LENGTH_EXTENDED,
             enable_rate_limiting: false,
             rate_limit_requests_per_minute: 0,
         }
@@ -764,7 +765,7 @@ mod tests {
 
         // Too large (simulate by using policy with small limit)
         let strict_validator = ContentSecurityValidator::strict().unwrap();
-        let large_data = "A".repeat(2 * 1024 * 1024); // 2MB of 'A's
+        let large_data = "A".repeat(2 * sizes::content::MB);
         assert!(strict_validator
             .validate_base64_security(&large_data, "test")
             .is_err());

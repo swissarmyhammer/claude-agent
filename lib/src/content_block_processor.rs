@@ -876,6 +876,7 @@ pub struct ContentProcessingSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::sizes;
     use agent_client_protocol::{AudioContent, EmbeddedResource, ImageContent, ResourceLink};
 
     fn create_test_processor() -> ContentBlockProcessor {
@@ -888,12 +889,12 @@ mod tests {
 
         ContentBlockProcessor::new_with_config(
             Base64Processor::default(),
-            50 * 1024 * 1024,        // 50MB for resources
-            true,                    // enable_uri_validation
-            Duration::from_secs(30), // processing_timeout
-            true,                    // enable_capability_validation
+            sizes::content::MAX_RESOURCE_MODERATE,
+            true,
+            Duration::from_secs(30),
+            true,
             supported_capabilities,
-            true, // enable_batch_recovery
+            true,
         )
     }
 
@@ -1209,8 +1210,8 @@ mod tests {
     fn test_uri_validation_disabled() {
         let processor = ContentBlockProcessor::new(
             Base64Processor::default(),
-            50 * 1024 * 1024,
-            false, // Disable URI validation
+            sizes::content::MAX_RESOURCE_MODERATE,
+            false,
         );
 
         let resource_link = ResourceLink {

@@ -59,8 +59,6 @@ use crate::terminal_manager::{TerminalCreateParams, TerminalCreateResponse, Term
 #[cfg(test)]
 use crate::tool_types::{ToolCallContent, ToolCallLocation};
 use crate::tool_types::{ToolCallReport, ToolCallStatus, ToolKind};
-#[cfg(test)]
-use agent_client_protocol::SessionId;
 
 use serde_json::Value;
 
@@ -1844,10 +1842,21 @@ enum ToolRiskLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::permissions::{FilePermissionStorage, PermissionPolicyEngine};
+    use crate::session::SessionManager;
     use serde_json::json;
+    use std::sync::Arc;
+    use agent_client_protocol::SessionId;
 
-    // Import shared test fixtures
-    use crate::tests::common::fixtures;
+    fn create_permission_engine() -> Arc<PermissionPolicyEngine> {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = FilePermissionStorage::new(temp_dir.path().to_path_buf());
+        Arc::new(PermissionPolicyEngine::new(Box::new(storage)))
+    }
+
+    fn session_id(id: &str) -> SessionId {
+        SessionId(id.into())
+    }
 
     fn create_test_handler() -> ToolCallHandler {
         let permissions = ToolPermissions {
@@ -1869,8 +1878,8 @@ mod tests {
     }
 
     fn create_test_handler_with_permissions(permissions: ToolPermissions) -> ToolCallHandler {
-        let session_manager = fixtures::session_manager();
-        let permission_engine = fixtures::permission_engine();
+        let session_manager = Arc::new(SessionManager::new());
+        let permission_engine = create_permission_engine();
         let mut handler = ToolCallHandler::new(permissions, session_manager, permission_engine);
 
         // Set up test client capabilities for ACP compliance
@@ -1888,7 +1897,7 @@ mod tests {
     }
 
     fn create_test_session_id() -> SessionId {
-        fixtures::session_id("sess_01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        session_id("sess_01ARZ3NDEKTSV4RRFFQ69G5FAV")
     }
 
     fn create_test_handler_with_session(
@@ -1905,7 +1914,7 @@ mod tests {
         let acp_session_id = SessionId(internal_session_id.to_string().into());
 
         // Create handler with session manager
-        let permission_engine = fixtures::permission_engine();
+        let permission_engine = create_permission_engine();
         let mut handler = ToolCallHandler::new(permissions, session_manager, permission_engine);
 
         // Set test capabilities
@@ -2742,7 +2751,7 @@ mod tests {
             forbidden_paths: vec![],
         };
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let permission_engine = fixtures::permission_engine();
+        let permission_engine = create_permission_engine();
         let mut handler = ToolCallHandler::new(permissions, session_manager, permission_engine);
         let session_id = create_test_session_id();
         let caps_no_read = agent_client_protocol::ClientCapabilities {
@@ -2784,7 +2793,7 @@ mod tests {
             forbidden_paths: vec![],
         };
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let permission_engine = fixtures::permission_engine();
+        let permission_engine = create_permission_engine();
         let mut handler = ToolCallHandler::new(permissions, session_manager, permission_engine);
         let session_id = create_test_session_id();
         let caps_no_terminal = agent_client_protocol::ClientCapabilities {
@@ -2825,7 +2834,7 @@ mod tests {
             forbidden_paths: vec![],
         };
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let permission_engine = fixtures::permission_engine();
+        let permission_engine = create_permission_engine();
         let mut handler = ToolCallHandler::new(permissions, session_manager, permission_engine);
         let session_id = create_test_session_id();
         let caps_enabled = agent_client_protocol::ClientCapabilities {
@@ -2892,7 +2901,7 @@ mod tests {
 
         // Test with terminal capability disabled
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let permission_engine = fixtures::permission_engine();
+        let permission_engine = create_permission_engine();
         let mut handler_no_terminal = ToolCallHandler::new(
             ToolPermissions {
                 auto_approved: vec![],
@@ -2960,7 +2969,7 @@ mod tests {
 
         // Test with no client capabilities set
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let permission_engine_2 = fixtures::permission_engine();
+        let permission_engine_2 = create_permission_engine();
         let handler_no_caps = ToolCallHandler::new(
             ToolPermissions {
                 auto_approved: vec![],
@@ -3299,7 +3308,7 @@ mod tests {
     async fn test_improved_terminal_capability_error_messages() {
         // Test that terminal capability validation returns improved error messages
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let permission_engine = fixtures::permission_engine();
+        let permission_engine = create_permission_engine();
         let mut handler = ToolCallHandler::new(
             ToolPermissions {
                 auto_approved: vec!["terminal_create".to_string()],
@@ -3344,7 +3353,7 @@ mod tests {
 
         // Test with no capabilities provided
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let permission_engine_2 = fixtures::permission_engine();
+        let permission_engine_2 = create_permission_engine();
         let handler_no_caps = ToolCallHandler::new(
             ToolPermissions {
                 auto_approved: vec!["terminal_create".to_string()],
@@ -3898,7 +3907,7 @@ mod tests {
             auto_approved: vec!["fs_read".to_string()],
             forbidden_paths: vec![],
         };
-        let permission_engine = fixtures::permission_engine();
+        let permission_engine = create_permission_engine();
         let mut handler =
             ToolCallHandler::new(permissions, session_manager.clone(), permission_engine);
 
@@ -3968,7 +3977,7 @@ mod tests {
             auto_approved: vec!["fs_read".to_string()],
             forbidden_paths: vec![],
         };
-        let permission_engine = fixtures::permission_engine();
+        let permission_engine = create_permission_engine();
         let mut handler =
             ToolCallHandler::new(permissions, session_manager.clone(), permission_engine);
 
@@ -4053,7 +4062,7 @@ mod tests {
             auto_approved: vec!["fs_read".to_string(), "fs_write".to_string()],
             forbidden_paths: vec![],
         };
-        let permission_engine = fixtures::permission_engine();
+        let permission_engine = create_permission_engine();
         let mut handler =
             ToolCallHandler::new(permissions, session_manager.clone(), permission_engine);
 

@@ -11,6 +11,7 @@ pub mod base64_validation;
 pub mod capability_validation;
 pub mod claude;
 pub mod config;
+pub mod constants;
 pub mod content_block_processor;
 pub mod content_capability_validator;
 pub mod content_security_validator;
@@ -21,8 +22,6 @@ pub mod mime_type_validator;
 
 #[cfg(test)]
 mod content_security_integration_tests;
-#[cfg(test)]
-mod tests;
 pub mod error;
 pub mod mcp;
 pub mod mcp_error_handling;

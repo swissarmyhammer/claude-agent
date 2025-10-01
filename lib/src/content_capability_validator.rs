@@ -237,8 +237,94 @@ mod tests {
         }
     }
 
-    // Import shared test fixtures
-    use crate::tests::common::content_blocks;
+    // Helper functions to create test content blocks
+    mod content_blocks {
+        use agent_client_protocol::{AudioContent, ContentBlock, EmbeddedResource, ImageContent, ResourceLink, TextContent};
+        
+        pub fn text(content: &str) -> ContentBlock {
+            ContentBlock::Text(TextContent {
+                text: content.to_string(),
+                annotations: None,
+                meta: None,
+            })
+        }
+        
+        pub fn image(mime_type: &str, data: &str) -> ContentBlock {
+            ContentBlock::Image(ImageContent {
+                data: data.to_string(),
+                mime_type: mime_type.to_string(),
+                uri: None,
+                annotations: None,
+                meta: None,
+            })
+        }
+        
+        pub fn image_png() -> ContentBlock {
+            const VALID_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
+            image("image/png", VALID_PNG_BASE64)
+        }
+        
+        pub fn audio(mime_type: &str, data: &str) -> ContentBlock {
+            ContentBlock::Audio(AudioContent {
+                data: data.to_string(),
+                mime_type: mime_type.to_string(),
+                annotations: None,
+                meta: None,
+            })
+        }
+        
+        pub fn audio_wav() -> ContentBlock {
+            const VALID_WAV_BASE64: &str = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAAA";
+            audio("audio/wav", VALID_WAV_BASE64)
+        }
+        
+        pub fn resource_link(uri: &str, name: &str) -> ContentBlock {
+            ContentBlock::ResourceLink(ResourceLink {
+                uri: uri.to_string(),
+                name: name.to_string(),
+                description: None,
+                mime_type: None,
+                title: None,
+                size: None,
+                annotations: None,
+                meta: None,
+            })
+        }
+        
+        pub fn resource_link_full(
+            uri: &str,
+            name: &str,
+            description: &str,
+            mime_type: &str,
+            title: &str,
+            size_bytes: u64,
+        ) -> ContentBlock {
+            ContentBlock::ResourceLink(ResourceLink {
+                uri: uri.to_string(),
+                name: name.to_string(),
+                description: Some(description.to_string()),
+                mime_type: Some(mime_type.to_string()),
+                title: Some(title.to_string()),
+                size: Some(size_bytes.try_into().unwrap()),
+                annotations: None,
+                meta: None,
+            })
+        }
+        
+        pub fn embedded_resource(uri: &str, mime_type: &str, data: &str) -> ContentBlock {
+            let resource_data = serde_json::json!({
+                "uri": uri,
+                "mimeType": mime_type,
+                "text": data
+            });
+            let embedded_resource = EmbeddedResource {
+                resource: serde_json::from_value(resource_data).unwrap(),
+                annotations: None,
+                meta: None,
+            };
+            ContentBlock::Resource(embedded_resource)
+        }
+    }
 
 
 

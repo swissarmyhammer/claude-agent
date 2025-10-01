@@ -1,25 +1,26 @@
 //! Configuration types for the Claude Agent
 
+use crate::constants::sizes;
 use serde::{Deserialize, Serialize};
 
 /// Default value for max_prompt_length
 fn default_max_prompt_length() -> usize {
-    100_000
+    sizes::messages::MAX_PROMPT_LENGTH
 }
 
 /// Default value for notification_buffer_size
 fn default_notification_buffer_size() -> usize {
-    1000
+    sizes::buffers::NOTIFICATION_BUFFER_LARGE
 }
 
 /// Default value for cancellation_buffer_size
 fn default_cancellation_buffer_size() -> usize {
-    100
+    sizes::buffers::CANCELLATION_BUFFER
 }
 
 /// Default value for max_tokens_per_turn (100k tokens)
 fn default_max_tokens_per_turn() -> u64 {
-    100_000
+    sizes::messages::MAX_TOKENS_PER_TURN as u64
 }
 
 /// Default value for max_turn_requests (50 requests)
@@ -354,9 +355,9 @@ impl Default for AgentConfig {
                 require_permission_for: vec!["fs_write".to_string(), "terminal_create".to_string()],
             },
             mcp_servers: vec![],
-            max_prompt_length: 100_000,
-            notification_buffer_size: 1000,
-            cancellation_buffer_size: 100,
+            max_prompt_length: default_max_prompt_length(),
+            notification_buffer_size: default_notification_buffer_size(),
+            cancellation_buffer_size: default_cancellation_buffer_size(),
             max_tokens_per_turn: default_max_tokens_per_turn(),
             max_turn_requests: default_max_turn_requests(),
         }
@@ -578,7 +579,7 @@ mod tests {
             }
             _ => panic!("Expected stdio transport configuration"),
         }
-        assert_eq!(config.max_prompt_length, 100_000); // Should use default value
+        assert_eq!(config.max_prompt_length, sizes::messages::MAX_PROMPT_LENGTH);
     }
 
     #[test]

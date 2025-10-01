@@ -9,8 +9,60 @@ use std::time::Duration;
 mod tests {
     use super::*;
     
-    // Import shared test fixtures
-    use crate::tests::common::{content_blocks, test_data};
+    // Test data constants
+    const VALID_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
+    const VALID_WAV_BASE64: &str = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAAA";
+    const MALICIOUS_PE_BASE64: &str = "TVqQAAMAAAAEAAAA//8AALgAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const MALICIOUS_ELF_BASE64: &str = "f0VMRgIBAQAAAAAAAAAAAA==";
+    
+    // Helper functions to create content blocks
+    fn text(content: &str) -> ContentBlock {
+        ContentBlock::Text(TextContent {
+            text: content.to_string(),
+            annotations: None,
+            meta: None,
+        })
+    }
+    
+    fn image(mime_type: &str, data: &str) -> ContentBlock {
+        ContentBlock::Image(ImageContent {
+            data: data.to_string(),
+            mime_type: mime_type.to_string(),
+            uri: None,
+            annotations: None,
+            meta: None,
+        })
+    }
+    
+    fn image_png() -> ContentBlock {
+        image("image/png", VALID_PNG_BASE64)
+    }
+    
+    fn audio(mime_type: &str, data: &str) -> ContentBlock {
+        ContentBlock::Audio(agent_client_protocol::AudioContent {
+            data: data.to_string(),
+            mime_type: mime_type.to_string(),
+            annotations: None,
+            meta: None,
+        })
+    }
+    
+    fn audio_wav() -> ContentBlock {
+        audio("audio/wav", VALID_WAV_BASE64)
+    }
+    
+    fn resource_link(uri: &str, name: &str) -> ContentBlock {
+        ContentBlock::ResourceLink(ResourceLink {
+            uri: uri.to_string(),
+            name: name.to_string(),
+            description: None,
+            mime_type: None,
+            title: None,
+            size: None,
+            annotations: None,
+            meta: None,
+        })
+    }
 
     /// Create a ContentBlockProcessor with strict security validation
     fn create_strict_secure_processor() -> ContentBlockProcessor {
@@ -152,7 +204,7 @@ mod tests {
     fn test_safe_image_content_processing() {
         let processor = create_moderate_secure_processor();
 
-        let safe_image = content_blocks::image("image/png", test_data::VALID_PNG_BASE64);
+        let safe_image = image("image/png", VALID_PNG_BASE64);
         let safe_image = match safe_image {
             ContentBlock::Image(mut img) => {
                 img.uri = Some("https://example.com/safe-image.png".to_string());
@@ -175,7 +227,7 @@ mod tests {
     fn test_malicious_base64_content_blocking() {
         let processor = create_strict_secure_processor();
 
-        let malicious_image = content_blocks::image("image/png", test_data::MALICIOUS_PE_BASE64);
+        let malicious_image = image("image/png", MALICIOUS_PE_BASE64);
 
         let result = processor.process_content_block(&malicious_image);
         assert!(result.is_err());
@@ -381,7 +433,7 @@ mod tests {
     fn test_audio_content_security_validation() {
         let processor = create_moderate_secure_processor();
 
-        let safe_audio = content_blocks::audio_wav();
+        let safe_audio = audio_wav();
 
         let result = processor.process_content_block(&safe_audio);
         assert!(result.is_ok());
