@@ -5,36 +5,18 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::agent::NotificationSender;
     use crate::tool_types::ToolCallStatus;
-    use crate::tools::{ToolCallHandler, ToolPermissions};
+    use crate::tools::ToolCallHandler;
     use agent_client_protocol::{SessionId, SessionNotification, SessionUpdate};
     use serde_json::json;
     use tokio::sync::broadcast;
 
-    fn create_test_permission_engine() -> std::sync::Arc<crate::permissions::PermissionPolicyEngine>
-    {
-        use crate::permissions::{FilePermissionStorage, PermissionPolicyEngine};
-        let temp_dir = tempfile::tempdir().unwrap();
-        let storage = FilePermissionStorage::new(temp_dir.path().to_path_buf());
-        std::sync::Arc::new(PermissionPolicyEngine::new(Box::new(storage)))
-    }
+    // Import shared test fixtures
+    use crate::tests::common::{fixtures, handler_utils};
 
     /// Helper to create a test tool call handler with notification sender
     async fn create_test_handler() -> (ToolCallHandler, broadcast::Receiver<SessionNotification>) {
-        let permissions = ToolPermissions {
-            require_permission_for: vec![],
-            auto_approved: vec!["test_tool".to_string()],
-            forbidden_paths: vec![],
-        };
-
-        let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let permission_engine = create_test_permission_engine();
-        let mut handler = ToolCallHandler::new(permissions, session_manager, permission_engine);
-        let (sender, receiver) = NotificationSender::new(32);
-        handler.set_notification_sender(sender);
-
-        (handler, receiver)
+        handler_utils::create_handler_with_notifications().await
     }
 
     #[tokio::test]
@@ -370,8 +352,8 @@ mod tests {
             forbidden_paths: vec![],
         };
 
-        let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let permission_engine = create_test_permission_engine();
+        let session_manager = fixtures::session_manager();
+        let permission_engine = fixtures::permission_engine();
         let handler = ToolCallHandler::new(permissions, session_manager, permission_engine);
         let session_id = SessionId("test_session_no_sender".into());
 

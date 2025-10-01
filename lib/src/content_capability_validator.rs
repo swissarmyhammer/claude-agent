@@ -239,66 +239,16 @@ mod tests {
         }
     }
 
-    fn create_test_text_content() -> ContentBlock {
-        ContentBlock::Text(TextContent {
-            text: "Test text content".to_string(),
-            annotations: None,
-            meta: None,
-        })
-    }
+    // Import shared test fixtures
+    use crate::tests::common::content_blocks;
 
-    fn create_test_resource_link_content() -> ContentBlock {
-        ContentBlock::ResourceLink(ResourceLink {
-            uri: "https://example.com/resource".to_string(),
-            name: "Test resource".to_string(),
-            description: Some("Test resource description".to_string()),
-            mime_type: Some("text/plain".to_string()),
-            title: Some("Test Resource".to_string()),
-            size: Some(1024),
-            annotations: None,
-            meta: None,
-        })
-    }
 
-    fn create_test_image_content() -> ContentBlock {
-        ContentBlock::Image(ImageContent {
-            data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==".to_string(),
-            mime_type: "image/png".to_string(),
-            uri: None,
-            annotations: None,
-            meta: None,
-        })
-    }
-
-    fn create_test_audio_content() -> ContentBlock {
-        ContentBlock::Audio(AudioContent {
-            data: "UklGRjIAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQ4AAAAAAAAAAAAAAA=="
-                .to_string(),
-            mime_type: "audio/wav".to_string(),
-            annotations: None,
-            meta: None,
-        })
-    }
-
-    fn create_test_resource_content() -> ContentBlock {
-        let resource_data = serde_json::json!({
-            "uri": "https://example.com/resource",
-            "mimeType": "text/plain",
-            "text": "Resource content"
-        });
-        let embedded_resource = EmbeddedResource {
-            resource: serde_json::from_value(resource_data).unwrap(),
-            annotations: None,
-            meta: None,
-        };
-        ContentBlock::Resource(embedded_resource)
-    }
 
     #[test]
     fn test_text_content_always_allowed() {
         let capabilities = create_test_capabilities(false, false, false);
         let validator = ContentCapabilityValidator::new(capabilities);
-        let content = create_test_text_content();
+        let content = content_blocks::text("Test text content");
 
         assert!(validator.validate_content_block(&content).is_ok());
     }
@@ -307,7 +257,14 @@ mod tests {
     fn test_resource_link_always_allowed() {
         let capabilities = create_test_capabilities(false, false, false);
         let validator = ContentCapabilityValidator::new(capabilities);
-        let content = create_test_resource_link_content();
+        let content = content_blocks::resource_link_full(
+            "https://example.com/resource",
+            "Test resource",
+            "Test resource description",
+            "text/plain",
+            "Test Resource",
+            1024,
+        );
 
         assert!(validator.validate_content_block(&content).is_ok());
     }
@@ -316,7 +273,7 @@ mod tests {
     fn test_image_content_allowed_when_capability_enabled() {
         let capabilities = create_test_capabilities(true, false, false);
         let validator = ContentCapabilityValidator::new(capabilities);
-        let content = create_test_image_content();
+        let content = content_blocks::image_png();
 
         assert!(validator.validate_content_block(&content).is_ok());
     }
@@ -325,7 +282,7 @@ mod tests {
     fn test_image_content_blocked_when_capability_disabled() {
         let capabilities = create_test_capabilities(false, false, false);
         let validator = ContentCapabilityValidator::new(capabilities);
-        let content = create_test_image_content();
+        let content = content_blocks::image_png();
 
         let result = validator.validate_content_block(&content);
         assert!(result.is_err());
@@ -350,7 +307,7 @@ mod tests {
     fn test_audio_content_allowed_when_capability_enabled() {
         let capabilities = create_test_capabilities(false, true, false);
         let validator = ContentCapabilityValidator::new(capabilities);
-        let content = create_test_audio_content();
+        let content = content_blocks::audio_wav();
 
         assert!(validator.validate_content_block(&content).is_ok());
     }
@@ -359,7 +316,7 @@ mod tests {
     fn test_audio_content_blocked_when_capability_disabled() {
         let capabilities = create_test_capabilities(false, false, false);
         let validator = ContentCapabilityValidator::new(capabilities);
-        let content = create_test_audio_content();
+        let content = content_blocks::audio_wav();
 
         let result = validator.validate_content_block(&content);
         assert!(result.is_err());
@@ -375,7 +332,17 @@ mod tests {
     fn test_resource_content_allowed_when_capability_enabled() {
         let capabilities = create_test_capabilities(false, false, true);
         let validator = ContentCapabilityValidator::new(capabilities);
-        let content = create_test_resource_content();
+        let resource_data = serde_json::json!({
+            "uri": "https://example.com/resource",
+            "mimeType": "text/plain",
+            "text": "Resource content"
+        });
+        let embedded_resource = EmbeddedResource {
+            resource: serde_json::from_value(resource_data).unwrap(),
+            annotations: None,
+            meta: None,
+        };
+        let content = ContentBlock::Resource(embedded_resource);
 
         assert!(validator.validate_content_block(&content).is_ok());
     }
@@ -384,7 +351,17 @@ mod tests {
     fn test_resource_content_blocked_when_capability_disabled() {
         let capabilities = create_test_capabilities(false, false, false);
         let validator = ContentCapabilityValidator::new(capabilities);
-        let content = create_test_resource_content();
+        let resource_data = serde_json::json!({
+            "uri": "https://example.com/resource",
+            "mimeType": "text/plain",
+            "text": "Resource content"
+        });
+        let embedded_resource = EmbeddedResource {
+            resource: serde_json::from_value(resource_data).unwrap(),
+            annotations: None,
+            meta: None,
+        };
+        let content = ContentBlock::Resource(embedded_resource);
 
         let result = validator.validate_content_block(&content);
         assert!(result.is_err());
@@ -401,11 +378,28 @@ mod tests {
         let capabilities = create_test_capabilities(true, false, true);
         let validator = ContentCapabilityValidator::new(capabilities);
 
+        let resource_data = serde_json::json!({
+            "uri": "https://example.com/resource",
+            "mimeType": "text/plain",
+            "text": "Resource content"
+        });
+        let embedded_resource = EmbeddedResource {
+            resource: serde_json::from_value(resource_data).unwrap(),
+            annotations: None,
+            meta: None,
+        };
         let content_blocks = vec![
-            create_test_text_content(),
-            create_test_resource_link_content(),
-            create_test_image_content(),
-            create_test_resource_content(),
+            content_blocks::text("Test text content"),
+            content_blocks::resource_link_full(
+                "https://example.com/resource",
+                "Test resource",
+                "Test resource description",
+                "text/plain",
+                "Test Resource",
+                1024,
+            ),
+            content_blocks::image_png(),
+            ContentBlock::Resource(embedded_resource),
         ];
 
         assert!(validator.validate_content_blocks(&content_blocks).is_ok());
@@ -417,9 +411,9 @@ mod tests {
         let validator = ContentCapabilityValidator::new(capabilities);
 
         let content_blocks = vec![
-            create_test_text_content(),  // Should pass
-            create_test_image_content(), // Should fail
-            create_test_audio_content(), // Should fail
+            content_blocks::text("Test text content"),  // Should pass
+            content_blocks::image_png(), // Should fail
+            content_blocks::audio_wav(), // Should fail
         ];
 
         let result = validator.validate_content_blocks(&content_blocks);

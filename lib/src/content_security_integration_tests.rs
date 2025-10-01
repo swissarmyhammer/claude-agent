@@ -8,6 +8,9 @@ use std::time::Duration;
 #[cfg(test)]
 mod tests {
     use super::*;
+    
+    // Import shared test fixtures
+    use crate::tests::common::{content_blocks, test_data};
 
     /// Create a ContentBlockProcessor with strict security validation
     fn create_strict_secure_processor() -> ContentBlockProcessor {
@@ -149,16 +152,14 @@ mod tests {
     fn test_safe_image_content_processing() {
         let processor = create_moderate_secure_processor();
 
-        // Valid 1x1 PNG in base64
-        let png_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
-
-        let safe_image = ContentBlock::Image(ImageContent {
-            data: png_data.to_string(),
-            mime_type: "image/png".to_string(),
-            uri: Some("https://example.com/safe-image.png".to_string()),
-            annotations: None,
-            meta: None,
-        });
+        let safe_image = content_blocks::image("image/png", test_data::VALID_PNG_BASE64);
+        let safe_image = match safe_image {
+            ContentBlock::Image(mut img) => {
+                img.uri = Some("https://example.com/safe-image.png".to_string());
+                ContentBlock::Image(img)
+            }
+            _ => panic!("Expected image content block"),
+        };
 
         let result = processor.process_content_block(&safe_image);
         assert!(result.is_ok());
@@ -174,17 +175,7 @@ mod tests {
     fn test_malicious_base64_content_blocking() {
         let processor = create_strict_secure_processor();
 
-        // Simulated PE executable header in base64 (should be detected as malicious)
-        let malicious_data =
-            "TVqQAAMAAAAEAAAA//8AALgAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-
-        let malicious_image = ContentBlock::Image(ImageContent {
-            data: malicious_data.to_string(),
-            mime_type: "image/png".to_string(),
-            uri: None,
-            annotations: None,
-            meta: None,
-        });
+        let malicious_image = content_blocks::image("image/png", test_data::MALICIOUS_PE_BASE64);
 
         let result = processor.process_content_block(&malicious_image);
         assert!(result.is_err());
@@ -390,15 +381,7 @@ mod tests {
     fn test_audio_content_security_validation() {
         let processor = create_moderate_secure_processor();
 
-        // Valid WAV header in base64
-        let wav_data = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAAA";
-
-        let safe_audio = ContentBlock::Audio(AudioContent {
-            data: wav_data.to_string(),
-            mime_type: "audio/wav".to_string(),
-            annotations: None,
-            meta: None,
-        });
+        let safe_audio = content_blocks::audio_wav();
 
         let result = processor.process_content_block(&safe_audio);
         assert!(result.is_ok());

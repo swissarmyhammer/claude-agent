@@ -3,6 +3,8 @@
 //! These tests verify the basic functionality of the Claude Agent library
 //! components working together.
 
+mod common;
+
 use claude_agent_lib::{config::AgentConfig, server::ClaudeAgentServer};
 use tokio::time::{timeout, Duration};
 
