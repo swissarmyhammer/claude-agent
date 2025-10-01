@@ -7,6 +7,7 @@
 pub mod acp_error_conversion;
 pub mod agent;
 pub mod base64_processor;
+pub mod base64_validation;
 pub mod capability_validation;
 pub mod claude;
 pub mod config;

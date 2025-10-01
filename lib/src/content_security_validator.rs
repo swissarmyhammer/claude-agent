@@ -1,3 +1,4 @@
+use crate::base64_validation;
 use agent_client_protocol::ContentBlock;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -385,9 +386,9 @@ impl ContentSecurityValidator {
         }
 
         // Validate base64 format
-        if !self.is_valid_base64_format(data) {
+        if let Err(e) = base64_validation::validate_base64_format(data) {
             return Err(ContentSecurityError::Base64SecurityViolation {
-                reason: "Invalid base64 format or characters".to_string(),
+                reason: format!("Invalid base64 format: {}", e),
             });
         }
 
@@ -491,24 +492,6 @@ impl ContentSecurityValidator {
         );
 
         Ok(())
-    }
-
-    /// Check if base64 format is valid
-    fn is_valid_base64_format(&self, data: &str) -> bool {
-        if data.is_empty() {
-            return false;
-        }
-
-        // Check for invalid characters
-        if !data.chars().all(|c| {
-            c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=' || c.is_whitespace()
-        }) {
-            return false;
-        }
-
-        // Check basic padding rules
-        let trimmed = data.trim();
-        trimmed.len().is_multiple_of(4)
     }
 
     /// Detect malicious patterns in base64 data

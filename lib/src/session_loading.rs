@@ -674,7 +674,7 @@ mod tests {
 
     #[test]
     fn test_validate_load_request_with_valid_stdio_server() {
-        use agent_client_protocol::{EnvVar, McpServer, SessionId};
+        use agent_client_protocol::{McpServer, SessionId};
         use std::path::PathBuf;
 
         let session_manager = SessionManager::new();
@@ -698,7 +698,7 @@ mod tests {
 
     #[test]
     fn test_validate_load_request_with_valid_http_server() {
-        use agent_client_protocol::{HttpHeader, McpServer, SessionId};
+        use agent_client_protocol::{McpServer, SessionId};
 
         let session_manager = SessionManager::new();
         let loader = EnhancedSessionLoader::new(session_manager);
@@ -720,7 +720,7 @@ mod tests {
 
     #[test]
     fn test_validate_load_request_with_valid_sse_server() {
-        use agent_client_protocol::{HttpHeader, McpServer, SessionId};
+        use agent_client_protocol::{McpServer, SessionId};
 
         let session_manager = SessionManager::new();
         let loader = EnhancedSessionLoader::new(session_manager);
@@ -742,7 +742,7 @@ mod tests {
 
     #[test]
     fn test_validate_load_request_with_invalid_http_url() {
-        use agent_client_protocol::{HttpHeader, McpServer, SessionId};
+        use agent_client_protocol::{McpServer, SessionId};
 
         let session_manager = SessionManager::new();
         let loader = EnhancedSessionLoader::new(session_manager);
@@ -760,7 +760,7 @@ mod tests {
 
         let result = loader.validate_load_request(&request);
         assert!(result.is_err());
-        
+
         if let Err(SessionSetupError::McpServerConnectionFailed { server_name, .. }) = result {
             assert_eq!(server_name, "test-http-server");
         } else {
@@ -770,7 +770,7 @@ mod tests {
 
     #[test]
     fn test_validate_load_request_with_invalid_sse_url() {
-        use agent_client_protocol::{HttpHeader, McpServer, SessionId};
+        use agent_client_protocol::{McpServer, SessionId};
 
         let session_manager = SessionManager::new();
         let loader = EnhancedSessionLoader::new(session_manager);
@@ -788,7 +788,7 @@ mod tests {
 
         let result = loader.validate_load_request(&request);
         assert!(result.is_err());
-        
+
         if let Err(SessionSetupError::McpServerConnectionFailed { server_name, .. }) = result {
             assert_eq!(server_name, "test-sse-server");
         } else {
@@ -798,7 +798,7 @@ mod tests {
 
     #[test]
     fn test_validate_load_request_with_multiple_servers() {
-        use agent_client_protocol::{HttpHeader, McpServer, SessionId};
+        use agent_client_protocol::{McpServer, SessionId};
         use std::path::PathBuf;
 
         let session_manager = SessionManager::new();
@@ -834,7 +834,7 @@ mod tests {
 
     #[test]
     fn test_validate_load_request_with_nonexistent_stdio_command() {
-        use agent_client_protocol::{EnvVar, McpServer, SessionId};
+        use agent_client_protocol::{McpServer, SessionId};
         use std::path::PathBuf;
 
         let session_manager = SessionManager::new();
@@ -854,11 +854,14 @@ mod tests {
 
         let result = loader.validate_load_request(&request);
         assert!(result.is_err());
-        
+
         if let Err(SessionSetupError::McpServerExecutableNotFound { server_name, .. }) = result {
             assert_eq!(server_name, "nonexistent-server");
         } else {
-            panic!("Expected McpServerExecutableNotFound error, got {:?}", result);
+            panic!(
+                "Expected McpServerExecutableNotFound error, got {:?}",
+                result
+            );
         }
     }
 }

@@ -1,3 +1,4 @@
+use crate::base64_validation;
 use crate::content_security_validator::{ContentSecurityError, ContentSecurityValidator};
 use crate::mime_type_validator::{MimeTypeValidationError, MimeTypeValidator};
 use base64::{engine::general_purpose, Engine as _};
@@ -342,30 +343,17 @@ impl Base64Processor {
     }
 
     fn validate_base64_format(&self, data: &str) -> Result<(), Base64ProcessorError> {
-        if data.is_empty() {
-            return Err(Base64ProcessorError::InvalidBase64(
-                "Empty base64 data".to_string(),
-            ));
-        }
-
-        // Check for invalid characters
-        if !data.chars().all(|c| {
-            c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=' || c.is_whitespace()
-        }) {
-            return Err(Base64ProcessorError::InvalidBase64(
-                "Contains invalid characters".to_string(),
-            ));
-        }
-
-        // Check basic base64 padding rules
-        let trimmed = data.trim();
-        if !trimmed.len().is_multiple_of(4) {
-            return Err(Base64ProcessorError::InvalidBase64(
-                "Invalid base64 padding".to_string(),
-            ));
-        }
-
-        Ok(())
+        base64_validation::validate_base64_format(data).map_err(|e| match e {
+            base64_validation::Base64ValidationError::EmptyData => {
+                Base64ProcessorError::InvalidBase64("Empty base64 data".to_string())
+            }
+            base64_validation::Base64ValidationError::InvalidCharacters => {
+                Base64ProcessorError::InvalidBase64("Contains invalid characters".to_string())
+            }
+            base64_validation::Base64ValidationError::InvalidPadding => {
+                Base64ProcessorError::InvalidBase64("Invalid base64 padding".to_string())
+            }
+        })
     }
 
     fn check_size_limits(&self, data: &str) -> Result<(), Base64ProcessorError> {
