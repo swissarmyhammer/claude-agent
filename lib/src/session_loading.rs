@@ -312,8 +312,14 @@ impl EnhancedSessionLoader {
         // Validate working directory (always present in ACP)
         crate::session_validation::validate_working_directory(&request.cwd)?;
 
-        // For now, we'll skip MCP server validation as the types don't match
-        // TODO: Add proper MCP server validation once types are aligned
+        // Validate MCP server configurations
+        for acp_server in &request.mcp_servers {
+            if let Some(internal_config) = Self::convert_acp_to_internal_mcp_config(acp_server) {
+                crate::session_validation::validate_mcp_server_config(&internal_config)?;
+            } else {
+                warn!("Failed to convert ACP MCP server config to internal format for validation");
+            }
+        }
 
         Ok(())
     }
@@ -346,6 +352,73 @@ impl EnhancedSessionLoader {
                     .unwrap_or_default()
                     .as_secs()
             })),
+        }
+    }
+
+    /// Convert ACP MCP server config to internal type for validation
+    fn convert_acp_to_internal_mcp_config(
+        acp_config: &agent_client_protocol::McpServer,
+    ) -> Option<crate::config::McpServerConfig> {
+        use crate::config::{
+            EnvVariable, HttpHeader, HttpTransport, McpServerConfig, SseTransport, StdioTransport,
+        };
+        use agent_client_protocol::McpServer;
+
+        match acp_config {
+            McpServer::Stdio {
+                name,
+                command,
+                args,
+                env,
+            } => {
+                let internal_env = env
+                    .iter()
+                    .map(|env_var| EnvVariable {
+                        name: env_var.name.clone(),
+                        value: env_var.value.clone(),
+                    })
+                    .collect();
+
+                Some(McpServerConfig::Stdio(StdioTransport {
+                    name: name.clone(),
+                    command: command.to_string_lossy().to_string(),
+                    args: args.clone(),
+                    env: internal_env,
+                    cwd: None, // ACP doesn't specify cwd, use default
+                }))
+            }
+            McpServer::Http { name, url, headers } => {
+                let internal_headers = headers
+                    .iter()
+                    .map(|header| HttpHeader {
+                        name: header.name.clone(),
+                        value: header.value.clone(),
+                    })
+                    .collect();
+
+                Some(McpServerConfig::Http(HttpTransport {
+                    transport_type: "http".to_string(),
+                    name: name.clone(),
+                    url: url.clone(),
+                    headers: internal_headers,
+                }))
+            }
+            McpServer::Sse { name, url, headers } => {
+                let internal_headers = headers
+                    .iter()
+                    .map(|header| HttpHeader {
+                        name: header.name.clone(),
+                        value: header.value.clone(),
+                    })
+                    .collect();
+
+                Some(McpServerConfig::Sse(SseTransport {
+                    transport_type: "sse".to_string(),
+                    name: name.clone(),
+                    url: url.clone(),
+                    headers: internal_headers,
+                }))
+            }
         }
     }
 }
@@ -597,5 +670,195 @@ mod tests {
         let replayer = SessionHistoryReplayer::new();
         assert_eq!(replayer.max_replay_failures, 5);
         assert_eq!(replayer.replay_delay_ms, 10);
+    }
+
+    #[test]
+    fn test_validate_load_request_with_valid_stdio_server() {
+        use agent_client_protocol::{EnvVar, McpServer, SessionId};
+        use std::path::PathBuf;
+
+        let session_manager = SessionManager::new();
+        let loader = EnhancedSessionLoader::new(session_manager);
+
+        let request = LoadSessionRequest {
+            session_id: SessionId("sess_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string().into()),
+            cwd: std::env::current_dir().unwrap(),
+            mcp_servers: vec![McpServer::Stdio {
+                name: "test-server".to_string(),
+                command: PathBuf::from("echo"),
+                args: vec!["hello".to_string()],
+                env: vec![],
+            }],
+            meta: None,
+        };
+
+        let result = loader.validate_load_request(&request);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_load_request_with_valid_http_server() {
+        use agent_client_protocol::{HttpHeader, McpServer, SessionId};
+
+        let session_manager = SessionManager::new();
+        let loader = EnhancedSessionLoader::new(session_manager);
+
+        let request = LoadSessionRequest {
+            session_id: SessionId("sess_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string().into()),
+            cwd: std::env::current_dir().unwrap(),
+            mcp_servers: vec![McpServer::Http {
+                name: "test-http-server".to_string(),
+                url: "https://example.com/mcp".to_string(),
+                headers: vec![],
+            }],
+            meta: None,
+        };
+
+        let result = loader.validate_load_request(&request);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_load_request_with_valid_sse_server() {
+        use agent_client_protocol::{HttpHeader, McpServer, SessionId};
+
+        let session_manager = SessionManager::new();
+        let loader = EnhancedSessionLoader::new(session_manager);
+
+        let request = LoadSessionRequest {
+            session_id: SessionId("sess_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string().into()),
+            cwd: std::env::current_dir().unwrap(),
+            mcp_servers: vec![McpServer::Sse {
+                name: "test-sse-server".to_string(),
+                url: "https://example.com/sse".to_string(),
+                headers: vec![],
+            }],
+            meta: None,
+        };
+
+        let result = loader.validate_load_request(&request);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_load_request_with_invalid_http_url() {
+        use agent_client_protocol::{HttpHeader, McpServer, SessionId};
+
+        let session_manager = SessionManager::new();
+        let loader = EnhancedSessionLoader::new(session_manager);
+
+        let request = LoadSessionRequest {
+            session_id: SessionId("sess_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string().into()),
+            cwd: std::env::current_dir().unwrap(),
+            mcp_servers: vec![McpServer::Http {
+                name: "test-http-server".to_string(),
+                url: "not-a-valid-url".to_string(),
+                headers: vec![],
+            }],
+            meta: None,
+        };
+
+        let result = loader.validate_load_request(&request);
+        assert!(result.is_err());
+        
+        if let Err(SessionSetupError::McpServerConnectionFailed { server_name, .. }) = result {
+            assert_eq!(server_name, "test-http-server");
+        } else {
+            panic!("Expected McpServerConnectionFailed error");
+        }
+    }
+
+    #[test]
+    fn test_validate_load_request_with_invalid_sse_url() {
+        use agent_client_protocol::{HttpHeader, McpServer, SessionId};
+
+        let session_manager = SessionManager::new();
+        let loader = EnhancedSessionLoader::new(session_manager);
+
+        let request = LoadSessionRequest {
+            session_id: SessionId("sess_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string().into()),
+            cwd: std::env::current_dir().unwrap(),
+            mcp_servers: vec![McpServer::Sse {
+                name: "test-sse-server".to_string(),
+                url: "invalid://url".to_string(),
+                headers: vec![],
+            }],
+            meta: None,
+        };
+
+        let result = loader.validate_load_request(&request);
+        assert!(result.is_err());
+        
+        if let Err(SessionSetupError::McpServerConnectionFailed { server_name, .. }) = result {
+            assert_eq!(server_name, "test-sse-server");
+        } else {
+            panic!("Expected McpServerConnectionFailed error");
+        }
+    }
+
+    #[test]
+    fn test_validate_load_request_with_multiple_servers() {
+        use agent_client_protocol::{HttpHeader, McpServer, SessionId};
+        use std::path::PathBuf;
+
+        let session_manager = SessionManager::new();
+        let loader = EnhancedSessionLoader::new(session_manager);
+
+        let request = LoadSessionRequest {
+            session_id: SessionId("sess_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string().into()),
+            cwd: std::env::current_dir().unwrap(),
+            mcp_servers: vec![
+                McpServer::Stdio {
+                    name: "stdio-server".to_string(),
+                    command: PathBuf::from("echo"),
+                    args: vec![],
+                    env: vec![],
+                },
+                McpServer::Http {
+                    name: "http-server".to_string(),
+                    url: "https://example.com/mcp".to_string(),
+                    headers: vec![],
+                },
+                McpServer::Sse {
+                    name: "sse-server".to_string(),
+                    url: "https://example.com/sse".to_string(),
+                    headers: vec![],
+                },
+            ],
+            meta: None,
+        };
+
+        let result = loader.validate_load_request(&request);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_load_request_with_nonexistent_stdio_command() {
+        use agent_client_protocol::{EnvVar, McpServer, SessionId};
+        use std::path::PathBuf;
+
+        let session_manager = SessionManager::new();
+        let loader = EnhancedSessionLoader::new(session_manager);
+
+        let request = LoadSessionRequest {
+            session_id: SessionId("sess_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string().into()),
+            cwd: std::env::current_dir().unwrap(),
+            mcp_servers: vec![McpServer::Stdio {
+                name: "nonexistent-server".to_string(),
+                command: PathBuf::from("/absolute/path/to/nonexistent/command"),
+                args: vec![],
+                env: vec![],
+            }],
+            meta: None,
+        };
+
+        let result = loader.validate_load_request(&request);
+        assert!(result.is_err());
+        
+        if let Err(SessionSetupError::McpServerExecutableNotFound { server_name, .. }) = result {
+            assert_eq!(server_name, "nonexistent-server");
+        } else {
+            panic!("Expected McpServerExecutableNotFound error, got {:?}", result);
+        }
     }
 }
