@@ -4,6 +4,7 @@
 //! ensuring all ACP requirements are met with comprehensive error handling.
 
 use crate::session_errors::{SessionSetupError, SessionSetupResult};
+use crate::url_validation;
 use reqwest::Url;
 use std::fs;
 use std::path::Path;
@@ -208,13 +209,12 @@ fn validate_mcp_http_config(config: &crate::config::HttpTransport) -> SessionSet
         })?;
 
     // Validate URL scheme - HTTP requires http or https
-    let scheme = parsed_url.scheme();
-    if scheme != "http" && scheme != "https" {
+    if !url_validation::is_allowed_scheme(&parsed_url, &["http", "https"]) {
         return Err(SessionSetupError::McpServerConnectionFailed {
             server_name: config.name.clone(),
             error: format!(
                 "Invalid URL scheme '{}', expected 'http' or 'https'",
-                scheme
+                parsed_url.scheme()
             ),
             transport_type: "http".to_string(),
         });
@@ -234,13 +234,12 @@ fn validate_mcp_sse_config(config: &crate::config::SseTransport) -> SessionSetup
         })?;
 
     // Validate URL scheme - SSE requires http or https
-    let scheme = parsed_url.scheme();
-    if scheme != "http" && scheme != "https" {
+    if !url_validation::is_allowed_scheme(&parsed_url, &["http", "https"]) {
         return Err(SessionSetupError::McpServerConnectionFailed {
             server_name: config.name.clone(),
             error: format!(
                 "Invalid URL scheme '{}', expected 'http' or 'https'",
-                scheme
+                parsed_url.scheme()
             ),
             transport_type: "sse".to_string(),
         });

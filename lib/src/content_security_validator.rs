@@ -1,12 +1,12 @@
 use crate::base64_validation;
 use crate::error::ToJsonRpcError;
 use crate::size_validator::{SizeValidationError, SizeValidator};
+use crate::url_validation;
 use crate::validation_utils;
 use agent_client_protocol::ContentBlock;
 use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -586,7 +586,12 @@ impl ContentSecurityValidator {
 
         // SSRF protection
         if self.policy.enable_ssrf_protection {
-            self.validate_ssrf_protection(&parsed_uri)?;
+            if let Some(reason) = url_validation::validate_url_against_ssrf(&parsed_uri) {
+                return Err(ContentSecurityError::SsrfProtectionTriggered {
+                    target: uri.to_string(),
+                    reason,
+                });
+            }
         }
 
         Ok(())
@@ -664,77 +669,7 @@ impl ContentSecurityValidator {
         false
     }
 
-    /// Validate SSRF protection
-    fn validate_ssrf_protection(&self, parsed_uri: &Url) -> Result<(), ContentSecurityError> {
-        if let Some(host) = parsed_uri.host_str() {
-            // Check if host is an IP address
-            if let Ok(ip) = host.parse::<IpAddr>() {
-                self.validate_ip_address(&ip, parsed_uri.as_str())?;
-            } else {
-                // Check hostname patterns
-                self.validate_hostname(host, parsed_uri.as_str())?;
-            }
-        }
 
-        Ok(())
-    }
-
-    /// Validate IP address for SSRF protection
-    fn validate_ip_address(&self, ip: &IpAddr, uri: &str) -> Result<(), ContentSecurityError> {
-        match ip {
-            IpAddr::V4(ipv4) => {
-                if self.is_private_ipv4(ipv4) {
-                    return Err(ContentSecurityError::SsrfProtectionTriggered {
-                        target: uri.to_string(),
-                        reason: "Private IPv4 address".to_string(),
-                    });
-                }
-            }
-            IpAddr::V6(ipv6) => {
-                if self.is_private_ipv6(ipv6) {
-                    return Err(ContentSecurityError::SsrfProtectionTriggered {
-                        target: uri.to_string(),
-                        reason: "Private IPv6 address".to_string(),
-                    });
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Validate hostname for SSRF protection
-    fn validate_hostname(&self, hostname: &str, uri: &str) -> Result<(), ContentSecurityError> {
-        let hostname_lower = hostname.to_lowercase();
-
-        // Check for localhost variants
-        if hostname_lower == "localhost" || hostname_lower == "127.0.0.1" {
-            return Err(ContentSecurityError::SsrfProtectionTriggered {
-                target: uri.to_string(),
-                reason: "Localhost hostname".to_string(),
-            });
-        }
-
-        // Check for metadata service endpoints (cloud providers)
-        if hostname_lower == "169.254.169.254" || hostname_lower == "metadata.google.internal" {
-            return Err(ContentSecurityError::SsrfProtectionTriggered {
-                target: uri.to_string(),
-                reason: "Metadata service endpoint".to_string(),
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Check if IPv4 address is private
-    fn is_private_ipv4(&self, ip: &Ipv4Addr) -> bool {
-        ip.is_private() || ip.is_loopback() || ip.is_link_local()
-    }
-
-    /// Check if IPv6 address is private
-    fn is_private_ipv6(&self, ip: &Ipv6Addr) -> bool {
-        ip.is_loopback() || ip.is_unspecified()
-    }
 
     /// Validate text content for potentially dangerous content
     fn validate_text_content_safety(&self, text: &str) -> Result<(), ContentSecurityError> {

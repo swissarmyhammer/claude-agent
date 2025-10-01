@@ -2,12 +2,14 @@ use crate::base64_processor::{Base64Processor, Base64ProcessorError};
 use crate::content_security_validator::{ContentSecurityError, ContentSecurityValidator};
 use crate::error::ToJsonRpcError;
 use crate::size_validator::{SizeValidationError, SizeValidator};
+use crate::url_validation;
 use agent_client_protocol::{ContentBlock, TextContent};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, error, warn};
+use url::Url;
 
 /// Configuration struct for enhanced security settings
 #[derive(Debug)]
@@ -599,19 +601,16 @@ impl ContentBlockProcessor {
             ));
         }
 
-        // Basic URI validation
-        if !uri.contains(':') {
-            return Err(ContentBlockProcessorError::InvalidUri(
-                "URI must contain a scheme".to_string(),
-            ));
-        }
+        // Parse URI
+        let parsed_uri = Url::parse(uri).map_err(|_| {
+            ContentBlockProcessorError::InvalidUri("Invalid URI format".to_string())
+        })?;
 
         // Allow common schemes
         let allowed_schemes = ["file", "http", "https", "data", "ftp"];
-        let scheme = uri.split(':').next().unwrap_or("");
-
-        if !allowed_schemes.contains(&scheme) {
-            warn!("Potentially unsupported URI scheme: {}", scheme);
+        
+        if !url_validation::is_allowed_scheme(&parsed_uri, &allowed_schemes) {
+            warn!("Potentially unsupported URI scheme: {}", parsed_uri.scheme());
         }
 
         Ok(())

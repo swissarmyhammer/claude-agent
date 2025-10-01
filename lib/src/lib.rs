@@ -39,6 +39,7 @@ mod tool_call_lifecycle_tests;
 pub mod tool_classification;
 pub mod tool_types;
 pub mod tools;
+pub mod url_validation;
 pub mod validation_utils;
 
 pub use agent::ClaudeAgent;
