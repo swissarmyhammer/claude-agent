@@ -408,10 +408,9 @@ impl ContentBlockProcessor {
                     ));
                 }
             }
-            ContentBlock::Resource(_resource_content) => {
+            ContentBlock::Resource(resource_content) => {
                 self.validate_capability("resource")?;
-                // Resource structure validation will be enhanced when Resource processing is fully implemented
-                debug!("Resource content structure validation placeholder");
+                self.validate_resource_structure(resource_content)?;
             }
             ContentBlock::ResourceLink(resource_link) => {
                 self.validate_capability("resource_link")?;
@@ -616,6 +615,45 @@ impl ContentBlockProcessor {
                 "Potentially unsupported URI scheme: {}",
                 parsed_uri.scheme()
             );
+        }
+
+        Ok(())
+    }
+
+    /// Validate resource structure
+    fn validate_resource_structure(
+        &self,
+        resource_content: &agent_client_protocol::EmbeddedResource,
+    ) -> Result<(), ContentBlockProcessorError> {
+        use agent_client_protocol::EmbeddedResourceResource;
+
+        match &resource_content.resource {
+            EmbeddedResourceResource::TextResourceContents(text_resource) => {
+                // Validate text is non-empty
+                if text_resource.text.is_empty() {
+                    return Err(ContentBlockProcessorError::InvalidContentStructure {
+                        details: "Resource text cannot be empty".to_string(),
+                    });
+                }
+
+                // Validate URI if validation is enabled
+                if self.enable_uri_validation && !text_resource.uri.is_empty() {
+                    self.validate_uri(&text_resource.uri)?;
+                }
+            }
+            EmbeddedResourceResource::BlobResourceContents(blob_resource) => {
+                // Validate blob is non-empty
+                if blob_resource.blob.is_empty() {
+                    return Err(ContentBlockProcessorError::InvalidContentStructure {
+                        details: "Resource blob cannot be empty".to_string(),
+                    });
+                }
+
+                // Validate URI if validation is enabled
+                if self.enable_uri_validation && !blob_resource.uri.is_empty() {
+                    self.validate_uri(&blob_resource.uri)?;
+                }
+            }
         }
 
         Ok(())
@@ -1053,16 +1091,18 @@ mod tests {
 
     #[test]
     fn test_process_resource_content_placeholder() {
+        use agent_client_protocol::{EmbeddedResourceResource, TextResourceContents};
+
         let processor = create_test_processor();
 
-        // Create a proper EmbeddedResource with the actual structure
-        let resource_data = serde_json::json!({
-            "uri": "file:///test.txt",
-            "text": "Test content",
-            "mimeType": "text/plain"
-        });
+        let text_resource = TextResourceContents {
+            uri: "file:///test.txt".to_string(),
+            text: "Test content".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            meta: None,
+        };
         let embedded_resource = EmbeddedResource {
-            resource: serde_json::from_value(resource_data).unwrap(),
+            resource: EmbeddedResourceResource::TextResourceContents(text_resource),
             annotations: None,
             meta: None,
         };
@@ -1249,5 +1289,75 @@ mod tests {
         assert_eq!(summary.total_size_bytes, 0);
         assert!(summary.combined_text.is_empty());
         assert!(summary.content_type_counts.is_empty());
+    }
+
+    #[test]
+    fn test_validate_resource_structure_with_text() {
+        use agent_client_protocol::{EmbeddedResourceResource, TextResourceContents};
+
+        let processor = create_test_processor();
+
+        let text_resource = TextResourceContents {
+            uri: "https://example.com/data.json".to_string(),
+            text: "Sample text content".to_string(),
+            mime_type: None,
+            meta: None,
+        };
+        let embedded = EmbeddedResource {
+            resource: EmbeddedResourceResource::TextResourceContents(text_resource),
+            annotations: None,
+            meta: None,
+        };
+        let content_block = ContentBlock::Resource(embedded);
+
+        let result = processor.validate_content_block_structure(&content_block);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_resource_structure_with_blob() {
+        use agent_client_protocol::{BlobResourceContents, EmbeddedResourceResource};
+
+        let processor = create_test_processor();
+
+        let blob_resource = BlobResourceContents {
+            uri: "".to_string(),
+            blob: "SGVsbG8gV29ybGQ=".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            meta: None,
+        };
+        let embedded = EmbeddedResource {
+            resource: EmbeddedResourceResource::BlobResourceContents(blob_resource),
+            annotations: None,
+            meta: None,
+        };
+        let content_block = ContentBlock::Resource(embedded);
+
+        let result = processor.validate_content_block_structure(&content_block);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_resource_structure_empty() {
+        use agent_client_protocol::{EmbeddedResourceResource, TextResourceContents};
+
+        let processor = create_test_processor();
+
+        let text_resource = TextResourceContents {
+            uri: "".to_string(),
+            text: "".to_string(),  // Empty text should fail validation
+            mime_type: None,
+            meta: None,
+        };
+        let embedded = EmbeddedResource {
+            resource: EmbeddedResourceResource::TextResourceContents(text_resource),
+            annotations: None,
+            meta: None,
+        };
+        let content_block = ContentBlock::Resource(embedded);
+
+        let result = processor.validate_content_block_structure(&content_block);
+        // Empty resource should fail validation
+        assert!(result.is_err());
     }
 }

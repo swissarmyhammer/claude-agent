@@ -5,6 +5,7 @@ use crate::size_validator::{SizeValidationError, SizeValidator};
 use crate::url_validation;
 use crate::validation_utils;
 use agent_client_protocol::ContentBlock;
+use base64;
 use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -433,11 +434,8 @@ impl ContentSecurityValidator {
                     )?;
                 }
             }
-            ContentBlock::Resource(_resource_content) => {
-                // Enhanced Resource validation will be implemented when Resource processing is fully available
-                debug!(
-                    "Resource content security validation - placeholder for future implementation"
-                );
+            ContentBlock::Resource(resource_content) => {
+                self.validate_resource_content(resource_content)?;
             }
             ContentBlock::ResourceLink(resource_link) => {
                 self.validate_uri_security(&resource_link.uri)?;
@@ -610,25 +608,187 @@ impl ContentSecurityValidator {
         Ok(())
     }
 
+    /// Validate resource content security
+    ///
+    /// Validates embedded resource content including URI security, text content safety,
+    /// base64 blob security, and content type consistency for both text and blob resources.
+    ///
+    /// # Arguments
+    ///
+    /// * `resource_content` - The embedded resource to validate
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` if validation passes
+    /// * `Err(ContentSecurityError)` if any validation check fails
+    ///
+    /// # Validation Checks
+    ///
+    /// For text resources:
+    /// - URI security validation (if URI is non-empty)
+    /// - Text content safety checks (if content sanitization is enabled)
+    ///
+    /// For blob resources:
+    /// - URI security validation (if URI is non-empty)
+    /// - Base64 security validation (if blob is non-empty)
+    /// - Content type consistency validation (if format validation is enabled and MIME type is not application/octet-stream)
+    pub fn validate_resource_content(
+        &self,
+        resource_content: &agent_client_protocol::EmbeddedResource,
+    ) -> Result<(), ContentSecurityError> {
+        use agent_client_protocol::EmbeddedResourceResource;
+
+        match &resource_content.resource {
+            EmbeddedResourceResource::TextResourceContents(text_resource) => {
+                // Validate URI
+                if !text_resource.uri.is_empty() {
+                    self.validate_uri_security(&text_resource.uri)?;
+                }
+
+                // Validate text content
+                if !text_resource.text.is_empty() && self.policy.enable_content_sanitization {
+                    self.validate_text_content_safety(&text_resource.text)?;
+                }
+            }
+            EmbeddedResourceResource::BlobResourceContents(blob_resource) => {
+                // Validate URI
+                if !blob_resource.uri.is_empty() {
+                    self.validate_uri_security(&blob_resource.uri)?;
+                }
+
+                // Validate base64 blob data
+                if !blob_resource.blob.is_empty() {
+                    self.validate_base64_security(&blob_resource.blob, "resource")?;
+
+                    // Validate content type consistency if MIME type is provided
+                    if self.policy.enable_format_validation {
+                        if let Some(ref mime_type) = blob_resource.mime_type {
+                            if mime_type != "application/octet-stream" {
+                                self.validate_content_type_consistency(&blob_resource.blob, mime_type)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Sniff content type from binary data using magic numbers
+    ///
+    /// Uses the `infer` crate to detect file types by examining magic numbers
+    /// at the beginning of the binary data.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - Binary data to analyze
+    ///
+    /// # Returns
+    ///
+    /// * `Some(String)` containing the detected MIME type if recognizable
+    /// * `None` if the content type cannot be determined
+    pub fn sniff_content_type(&self, data: &[u8]) -> Option<String> {
+        infer::get(data).map(|kind| kind.mime_type().to_string())
+    }
+
     /// Validate content type consistency to detect spoofing
+    ///
+    /// Compares the declared MIME type against the actual content type detected
+    /// from magic numbers in the binary data. This helps prevent content type
+    /// spoofing attacks where an attacker declares one type but provides another.
+    ///
+    /// # Arguments
+    ///
+    /// * `base64_data` - Base64-encoded binary data to validate
+    /// * `declared_mime_type` - The MIME type claimed for this content
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` if content sniffing is disabled, types match, or type cannot be determined
+    /// * `Err(ContentSecurityError::ContentTypeSpoofingDetected)` if declared and actual types differ
+    /// * `Err(ContentSecurityError::Base64SecurityViolation)` if base64 decoding fails
+    ///
+    /// # Implementation Details
+    ///
+    /// - Only validates the first 512 bytes (684 base64 characters) for efficiency
+    /// - Normalizes MIME types for comparison (e.g., "image/jpg" vs "image/jpeg")
+    /// - Permissive for unknown types that cannot be detected
     pub fn validate_content_type_consistency(
         &self,
-        _base64_data: &str,
+        base64_data: &str,
         declared_mime_type: &str,
     ) -> Result<(), ContentSecurityError> {
         if !self.policy.enable_content_sniffing {
             return Ok(());
         }
 
-        // This is a placeholder for content sniffing implementation
-        // In a real implementation, we would decode a small portion of the base64 data
-        // and check magic numbers to verify the actual content type
         debug!(
             "Content type consistency validation for {}",
             declared_mime_type
         );
 
+        // Decode a portion of the base64 data to check magic numbers
+        // We only need the first 512 bytes for magic number detection
+        let sample_size = std::cmp::min(base64_data.len(), 684); // 684 base64 chars = ~512 bytes
+        let sample = &base64_data[..sample_size];
+
+        // Decode the sample
+        use base64::Engine;
+        let decoded = match base64::engine::general_purpose::STANDARD.decode(sample) {
+            Ok(data) => data,
+            Err(e) => {
+                return Err(ContentSecurityError::Base64SecurityViolation {
+                    reason: format!("Failed to decode base64 for content sniffing: {}", e),
+                });
+            }
+        };
+
+        // Sniff the actual content type
+        if let Some(actual_mime_type) = self.sniff_content_type(&decoded) {
+            // Normalize MIME types for comparison (some variations are acceptable)
+            let declared_normalized = self.normalize_mime_type(declared_mime_type);
+            let actual_normalized = self.normalize_mime_type(&actual_mime_type);
+
+            if declared_normalized != actual_normalized {
+                return Err(ContentSecurityError::ContentTypeSpoofingDetected {
+                    declared: declared_mime_type.to_string(),
+                    actual: actual_mime_type,
+                });
+            }
+        }
+        // If we can't determine the type, we allow it (permissive for unknown types)
+
         Ok(())
+    }
+
+    /// Normalize MIME type for comparison
+    ///
+    /// Converts MIME types to a canonical form for consistent comparison.
+    /// Handles common variations and aliases.
+    ///
+    /// # Arguments
+    ///
+    /// * `mime_type` - The MIME type string to normalize
+    ///
+    /// # Returns
+    ///
+    /// A normalized MIME type string in lowercase with common aliases resolved
+    ///
+    /// # Examples of Normalization
+    ///
+    /// - `"IMAGE/JPEG"` → `"image/jpeg"`
+    /// - `"image/jpg"` → `"image/jpeg"`
+    fn normalize_mime_type(&self, mime_type: &str) -> String {
+        // Convert to lowercase and handle common variations
+        let normalized = mime_type.to_lowercase();
+
+        // Map common variations to canonical forms
+        match normalized.as_str() {
+            "image/jpg" => "image/jpeg".to_string(),
+            "audio/x-wav" => "audio/wav".to_string(),
+            _ => normalized,
+        }
     }
 
     /// Detect malicious patterns in base64 data
@@ -876,5 +1036,152 @@ mod tests {
         // This might pass or fail depending on system performance
         // The test mainly checks that timeout handling is implemented
         let _result = validator.validate_content_security(&content);
+    }
+
+    #[test]
+    fn test_sniff_content_type_png() {
+        let validator = create_test_validator();
+        // 1x1 PNG in base64
+        let png_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
+
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD.decode(png_data).unwrap();
+        let result = validator.sniff_content_type(&decoded);
+
+        assert!(result.is_some());
+        let mime_type = result.unwrap();
+        assert_eq!(mime_type, "image/png");
+    }
+
+    #[test]
+    fn test_sniff_content_type_jpeg() {
+        let validator = create_test_validator();
+        // JPEG header (FFD8FF)
+        let jpeg_header = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46];
+
+        let result = validator.sniff_content_type(&jpeg_header);
+
+        assert!(result.is_some());
+        let mime_type = result.unwrap();
+        assert_eq!(mime_type, "image/jpeg");
+    }
+
+    #[test]
+    fn test_sniff_content_type_unknown() {
+        let validator = create_test_validator();
+        let unknown_data = vec![0x00, 0x01, 0x02, 0x03];
+
+        let result = validator.sniff_content_type(&unknown_data);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_content_type_consistency_matching() {
+        let validator = create_test_validator();
+        let png_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
+
+        let result = validator.validate_content_type_consistency(png_data, "image/png");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_content_type_consistency_spoofing() {
+        let validator = create_test_validator();
+        let png_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
+
+        // Declaring as JPEG when it's actually PNG
+        let result = validator.validate_content_type_consistency(png_data, "image/jpeg");
+        assert!(result.is_err());
+
+        if let Err(ContentSecurityError::ContentTypeSpoofingDetected { declared, actual }) = result {
+            assert_eq!(declared, "image/jpeg");
+            assert_eq!(actual, "image/png");
+        } else {
+            panic!("Expected ContentTypeSpoofingDetected error");
+        }
+    }
+
+    #[test]
+    fn test_content_type_consistency_disabled() {
+        let mut policy = SecurityPolicy::moderate();
+        policy.enable_content_sniffing = false;
+        let validator = ContentSecurityValidator::new(policy).unwrap();
+
+        let png_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
+
+        // Should pass even with mismatched types when sniffing is disabled
+        let result = validator.validate_content_type_consistency(png_data, "image/jpeg");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_resource_content_with_uri() {
+        use agent_client_protocol::{EmbeddedResourceResource, TextResourceContents};
+
+        let validator = create_test_validator();
+
+        let text_resource = TextResourceContents {
+            uri: "https://example.com/data.json".to_string(),
+            text: "Sample text content".to_string(),
+            mime_type: None,
+            meta: None,
+        };
+        let embedded = agent_client_protocol::EmbeddedResource {
+            resource: EmbeddedResourceResource::TextResourceContents(text_resource),
+            annotations: None,
+            meta: None,
+        };
+        let content = ContentBlock::Resource(embedded);
+
+        let result = validator.validate_content_security(&content);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_resource_content_with_invalid_uri() {
+        use agent_client_protocol::{EmbeddedResourceResource, TextResourceContents};
+
+        let validator = create_test_validator();
+
+        let text_resource = TextResourceContents {
+            uri: "http://localhost/secret".to_string(),
+            text: "Sample text content".to_string(),
+            mime_type: None,
+            meta: None,
+        };
+        let embedded = agent_client_protocol::EmbeddedResource {
+            resource: EmbeddedResourceResource::TextResourceContents(text_resource),
+            annotations: None,
+            meta: None,
+        };
+        let content = ContentBlock::Resource(embedded);
+
+        let result = validator.validate_content_security(&content);
+        // Should fail due to SSRF protection (localhost)
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_resource_content_with_blob() {
+        use agent_client_protocol::{BlobResourceContents, EmbeddedResourceResource};
+
+        let validator = create_test_validator();
+
+        let blob_resource = BlobResourceContents {
+            uri: "".to_string(),
+            blob: "SGVsbG8gV29ybGQ=".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            meta: None,
+        };
+        let embedded = agent_client_protocol::EmbeddedResource {
+            resource: EmbeddedResourceResource::BlobResourceContents(blob_resource),
+            annotations: None,
+            meta: None,
+        };
+        let content = ContentBlock::Resource(embedded);
+
+        let result = validator.validate_content_security(&content);
+        assert!(result.is_ok());
     }
 }
