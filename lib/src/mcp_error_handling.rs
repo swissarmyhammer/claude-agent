@@ -700,13 +700,14 @@ impl EnhancedMcpServerManager {
             })?
         } else {
             // Handle JSON response
-            response.json().await.map_err(|e| {
-                SessionSetupError::McpServerConnectionFailed {
+            response
+                .json()
+                .await
+                .map_err(|e| SessionSetupError::McpServerConnectionFailed {
                     server_name: http_config.name.clone(),
                     error: format!("Failed to parse initialize response: {}", e),
                     transport_type: "http".to_string(),
-                }
-            })?
+                })?
         };
 
         // Validate initialize response
@@ -766,7 +767,8 @@ impl EnhancedMcpServerManager {
 
         // Include session ID if present
         if let Some(session_id_value) = session_id.read().await.as_ref() {
-            tools_request_builder = tools_request_builder.header("Mcp-Session-Id", session_id_value);
+            tools_request_builder =
+                tools_request_builder.header("Mcp-Session-Id", session_id_value);
         }
 
         let tools_response = tools_request_builder
@@ -857,21 +859,397 @@ impl EnhancedMcpServerManager {
             Vec::new()
         };
 
-        tracing::info!("MCP server {} reported {} tools", http_config.name, tools.len());
+        tracing::info!(
+            "MCP server {} reported {} tools",
+            http_config.name,
+            tools.len()
+        );
         Ok(tools)
     }
 
     /// Initialize SSE MCP protocol with comprehensive error handling
+    ///
+    /// SSE transport uses a persistent GET connection for receiving server events
+    /// and POST requests for sending client requests (initialize, tools/call, etc).
+    ///
+    /// # Arguments
+    /// * `sse_config` - SSE transport configuration including URL and headers
+    /// * `response_tx` - Channel for sending responses from the event stream
+    ///
+    /// # Returns
+    /// List of available tool names from the MCP server
+    ///
+    /// # Errors
+    /// Returns SessionSetupError if:
+    /// - Connection fails
+    /// - Server returns non-success status
+    /// - Response parsing fails
+    /// - Protocol negotiation fails
     async fn initialize_sse_mcp_protocol_enhanced(
         &self,
-        _sse_config: &crate::config::SseTransport,
-        _response_tx: mpsc::UnboundedSender<String>,
+        sse_config: &crate::config::SseTransport,
+        response_tx: mpsc::UnboundedSender<String>,
     ) -> SessionSetupResult<Vec<String>> {
-        // This is a placeholder implementation - SSE MCP protocol would need actual specification
-        tracing::warn!("SSE MCP protocol initialization is not fully implemented");
+        tracing::info!("Initializing SSE MCP protocol for {}", sse_config.name);
 
-        // Basic URL validation was already done in connect_sse_server_enhanced
-        Ok(vec!["sse_placeholder_tool".to_string()])
+        // Create HTTP client with headers
+        let mut headers = reqwest::header::HeaderMap::new();
+        for header in &sse_config.headers {
+            if let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(header.name.as_bytes()),
+                reqwest::header::HeaderValue::from_str(&header.value),
+            ) {
+                headers.insert(name, value);
+            }
+        }
+
+        let client = Client::builder()
+            .default_headers(headers.clone())
+            .build()
+            .map_err(|e| SessionSetupError::McpServerConnectionFailed {
+                server_name: sse_config.name.clone(),
+                error: format!("Failed to create HTTP client: {}", e),
+                transport_type: "sse".to_string(),
+            })?;
+
+        // Step 1: Send initialize request via POST
+        let initialize_request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {}
+                },
+                "clientInfo": {
+                    "name": "claude-agent",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }
+        });
+
+        let response = timeout(
+            Duration::from_millis(self.protocol_timeout_ms),
+            client
+                .post(&sse_config.url)
+                .header("Accept", "text/event-stream")
+                .header("Content-Type", "application/json")
+                .json(&initialize_request)
+                .send(),
+        )
+        .await
+        .map_err(|_| SessionSetupError::McpServerConnectionFailed {
+            server_name: sse_config.name.clone(),
+            error: format!(
+                "Initialize request timed out after {}ms",
+                self.protocol_timeout_ms
+            ),
+            transport_type: "sse".to_string(),
+        })?
+        .map_err(|e| SessionSetupError::McpServerConnectionFailed {
+            server_name: sse_config.name.clone(),
+            error: format!("Failed to send initialize request: {}", e),
+            transport_type: "sse".to_string(),
+        })?;
+
+        if !response.status().is_success() {
+            return Err(SessionSetupError::McpServerConnectionFailed {
+                server_name: sse_config.name.clone(),
+                error: format!("Initialize request failed with status: {}", response.status()),
+                transport_type: "sse".to_string(),
+            });
+        }
+
+        // Parse SSE response for initialize
+        let body = response
+            .text()
+            .await
+            .map_err(|e| SessionSetupError::McpServerConnectionFailed {
+                server_name: sse_config.name.clone(),
+                error: format!("Failed to read SSE response: {}", e),
+                transport_type: "sse".to_string(),
+            })?;
+
+        let initialize_response = Self::parse_sse_response_enhanced(&sse_config.name, &body)?;
+
+        // Validate initialize response
+        if let Some(error) = initialize_response.get("error") {
+            return Err(SessionSetupError::McpServerConnectionFailed {
+                server_name: sse_config.name.clone(),
+                error: format!("Server returned error: {}", error),
+                transport_type: "sse".to_string(),
+            });
+        }
+
+        // Step 2: Send initialized notification
+        let initialized_notification = json!({
+            "jsonrpc": "2.0",
+            "method": "initialized"
+        });
+
+        let notify_response = timeout(
+            Duration::from_millis(self.protocol_timeout_ms),
+            client
+                .post(&sse_config.url)
+                .header("Accept", "text/event-stream")
+                .header("Content-Type", "application/json")
+                .json(&initialized_notification)
+                .send(),
+        )
+        .await
+        .map_err(|_| SessionSetupError::McpServerConnectionFailed {
+            server_name: sse_config.name.clone(),
+            error: format!(
+                "Initialized notification timed out after {}ms",
+                self.protocol_timeout_ms
+            ),
+            transport_type: "sse".to_string(),
+        })?
+        .map_err(|e| SessionSetupError::McpServerConnectionFailed {
+            server_name: sse_config.name.clone(),
+            error: format!("Failed to send initialized notification: {}", e),
+            transport_type: "sse".to_string(),
+        })?;
+
+        if notify_response.status() != reqwest::StatusCode::ACCEPTED {
+            tracing::warn!(
+                "Initialized notification returned status: {} (expected 202 Accepted)",
+                notify_response.status()
+            );
+        }
+
+        // Step 3: Request list of available tools
+        let tools_list_request = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list"
+        });
+
+        let tools_response = timeout(
+            Duration::from_millis(self.protocol_timeout_ms),
+            client
+                .post(&sse_config.url)
+                .header("Accept", "text/event-stream")
+                .header("Content-Type", "application/json")
+                .json(&tools_list_request)
+                .send(),
+        )
+        .await
+        .map_err(|_| SessionSetupError::McpServerConnectionFailed {
+            server_name: sse_config.name.clone(),
+            error: format!(
+                "Tools list request timed out after {}ms",
+                self.protocol_timeout_ms
+            ),
+            transport_type: "sse".to_string(),
+        })?
+        .map_err(|e| SessionSetupError::McpServerConnectionFailed {
+            server_name: sse_config.name.clone(),
+            error: format!("Failed to send tools/list request: {}", e),
+            transport_type: "sse".to_string(),
+        })?;
+
+        if !tools_response.status().is_success() {
+            return Err(SessionSetupError::McpServerConnectionFailed {
+                server_name: sse_config.name.clone(),
+                error: format!(
+                    "Tools list request failed with status: {}",
+                    tools_response.status()
+                ),
+                transport_type: "sse".to_string(),
+            });
+        }
+
+        let tools_body = tools_response
+            .text()
+            .await
+            .map_err(|e| SessionSetupError::McpServerConnectionFailed {
+                server_name: sse_config.name.clone(),
+                error: format!("Failed to read tools SSE response: {}", e),
+                transport_type: "sse".to_string(),
+            })?;
+
+        let tools_response_json =
+            Self::parse_sse_response_enhanced(&sse_config.name, &tools_body)?;
+        let final_tools = self.extract_tools_from_list_response_enhanced(
+            &sse_config.name,
+            &tools_response_json,
+        )?;
+
+        tracing::info!(
+            "SSE MCP server {} provides {} tools: {:?}",
+            sse_config.name,
+            final_tools.len(),
+            final_tools
+        );
+
+        // Spawn background task to maintain SSE event stream for server-initiated events
+        let event_url = sse_config.url.clone();
+        let event_client = client.clone();
+        let server_name = sse_config.name.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                Self::handle_sse_event_stream_enhanced(&server_name, event_client, &event_url, response_tx)
+                    .await
+            {
+                tracing::error!("SSE event stream error for {}: {}", server_name, e);
+            }
+        });
+
+        Ok(final_tools)
+    }
+
+    /// Parse SSE response body to extract JSON data
+    ///
+    /// SSE format specification (https://html.spec.whatwg.org/multipage/server-sent-events.html):
+    /// - Lines starting with "data: " contain the actual message data
+    /// - Multiple data lines can be sent for a single event
+    /// - Empty line indicates end of event
+    ///
+    /// This implementation extracts only the first "data: " line for simplicity.
+    ///
+    /// # Example SSE stream format
+    /// ```text
+    /// data: {"jsonrpc":"2.0","id":1,"result":{"tools":[]}}
+    ///
+    /// data: {"jsonrpc":"2.0","method":"notification"}
+    ///
+    /// ```
+    fn parse_sse_response_enhanced(server_name: &str, body: &str) -> SessionSetupResult<Value> {
+        let mut json_data = String::new();
+        for line in body.lines() {
+            if let Some(data) = line.strip_prefix("data: ") {
+                json_data = data.to_string();
+                break;
+            }
+        }
+
+        if json_data.is_empty() {
+            return Err(SessionSetupError::McpServerConnectionFailed {
+                server_name: server_name.to_string(),
+                error: "No data in SSE response".to_string(),
+                transport_type: "sse".to_string(),
+            });
+        }
+
+        serde_json::from_str(&json_data).map_err(|e| SessionSetupError::McpServerConnectionFailed {
+            server_name: server_name.to_string(),
+            error: format!("Invalid JSON in SSE response: {}", e),
+            transport_type: "sse".to_string(),
+        })
+    }
+
+    /// Handle persistent SSE event stream for server-initiated events
+    ///
+    /// This runs in a background task and maintains a persistent connection to the SSE endpoint.
+    /// It buffers incoming bytes and processes complete SSE messages line by line.
+    ///
+    /// The buffer size is limited to prevent memory exhaustion attacks.
+    async fn handle_sse_event_stream_enhanced(
+        server_name: &str,
+        client: Client,
+        url: &str,
+        response_tx: mpsc::UnboundedSender<String>,
+    ) -> SessionSetupResult<()> {
+        use futures::StreamExt;
+
+        const MAX_BUFFER_SIZE: usize = 1024 * 1024; // 1MB limit
+
+        loop {
+            tracing::debug!("Establishing SSE event stream connection for {}", server_name);
+
+            let response = client
+                .get(url)
+                .header("Accept", "text/event-stream")
+                .send()
+                .await
+                .map_err(|e| SessionSetupError::McpServerConnectionFailed {
+                    server_name: server_name.to_string(),
+                    error: format!("Failed to establish SSE event stream: {}", e),
+                    transport_type: "sse".to_string(),
+                })?;
+
+            if !response.status().is_success() {
+                return Err(SessionSetupError::McpServerConnectionFailed {
+                    server_name: server_name.to_string(),
+                    error: format!("SSE event stream failed with status: {}", response.status()),
+                    transport_type: "sse".to_string(),
+                });
+            }
+
+            let mut bytes_stream = response.bytes_stream();
+            let mut buffer = String::new();
+
+            while let Some(chunk_result) = bytes_stream.next().await {
+                match chunk_result {
+                    Ok(chunk) => {
+                        let text = String::from_utf8_lossy(&chunk);
+                        
+                        // Prevent unbounded buffer growth
+                        if buffer.len() + text.len() > MAX_BUFFER_SIZE {
+                            tracing::error!(
+                                "SSE buffer exceeded maximum size for {}, resetting",
+                                server_name
+                            );
+                            buffer.clear();
+                            continue;
+                        }
+                        
+                        buffer.push_str(&text);
+
+                        // Process complete lines from buffer
+                        while let Some(newline_pos) = buffer.find('\n') {
+                            let line = buffer[..newline_pos].to_string();
+                            buffer = buffer[newline_pos + 1..].to_string();
+
+                            if let Some(data) = line.strip_prefix("data: ") {
+                                if response_tx.send(data.to_string()).is_err() {
+                                    tracing::warn!("SSE response channel closed for {}", server_name);
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Error reading SSE stream for {}: {}", server_name, e);
+                        break;
+                    }
+                }
+            }
+
+            // Connection closed, wait before reconnecting
+            tracing::info!("SSE connection closed for {}, reconnecting in 5 seconds", server_name);
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        }
+    }
+
+    /// Extract tools from tools/list response
+    fn extract_tools_from_list_response_enhanced(
+        &self,
+        server_name: &str,
+        response: &Value,
+    ) -> SessionSetupResult<Vec<String>> {
+        let mut tools = Vec::new();
+
+        if let Some(result) = response.get("result") {
+            if let Some(tools_array) = result.get("tools") {
+                if let Some(tool_list) = tools_array.as_array() {
+                    for tool in tool_list {
+                        if let Some(name) = tool.get("name").and_then(|n| n.as_str()) {
+                            tools.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // If no tools found, log warning but don't fail
+        if tools.is_empty() {
+            tracing::warn!("No tools found in MCP tools/list response for {}", server_name);
+        }
+
+        Ok(tools)
     }
 }
 
@@ -948,5 +1326,135 @@ mod tests {
         } else {
             panic!("Expected McpServerConnectionFailed error");
         }
+    }
+
+    #[test]
+    fn test_parse_sse_response_valid() {
+        let sse_body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n";
+        let result =
+            EnhancedMcpServerManager::parse_sse_response_enhanced("test_server", sse_body);
+        assert!(result.is_ok());
+        let json = result.unwrap();
+        assert_eq!(json.get("jsonrpc").and_then(|v| v.as_str()), Some("2.0"));
+        assert_eq!(json.get("id").and_then(|v| v.as_i64()), Some(1));
+    }
+
+    #[test]
+    fn test_parse_sse_response_multiple_data_lines() {
+        let sse_body = "data: {\"jsonrpc\":\"2.0\",\"id\":1}\ndata: {\"other\":\"data\"}\n\n";
+        let result =
+            EnhancedMcpServerManager::parse_sse_response_enhanced("test_server", sse_body);
+        assert!(result.is_ok());
+        let json = result.unwrap();
+        // Should parse only the first data line
+        assert_eq!(json.get("jsonrpc").and_then(|v| v.as_str()), Some("2.0"));
+        assert!(json.get("other").is_none());
+    }
+
+    #[test]
+    fn test_parse_sse_response_no_data() {
+        let sse_body = "event: message\n\n";
+        let result =
+            EnhancedMcpServerManager::parse_sse_response_enhanced("test_server", sse_body);
+        assert!(result.is_err());
+        if let Err(SessionSetupError::McpServerConnectionFailed { error, .. }) = result {
+            assert!(error.contains("No data in SSE response"));
+        } else {
+            panic!("Expected McpServerConnectionFailed error");
+        }
+    }
+
+    #[test]
+    fn test_parse_sse_response_invalid_json() {
+        let sse_body = "data: not valid json\n\n";
+        let result =
+            EnhancedMcpServerManager::parse_sse_response_enhanced("test_server", sse_body);
+        assert!(result.is_err());
+        if let Err(SessionSetupError::McpServerConnectionFailed { error, .. }) = result {
+            assert!(error.contains("Invalid JSON in SSE response"));
+        } else {
+            panic!("Expected McpServerConnectionFailed error");
+        }
+    }
+
+    #[test]
+    fn test_extract_tools_from_list_response_valid() {
+        let manager = EnhancedMcpServerManager::new();
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "tools": [
+                    {"name": "tool1", "description": "First tool"},
+                    {"name": "tool2", "description": "Second tool"}
+                ]
+            }
+        });
+
+        let result = manager.extract_tools_from_list_response_enhanced("test_server", &response);
+        assert!(result.is_ok());
+        let tools = result.unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0], "tool1");
+        assert_eq!(tools[1], "tool2");
+    }
+
+    #[test]
+    fn test_extract_tools_from_list_response_empty() {
+        let manager = EnhancedMcpServerManager::new();
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "tools": []
+            }
+        });
+
+        let result = manager.extract_tools_from_list_response_enhanced("test_server", &response);
+        assert!(result.is_ok());
+        let tools = result.unwrap();
+        assert_eq!(tools.len(), 0);
+    }
+
+    #[test]
+    fn test_extract_tools_from_list_response_no_result() {
+        let manager = EnhancedMcpServerManager::new();
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "error": {
+                "code": -32600,
+                "message": "Invalid request"
+            }
+        });
+
+        let result = manager.extract_tools_from_list_response_enhanced("test_server", &response);
+        assert!(result.is_ok());
+        let tools = result.unwrap();
+        assert_eq!(tools.len(), 0);
+    }
+
+    #[test]
+    fn test_extract_tools_from_list_response_malformed() {
+        let manager = EnhancedMcpServerManager::new();
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "tools": [
+                    {"name": "tool1"},
+                    {"description": "tool without name"},
+                    {"name": "tool2"}
+                ]
+            }
+        });
+
+        let result = manager.extract_tools_from_list_response_enhanced("test_server", &response);
+        assert!(result.is_ok());
+        let tools = result.unwrap();
+        // Should skip the tool without a name
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0], "tool1");
+        assert_eq!(tools[1], "tool2");
     }
 }

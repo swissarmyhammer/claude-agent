@@ -639,20 +639,319 @@ impl McpServerManager {
         Ok(final_tools)
     }
 
-    /// Initialize SSE MCP connection
+    /// Initialize SSE MCP connection using persistent event stream.
+    ///
+    /// SSE transport uses a persistent GET connection for receiving server events
+    /// and POST requests for sending client requests (initialize, tools/call, etc).
+    ///
+    /// # Arguments
+    /// * `config` - SSE transport configuration including URL and headers
+    /// * `response_tx` - Channel for sending responses from the event stream
+    ///
+    /// # Returns
+    /// List of available tool names from the MCP server
+    ///
+    /// # Errors
+    /// Returns error if:
+    /// - Connection fails
+    /// - Server returns non-success status
+    /// - Response parsing fails
+    /// - Protocol negotiation fails
     async fn initialize_sse_mcp_connection(
         &self,
         config: &crate::config::SseTransport,
-        _response_tx: mpsc::UnboundedSender<String>,
+        response_tx: mpsc::UnboundedSender<String>,
     ) -> crate::Result<Vec<String>> {
-        // For now, return empty tools list as SSE implementation is complex
-        // This is a placeholder for the full SSE implementation
-        tracing::warn!(
-            "SSE MCP server {} connection initialized but not fully implemented",
-            config.name
+        tracing::info!("Initializing SSE MCP protocol for {}", config.name);
+
+        // Create HTTP client with headers
+        let mut headers = reqwest::header::HeaderMap::new();
+        for header in &config.headers {
+            if let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(header.name.as_bytes()),
+                reqwest::header::HeaderValue::from_str(&header.value),
+            ) {
+                headers.insert(name, value);
+            }
+        }
+
+        let client = Client::builder()
+            .default_headers(headers.clone())
+            .build()
+            .map_err(|e| {
+                crate::AgentError::ToolExecution(format!(
+                    "Failed to create HTTP client for SSE MCP server {}: {}",
+                    config.name, e
+                ))
+            })?;
+
+        // Step 1: Send initialize request via POST
+        let initialize_request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {}
+                },
+                "clientInfo": {
+                    "name": "claude-agent",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }
+        });
+
+        let response = client
+            .post(&config.url)
+            .header("Accept", "text/event-stream")
+            .header("Content-Type", "application/json")
+            .json(&initialize_request)
+            .send()
+            .await
+            .map_err(|e| {
+                crate::AgentError::ToolExecution(format!(
+                    "Failed to send initialize request to SSE MCP server: {}",
+                    e
+                ))
+            })?;
+
+        if !response.status().is_success() {
+            return Err(crate::AgentError::ToolExecution(format!(
+                "Initialize request failed with status: {}",
+                response.status()
+            )));
+        }
+
+        // Parse SSE response for initialize
+        let body = response.text().await.map_err(|e| {
+            crate::AgentError::ToolExecution(format!(
+                "Failed to read SSE response from MCP server: {}",
+                e
+            ))
+        })?;
+
+        let initialize_response = Self::parse_sse_response(&body)?;
+
+        // Validate initialize response
+        if let Some(error) = initialize_response.get("error") {
+            return Err(crate::AgentError::ToolExecution(format!(
+                "SSE MCP server returned error: {}",
+                error
+            )));
+        }
+
+        // Step 2: Send initialized notification
+        let initialized_notification = json!({
+            "jsonrpc": "2.0",
+            "method": "initialized"
+        });
+
+        let notify_response = client
+            .post(&config.url)
+            .header("Accept", "text/event-stream")
+            .header("Content-Type", "application/json")
+            .json(&initialized_notification)
+            .send()
+            .await
+            .map_err(|e| {
+                crate::AgentError::ToolExecution(format!(
+                    "Failed to send initialized notification to SSE MCP server: {}",
+                    e
+                ))
+            })?;
+
+        if notify_response.status() != reqwest::StatusCode::ACCEPTED {
+            tracing::warn!(
+                "Initialized notification returned status: {} (expected 202 Accepted)",
+                notify_response.status()
+            );
+        }
+
+        // Step 3: Request list of available tools
+        let tools_list_request = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list"
+        });
+
+        let tools_response = client
+            .post(&config.url)
+            .header("Accept", "text/event-stream")
+            .header("Content-Type", "application/json")
+            .json(&tools_list_request)
+            .send()
+            .await
+            .map_err(|e| {
+                crate::AgentError::ToolExecution(format!(
+                    "Failed to send tools/list request to SSE MCP server: {}",
+                    e
+                ))
+            })?;
+
+        if !tools_response.status().is_success() {
+            return Err(crate::AgentError::ToolExecution(format!(
+                "Tools list request failed with status: {}",
+                tools_response.status()
+            )));
+        }
+
+        let tools_body = tools_response.text().await.map_err(|e| {
+            crate::AgentError::ToolExecution(format!(
+                "Failed to read tools SSE response from MCP server: {}",
+                e
+            ))
+        })?;
+
+        let tools_response_json = Self::parse_sse_response(&tools_body)?;
+        let final_tools = self.extract_tools_from_list_response(&tools_response_json)?;
+
+        tracing::info!(
+            "SSE MCP server {} provides {} tools: {:?}",
+            config.name,
+            final_tools.len(),
+            final_tools
         );
 
-        Ok(vec![])
+        // Spawn background task to maintain SSE event stream for server-initiated events
+        let event_url = config.url.clone();
+        let event_client = client.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                Self::handle_sse_event_stream(event_client, &event_url, response_tx).await
+            {
+                tracing::error!("SSE event stream error: {}", e);
+            }
+        });
+
+        Ok(final_tools)
+    }
+
+    /// Parse SSE response body to extract JSON data
+    ///
+    /// SSE format specification (https://html.spec.whatwg.org/multipage/server-sent-events.html):
+    /// - Lines starting with "data: " contain the actual message data
+    /// - Multiple data lines can be sent for a single event
+    /// - Empty line indicates end of event
+    ///
+    /// This implementation extracts only the first "data: " line for simplicity.
+    ///
+    /// # Example SSE stream format
+    /// ```text
+    /// data: {"jsonrpc":"2.0","id":1,"result":{"tools":[]}}
+    ///
+    /// data: {"jsonrpc":"2.0","method":"notification"}
+    ///
+    /// ```
+    fn parse_sse_response(body: &str) -> crate::Result<Value> {
+        let mut json_data = String::new();
+        for line in body.lines() {
+            if let Some(data) = line.strip_prefix("data: ") {
+                json_data = data.to_string();
+                break;
+            }
+        }
+
+        if json_data.is_empty() {
+            return Err(crate::AgentError::ToolExecution(
+                "No data in SSE response from MCP server".to_string(),
+            ));
+        }
+
+        serde_json::from_str(&json_data).map_err(|e| {
+            crate::AgentError::ToolExecution(format!(
+                "Invalid JSON in SSE response from MCP server: {}",
+                e
+            ))
+        })
+    }
+
+    /// Handle persistent SSE event stream for server-initiated events
+    ///
+    /// This runs in a background task and maintains a persistent connection to the SSE endpoint.
+    /// It buffers incoming bytes and processes complete SSE messages line by line.
+    ///
+    /// The buffer size is limited to prevent memory exhaustion attacks.
+    ///
+    /// # Example SSE stream
+    /// ```text
+    /// data: {"jsonrpc":"2.0","method":"tools/list_changed"}
+    ///
+    /// data: {"jsonrpc":"2.0","method":"progress","params":{"progressToken":"token1"}}
+    ///
+    /// ```
+    async fn handle_sse_event_stream(
+        client: Client,
+        url: &str,
+        response_tx: mpsc::UnboundedSender<String>,
+    ) -> crate::Result<()> {
+        use futures::StreamExt;
+
+        const MAX_BUFFER_SIZE: usize = 1024 * 1024; // 1MB limit
+
+        loop {
+            tracing::debug!("Establishing SSE event stream connection");
+
+            let response = client
+                .get(url)
+                .header("Accept", "text/event-stream")
+                .send()
+                .await
+                .map_err(|e| {
+                    crate::AgentError::ToolExecution(format!(
+                        "Failed to establish SSE event stream: {}",
+                        e
+                    ))
+                })?;
+
+            if !response.status().is_success() {
+                return Err(crate::AgentError::ToolExecution(format!(
+                    "SSE event stream failed with status: {}",
+                    response.status()
+                )));
+            }
+
+            let mut bytes_stream = response.bytes_stream();
+            let mut buffer = String::new();
+
+            while let Some(chunk_result) = bytes_stream.next().await {
+                match chunk_result {
+                    Ok(chunk) => {
+                        let text = String::from_utf8_lossy(&chunk);
+                        
+                        // Prevent unbounded buffer growth
+                        if buffer.len() + text.len() > MAX_BUFFER_SIZE {
+                            tracing::error!("SSE buffer exceeded maximum size, resetting");
+                            buffer.clear();
+                            continue;
+                        }
+                        
+                        buffer.push_str(&text);
+
+                        // Process complete lines from buffer
+                        while let Some(newline_pos) = buffer.find('\n') {
+                            let line = buffer[..newline_pos].to_string();
+                            buffer = buffer[newline_pos + 1..].to_string();
+
+                            if let Some(data) = line.strip_prefix("data: ") {
+                                if response_tx.send(data.to_string()).is_err() {
+                                    tracing::warn!("SSE response channel closed");
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Error reading SSE stream: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            // Connection closed, wait before reconnecting
+            tracing::info!("SSE connection closed, reconnecting in 5 seconds");
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        }
     }
 
     /// Extract tools from initialize response
@@ -799,11 +1098,60 @@ impl McpServerManager {
 
                 Ok(response_json)
             }
-            TransportConnection::Sse { .. } => {
-                // SSE transport not fully implemented yet
-                Err(crate::AgentError::ToolExecution(
-                    "SSE transport tool calls not yet implemented".to_string(),
-                ))
+            TransportConnection::Sse { url, headers, .. } => {
+                // Create HTTP client with headers
+                let mut header_map = reqwest::header::HeaderMap::new();
+                for header in headers {
+                    if let (Ok(name), Ok(value)) = (
+                        reqwest::header::HeaderName::from_bytes(header.name.as_bytes()),
+                        reqwest::header::HeaderValue::from_str(&header.value),
+                    ) {
+                        header_map.insert(name, value);
+                    }
+                }
+
+                let client = Client::builder()
+                    .default_headers(header_map)
+                    .build()
+                    .map_err(|e| {
+                        crate::AgentError::ToolExecution(format!(
+                            "Failed to create HTTP client for SSE tool call: {}",
+                            e
+                        ))
+                    })?;
+
+                // Send tool call request via POST
+                let response = client
+                    .post(url)
+                    .header("Accept", "text/event-stream")
+                    .header("Content-Type", "application/json")
+                    .json(&mcp_request)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        crate::AgentError::ToolExecution(format!(
+                            "Failed to send SSE tool call request to MCP server: {}",
+                            e
+                        ))
+                    })?;
+
+                if !response.status().is_success() {
+                    return Err(crate::AgentError::ToolExecution(format!(
+                        "SSE tool call request failed with status: {}",
+                        response.status()
+                    )));
+                }
+
+                // Parse SSE response
+                let body = response.text().await.map_err(|e| {
+                    crate::AgentError::ToolExecution(format!(
+                        "Failed to read SSE tool call response from MCP server: {}",
+                        e
+                    ))
+                })?;
+
+                let response_json = Self::parse_sse_response(&body)?;
+                Ok(response_json)
             }
         }
     }
@@ -1324,7 +1672,7 @@ mod tests {
     #[test]
     fn test_parse_sse_response_with_data() {
         let sse_body = "data: {\"jsonrpc\":\"2.0\",\"result\":{\"tools\":[]}}\n\n";
-        
+
         let mut json_data = String::new();
         for line in sse_body.lines() {
             if let Some(data) = line.strip_prefix("data: ") {
@@ -1332,7 +1680,7 @@ mod tests {
                 break;
             }
         }
-        
+
         assert!(!json_data.is_empty());
         let parsed: Value = serde_json::from_str(&json_data).unwrap();
         assert_eq!(parsed["jsonrpc"], "2.0");
@@ -1341,7 +1689,7 @@ mod tests {
     #[test]
     fn test_parse_sse_response_empty() {
         let sse_body = "event: message\n\n";
-        
+
         let mut json_data = String::new();
         for line in sse_body.lines() {
             if let Some(data) = line.strip_prefix("data: ") {
@@ -1349,27 +1697,27 @@ mod tests {
                 break;
             }
         }
-        
+
         assert!(json_data.is_empty());
     }
 
     #[test]
     fn test_session_id_storage() {
         use tokio::runtime::Runtime;
-        
+
         let rt = Runtime::new().unwrap();
         rt.block_on(async {
             let session_id = Arc::new(RwLock::new(None));
-            
+
             // Test initial state
             assert!(session_id.read().await.is_none());
-            
+
             // Test storing session ID
             {
                 let mut write_lock = session_id.write().await;
                 *write_lock = Some("test-session-123".to_string());
             }
-            
+
             // Test reading session ID
             let read_lock = session_id.read().await;
             assert_eq!(read_lock.as_ref().unwrap(), "test-session-123");
@@ -1379,21 +1727,23 @@ mod tests {
     #[test]
     fn test_http_transport_connection_has_session_id() {
         use tokio::runtime::Runtime;
-        
+
         let rt = Runtime::new().unwrap();
         rt.block_on(async {
             let client = reqwest::Client::new();
             let session_id = Arc::new(RwLock::new(Some("session-abc".to_string())));
-            
+
             let transport = TransportConnection::Http {
                 client: Arc::new(client),
                 url: "http://localhost:8080".to_string(),
                 headers: vec![],
                 session_id: session_id.clone(),
             };
-            
+
             match transport {
-                TransportConnection::Http { session_id: sid, .. } => {
+                TransportConnection::Http {
+                    session_id: sid, ..
+                } => {
                     assert_eq!(sid.read().await.as_ref().unwrap(), "session-abc");
                 }
                 _ => panic!("Expected HTTP transport"),

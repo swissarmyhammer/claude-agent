@@ -664,7 +664,10 @@ impl ContentSecurityValidator {
                     if self.policy.enable_format_validation {
                         if let Some(ref mime_type) = blob_resource.mime_type {
                             if mime_type != "application/octet-stream" {
-                                self.validate_content_type_consistency(&blob_resource.blob, mime_type)?;
+                                self.validate_content_type_consistency(
+                                    &blob_resource.blob,
+                                    mime_type,
+                                )?;
                             }
                         }
                     }
@@ -1045,7 +1048,9 @@ mod tests {
         let png_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
 
         use base64::Engine;
-        let decoded = base64::engine::general_purpose::STANDARD.decode(png_data).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(png_data)
+            .unwrap();
         let result = validator.sniff_content_type(&decoded);
 
         assert!(result.is_some());
@@ -1094,7 +1099,8 @@ mod tests {
         let result = validator.validate_content_type_consistency(png_data, "image/jpeg");
         assert!(result.is_err());
 
-        if let Err(ContentSecurityError::ContentTypeSpoofingDetected { declared, actual }) = result {
+        if let Err(ContentSecurityError::ContentTypeSpoofingDetected { declared, actual }) = result
+        {
             assert_eq!(declared, "image/jpeg");
             assert_eq!(actual, "image/png");
         } else {

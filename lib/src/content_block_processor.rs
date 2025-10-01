@@ -1345,7 +1345,7 @@ mod tests {
 
         let text_resource = TextResourceContents {
             uri: "".to_string(),
-            text: "".to_string(),  // Empty text should fail validation
+            text: "".to_string(), // Empty text should fail validation
             mime_type: None,
             meta: None,
         };
