@@ -1,3 +1,4 @@
+use crate::validation_utils;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -83,8 +84,8 @@ impl PathValidator {
 
     /// Validate that a path is absolute according to ACP specification
     pub fn validate_absolute_path(&self, path_str: &str) -> Result<PathBuf, PathValidationError> {
-        // Check for empty path
-        if path_str.is_empty() {
+        // Check for empty path using common validation
+        if validation_utils::is_empty_str(path_str) {
             return Err(PathValidationError::EmptyPath);
         }
 

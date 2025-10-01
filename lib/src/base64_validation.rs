@@ -20,6 +20,7 @@
 //! to `ContentSecurityError::Base64SecurityViolation` with descriptive
 //! error messages for security auditing.
 
+use crate::validation_utils;
 use thiserror::Error;
 
 #[derive(Debug, Error, Clone)]
@@ -49,7 +50,8 @@ pub enum Base64ValidationError {
 /// assert!(validate_base64_format("Invalid!@#$").is_err());
 /// ```
 pub fn validate_base64_format(data: &str) -> Result<(), Base64ValidationError> {
-    if data.is_empty() {
+    // Use common validation utility for empty check
+    if validation_utils::is_empty_str(data) {
         return Err(Base64ValidationError::EmptyData);
     }
 

@@ -1,4 +1,5 @@
 use crate::base64_validation;
+use crate::validation_utils;
 use agent_client_protocol::ContentBlock;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -404,8 +405,8 @@ impl ContentSecurityValidator {
 
     /// Validate URI security including SSRF protection
     pub fn validate_uri_security(&self, uri: &str) -> Result<(), ContentSecurityError> {
-        // Basic format validation
-        if uri.is_empty() {
+        // Basic format validation using common validation utility
+        if validation_utils::is_empty_str(uri) {
             return Err(ContentSecurityError::UriSecurityViolation {
                 uri: uri.to_string(),
                 reason: "Empty URI".to_string(),

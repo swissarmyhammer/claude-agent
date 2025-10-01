@@ -200,20 +200,22 @@ fn validate_mcp_stdio_config(config: &crate::config::StdioTransport) -> SessionS
 /// Validate HTTP MCP server configuration
 fn validate_mcp_http_config(config: &crate::config::HttpTransport) -> SessionSetupResult<()> {
     // Validate URL format
-    let parsed_url = Url::parse(&config.url).map_err(|_| {
-        SessionSetupError::McpServerConnectionFailed {
+    let parsed_url =
+        Url::parse(&config.url).map_err(|_| SessionSetupError::McpServerConnectionFailed {
             server_name: config.name.clone(),
             error: "Invalid URL format".to_string(),
             transport_type: "http".to_string(),
-        }
-    })?;
+        })?;
 
     // Validate URL scheme - HTTP requires http or https
     let scheme = parsed_url.scheme();
     if scheme != "http" && scheme != "https" {
         return Err(SessionSetupError::McpServerConnectionFailed {
             server_name: config.name.clone(),
-            error: format!("Invalid URL scheme '{}', expected 'http' or 'https'", scheme),
+            error: format!(
+                "Invalid URL scheme '{}', expected 'http' or 'https'",
+                scheme
+            ),
             transport_type: "http".to_string(),
         });
     }
@@ -224,20 +226,22 @@ fn validate_mcp_http_config(config: &crate::config::HttpTransport) -> SessionSet
 /// Validate SSE MCP server configuration
 fn validate_mcp_sse_config(config: &crate::config::SseTransport) -> SessionSetupResult<()> {
     // Validate URL format
-    let parsed_url = Url::parse(&config.url).map_err(|_| {
-        SessionSetupError::McpServerConnectionFailed {
+    let parsed_url =
+        Url::parse(&config.url).map_err(|_| SessionSetupError::McpServerConnectionFailed {
             server_name: config.name.clone(),
             error: "Invalid URL format".to_string(),
             transport_type: "sse".to_string(),
-        }
-    })?;
+        })?;
 
     // Validate URL scheme - SSE requires http or https
     let scheme = parsed_url.scheme();
     if scheme != "http" && scheme != "https" {
         return Err(SessionSetupError::McpServerConnectionFailed {
             server_name: config.name.clone(),
-            error: format!("Invalid URL scheme '{}', expected 'http' or 'https'", scheme),
+            error: format!(
+                "Invalid URL scheme '{}', expected 'http' or 'https'",
+                scheme
+            ),
             transport_type: "sse".to_string(),
         });
     }

@@ -5,6 +5,7 @@
 //! detailed error reporting as required by the ACP specification.
 
 use crate::session_errors::{SessionSetupError, SessionSetupResult};
+use crate::validation_utils;
 use agent_client_protocol::{LoadSessionRequest, NewSessionRequest, SessionId};
 use serde_json::Value;
 
@@ -54,7 +55,8 @@ impl RequestValidator {
         session_id: &SessionId,
         request_type: &str,
     ) -> SessionSetupResult<()> {
-        if session_id.0.is_empty() {
+        // Use common validation utility for empty check
+        if validation_utils::is_empty_str(&session_id.0) {
             return Err(SessionSetupError::MissingRequiredParameter {
                 request_type: request_type.to_string(),
                 parameter_name: "sessionId".to_string(),
@@ -73,7 +75,8 @@ impl RequestValidator {
         cwd: &std::path::Path,
         request_type: &str,
     ) -> SessionSetupResult<()> {
-        if cwd.as_os_str().is_empty() {
+        // Use common validation utility for empty path check
+        if validation_utils::is_empty_path(cwd) {
             return Err(SessionSetupError::InvalidParameterType(Box::new(
                 crate::session_errors::InvalidParameterTypeDetails {
                     request_type: request_type.to_string(),
@@ -380,7 +383,8 @@ impl RequestValidator {
             }
             "PathBuf" => {
                 if let Some(path_str) = param_value.as_str() {
-                    if path_str.is_empty() {
+                    // Use common validation utility for empty check
+                    if validation_utils::is_empty_str(path_str) {
                         return Err(SessionSetupError::InvalidParameterType(Box::new(
                             crate::session_errors::InvalidParameterTypeDetails {
                                 request_type: request_type.to_string(),
