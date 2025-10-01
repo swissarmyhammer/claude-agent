@@ -19,11 +19,11 @@ pub enum PathValidationError {
     #[error("Path is not absolute: {0}")]
     NotAbsolute(String),
 
-    #[error("Path traversal attempt detected")]
-    PathTraversalAttempt,
+    #[error("Path traversal attempt detected in: {0}")]
+    PathTraversalAttempt(String),
 
-    #[error("Path contains relative components")]
-    RelativeComponent,
+    #[error("Path contains relative components: {0}")]
+    RelativeComponent(String),
 
     #[error("Path too long: {0} characters > maximum allowed ({1})")]
     PathTooLong(usize, usize),
@@ -82,7 +82,19 @@ impl PathValidator {
         self
     }
 
-    /// Validate that a path is absolute according to ACP specification
+    /// Validate that a path is absolute according to ACP specification.
+    ///
+    /// This method performs comprehensive path validation with multiple security checks:
+    ///
+    /// 1. **Quick traversal check** - Fast string-based pattern matching for early rejection
+    /// 2. **Absolute path verification** - Platform-specific absolute path validation
+    /// 3. **Canonicalization** - Resolves symlinks and normalizes path (if strict mode enabled)
+    /// 4. **Component-based security** - Authoritative check for traversal attempts
+    /// 5. **Boundary validation** - Ensures path is within allowed roots (if configured)
+    ///
+    /// The validation uses a layered approach where the string-based check provides
+    /// fast rejection of obviously malicious paths, while the component-based check
+    /// serves as the canonical security validation after normalization.
     pub fn validate_absolute_path(&self, path_str: &str) -> Result<PathBuf, PathValidationError> {
         // Check for empty path using common validation
         if validation_utils::is_empty_str(path_str) {
@@ -110,8 +122,8 @@ impl PathValidator {
             return Err(PathValidationError::NotAbsolute(path_str.to_string()));
         }
 
-        // Check for path traversal attempts in raw string
-        self.validate_path_security_raw(path_str)?;
+        // Quick traversal check on raw string (fast early rejection)
+        self.quick_traversal_check(path_str)?;
 
         // Normalize path if strict canonicalization is enabled
         let normalized = if self.strict_canonicalization {
@@ -137,13 +149,21 @@ impl PathValidator {
         path.is_absolute()
     }
 
-    /// Validate path security against traversal attempts in raw string
-    fn validate_path_security_raw(&self, path_str: &str) -> Result<(), PathValidationError> {
-        // Check for obvious path traversal patterns in raw string
+    /// Fast string-based path traversal pre-check for early rejection.
+    ///
+    /// This is an optimization that quickly rejects obviously malicious paths
+    /// before expensive operations like canonicalization. It checks for common
+    /// path traversal patterns in the raw string.
+    ///
+    /// Note: This is NOT the canonical security check. Always use `validate_path_security()`
+    /// on the normalized Path for authoritative validation.
+    fn quick_traversal_check(&self, path_str: &str) -> Result<(), PathValidationError> {
         let suspicious_patterns = ["/../", "\\..\\", "/..", "\\..", "../", "..\\"];
         for pattern in &suspicious_patterns {
             if path_str.contains(pattern) {
-                return Err(PathValidationError::PathTraversalAttempt);
+                return Err(PathValidationError::PathTraversalAttempt(
+                    path_str.to_string(),
+                ));
             }
         }
         Ok(())
@@ -159,16 +179,25 @@ impl PathValidator {
         })
     }
 
-    /// Validate path security against traversal attempts in normalized path
+    /// Canonical component-based path security validation.
+    ///
+    /// This is the authoritative security check that examines the path's components
+    /// to detect parent directory (`..`) and current directory (`.`) references.
+    /// This method is robust against encoding tricks and path obfuscation.
+    ///
+    /// Should be called on normalized/canonicalized paths for best results.
     fn validate_path_security(&self, path: &Path) -> Result<(), PathValidationError> {
-        // Check for dangerous path components
         for component in path.components() {
             match component {
                 std::path::Component::ParentDir => {
-                    return Err(PathValidationError::PathTraversalAttempt);
+                    return Err(PathValidationError::PathTraversalAttempt(
+                        path.display().to_string(),
+                    ));
                 }
                 std::path::Component::CurDir => {
-                    return Err(PathValidationError::RelativeComponent);
+                    return Err(PathValidationError::RelativeComponent(
+                        path.display().to_string(),
+                    ));
                 }
                 _ => {}
             }
@@ -283,7 +312,7 @@ mod tests {
                 Err(PathValidationError::NotAbsolute(p)) => {
                     assert_eq!(p, path);
                 }
-                Err(PathValidationError::PathTraversalAttempt) => {
+                Err(PathValidationError::PathTraversalAttempt(_)) => {
                     // Also acceptable for ../ patterns
                 }
                 Ok(_) => panic!("Expected relative path '{}' to be rejected", path),
@@ -305,7 +334,7 @@ mod tests {
         for path in unix_traversal_paths {
             let result = validator.validate_absolute_path(path);
             match result {
-                Err(PathValidationError::PathTraversalAttempt) => {
+                Err(PathValidationError::PathTraversalAttempt(_)) => {
                     // Expected
                 }
                 Err(PathValidationError::CanonicalizationFailed(_, _)) => {
@@ -326,7 +355,7 @@ mod tests {
             for path in windows_traversal_paths {
                 let result = validator.validate_absolute_path(path);
                 match result {
-                    Err(PathValidationError::PathTraversalAttempt) => {
+                    Err(PathValidationError::PathTraversalAttempt(_)) => {
                         // Expected
                     }
                     Err(PathValidationError::CanonicalizationFailed(_, _)) => {
@@ -349,7 +378,7 @@ mod tests {
                     Err(PathValidationError::NotAbsolute(_)) => {
                         // Expected on non-Windows systems
                     }
-                    Err(PathValidationError::PathTraversalAttempt) => {
+                    Err(PathValidationError::PathTraversalAttempt(_)) => {
                         // Also acceptable if detected as traversal before absolute check
                     }
                     Ok(_) => panic!(
@@ -479,8 +508,8 @@ mod tests {
             // These might pass or fail depending on canonicalization behavior
             // The key is that they are handled consistently
             match result {
-                Ok(_) => {}                                       // Canonicalization resolved the ./
-                Err(PathValidationError::RelativeComponent) => {} // Detected as relative component
+                Ok(_) => {}                                          // Canonicalization resolved the ./
+                Err(PathValidationError::RelativeComponent(_)) => {} // Detected as relative component
                 Err(PathValidationError::CanonicalizationFailed(_, _)) => {} // Path doesn't exist
                 Err(e) => panic!(
                     "Unexpected error for path with current dir component '{}': {}",

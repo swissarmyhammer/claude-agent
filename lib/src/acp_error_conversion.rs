@@ -80,9 +80,9 @@ impl ToJsonRpcError for ContentProcessingError {
             | Self::MissingRequiredField { .. }
             | Self::ContentValidationFailed { .. }
             | Self::FormatDetectionFailed { .. } => -32602, // Invalid params
-            Self::ProcessingTimeout { .. }
-            | Self::MemoryPressure
-            | Self::ResourceContention => -32603, // Internal error
+            Self::ProcessingTimeout { .. } | Self::MemoryPressure | Self::ResourceContention => {
+                -32603
+            } // Internal error
         }
     }
 
@@ -192,7 +192,7 @@ pub fn convert_content_security_error_to_acp(
     context: Option<ErrorContext>,
 ) -> JsonRpcError {
     let mut json_rpc_error = error.to_json_rpc_error();
-    
+
     // Add correlation context if available
     if let Some(ctx) = context {
         if let Some(ref mut data) = json_rpc_error.data {
@@ -205,7 +205,7 @@ pub fn convert_content_security_error_to_acp(
             }
         }
     }
-    
+
     json_rpc_error
 }
 
@@ -398,7 +398,7 @@ pub fn convert_base64_error_to_acp(
     context: Option<ErrorContext>,
 ) -> JsonRpcError {
     let mut json_rpc_error = error.to_json_rpc_error();
-    
+
     // Add correlation context if available
     if let Some(ctx) = context {
         if let Some(ref mut data) = json_rpc_error.data {
@@ -411,7 +411,7 @@ pub fn convert_base64_error_to_acp(
             }
         }
     }
-    
+
     json_rpc_error
 }
 
@@ -571,7 +571,7 @@ pub fn convert_mime_type_error_to_acp(
     context: Option<ErrorContext>,
 ) -> JsonRpcError {
     let mut json_rpc_error = error.to_json_rpc_error();
-    
+
     // Add correlation context if available
     if let Some(ctx) = context {
         if let Some(ref mut data) = json_rpc_error.data {
@@ -584,7 +584,7 @@ pub fn convert_mime_type_error_to_acp(
             }
         }
     }
-    
+
     json_rpc_error
 }
 
@@ -683,7 +683,7 @@ pub fn convert_content_block_error_to_acp(
     context: Option<ErrorContext>,
 ) -> JsonRpcError {
     let mut json_rpc_error = error.to_json_rpc_error();
-    
+
     // Add correlation context if available
     if let Some(ctx) = context {
         if let Some(ref mut data) = json_rpc_error.data {
@@ -696,7 +696,7 @@ pub fn convert_content_block_error_to_acp(
             }
         }
     }
-    
+
     json_rpc_error
 }
 
@@ -894,7 +894,7 @@ pub fn convert_content_processing_error_to_acp(
     context: Option<ErrorContext>,
 ) -> JsonRpcError {
     let mut json_rpc_error = error.to_json_rpc_error();
-    
+
     // Add correlation context if available
     if let Some(ctx) = context {
         if let Some(ref mut data) = json_rpc_error.data {
@@ -907,7 +907,7 @@ pub fn convert_content_processing_error_to_acp(
             }
         }
     }
-    
+
     json_rpc_error
 }
 
@@ -1133,7 +1133,10 @@ mod tests {
         let json_rpc_error = convert_base64_error_to_acp(error, Some(context));
 
         assert_eq!(json_rpc_error.code, -32602);
-        assert_eq!(json_rpc_error.message, "Invalid base64 format: Invalid padding");
+        assert_eq!(
+            json_rpc_error.message,
+            "Invalid base64 format: Invalid padding"
+        );
 
         if let Some(data) = json_rpc_error.data {
             assert_eq!(data["error"], "invalid_base64_format");
@@ -1207,7 +1210,10 @@ mod tests {
         let json_rpc_error = convert_content_processing_error_to_acp(error, None);
 
         assert_eq!(json_rpc_error.code, -32602);
-        assert_eq!(json_rpc_error.message, "Security validation failed: sensitive internal details");
+        assert_eq!(
+            json_rpc_error.message,
+            "Security validation failed: sensitive internal details"
+        );
 
         if let Some(data) = json_rpc_error.data {
             assert_eq!(data["error"], "security_violation");

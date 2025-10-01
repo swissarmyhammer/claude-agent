@@ -1480,14 +1480,14 @@ impl ToolCallHandler {
                         p
                     ))
                 }
-                PathValidationError::PathTraversalAttempt => {
+                PathValidationError::PathTraversalAttempt(path) => {
                     crate::AgentError::ToolExecution(
-                        "Path traversal attempt detected. Parent directory references (..) are not allowed".to_string()
+                        format!("Path traversal attempt detected in '{}'. Parent directory references (..) are not allowed", path)
                     )
                 }
-                PathValidationError::RelativeComponent => {
+                PathValidationError::RelativeComponent(path) => {
                     crate::AgentError::ToolExecution(
-                        "Path contains relative components (. or ..) which are not allowed".to_string()
+                        format!("Path '{}' contains relative components (. or ..) which are not allowed", path)
                     )
                 }
                 PathValidationError::PathTooLong(actual, max) => {

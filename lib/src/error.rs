@@ -265,13 +265,28 @@ mod tests {
     #[test]
     fn test_trait_json_rpc_error_codes() {
         // Test all error code mappings using trait
-        assert_eq!(AgentError::Protocol("test".to_string()).to_json_rpc_code(), -32600);
-        assert_eq!(AgentError::MethodNotFound("test".to_string()).to_json_rpc_code(), -32601);
-        assert_eq!(AgentError::InvalidRequest("test".to_string()).to_json_rpc_code(), -32602);
-        assert_eq!(AgentError::Internal("test".to_string()).to_json_rpc_code(), -32603);
-        
+        assert_eq!(
+            AgentError::Protocol("test".to_string()).to_json_rpc_code(),
+            -32600
+        );
+        assert_eq!(
+            AgentError::MethodNotFound("test".to_string()).to_json_rpc_code(),
+            -32601
+        );
+        assert_eq!(
+            AgentError::InvalidRequest("test".to_string()).to_json_rpc_code(),
+            -32602
+        );
+        assert_eq!(
+            AgentError::Internal("test".to_string()).to_json_rpc_code(),
+            -32603
+        );
+
         // Test MCP error codes
-        assert_eq!(McpError::ProtocolError("test".to_string()).to_json_rpc_code(), -32600);
+        assert_eq!(
+            McpError::ProtocolError("test".to_string()).to_json_rpc_code(),
+            -32600
+        );
         assert_eq!(McpError::RequestTimeout.to_json_rpc_code(), -32000);
     }
 

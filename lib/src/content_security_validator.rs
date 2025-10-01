@@ -67,8 +67,7 @@ impl ToJsonRpcError for ContentSecurityError {
             | Self::ContentArrayTooLarge { .. }
             | Self::InvalidContentEncoding { .. }
             | Self::MaliciousPatternDetected { .. } => -32602, // Invalid params
-            Self::ProcessingTimeout { .. }
-            | Self::RateLimitExceeded { .. } => -32000, // Server error
+            Self::ProcessingTimeout { .. } | Self::RateLimitExceeded { .. } => -32000, // Server error
         }
     }
 
