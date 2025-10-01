@@ -1,6 +1,8 @@
 use crate::base64_processor::{Base64Processor, Base64ProcessorError};
 use crate::content_security_validator::{ContentSecurityError, ContentSecurityValidator};
+use crate::error::ToJsonRpcError;
 use agent_client_protocol::{ContentBlock, TextContent};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -54,6 +56,117 @@ pub enum ContentBlockProcessorError {
     ContentArrayValidationFailed { details: String },
     #[error("Content security validation failed: {0}")]
     ContentSecurityValidationFailed(#[from] ContentSecurityError),
+}
+
+impl ToJsonRpcError for ContentBlockProcessorError {
+    fn to_json_rpc_code(&self) -> i32 {
+        match self {
+            Self::Base64Error(base64_error) => base64_error.to_json_rpc_code(),
+            Self::ResourceValidation(_)
+            | Self::ResourceLinkValidation(_)
+            | Self::UnsupportedContentType(_)
+            | Self::MissingRequiredField(_)
+            | Self::InvalidUri(_)
+            | Self::ContentSizeExceeded { .. }
+            | Self::InvalidAnnotation(_)
+            | Self::CapabilityNotSupported { .. }
+            | Self::ContentValidationFailed { .. }
+            | Self::InvalidContentStructure { .. }
+            | Self::ContentArrayValidationFailed { .. } => -32602, // Invalid params
+            Self::ProcessingTimeout { .. }
+            | Self::MemoryAllocationFailed
+            | Self::PartialBatchFailure { .. }
+            | Self::ResourceLinkFetchFailed { .. }
+            | Self::ContentSecurityValidationFailed(_) => -32603, // Internal error
+        }
+    }
+
+    fn to_error_data(&self) -> Option<Value> {
+        let data = match self {
+            Self::Base64Error(base64_error) => return base64_error.to_error_data(),
+            Self::ResourceValidation(details) => json!({
+                "error": "resource_validation_failed",
+                "details": details,
+                "suggestion": "Check resource structure and content format"
+            }),
+            Self::ResourceLinkValidation(details) => json!({
+                "error": "resource_link_validation_failed",
+                "details": details,
+                "suggestion": "Verify resource link URI and metadata"
+            }),
+            Self::UnsupportedContentType(content_type) => json!({
+                "error": "unsupported_content_type",
+                "contentType": content_type,
+                "supportedTypes": ["text", "image", "audio", "resource", "resource_link"],
+                "suggestion": "Use one of the supported content block types"
+            }),
+            Self::MissingRequiredField(field) => json!({
+                "error": "missing_required_field",
+                "field": field,
+                "suggestion": "Ensure all required fields are present in content block"
+            }),
+            Self::InvalidUri(uri) => json!({
+                "error": "invalid_uri",
+                "uri": uri,
+                "suggestion": "Provide a valid URI with proper scheme (http, https, file, etc.)"
+            }),
+            Self::ContentSizeExceeded { actual, limit } => json!({
+                "error": "content_size_exceeded",
+                "providedSize": actual,
+                "maxSize": limit,
+                "suggestion": "Reduce content size or split into smaller parts"
+            }),
+            Self::InvalidAnnotation(details) => json!({
+                "error": "invalid_annotation",
+                "details": details,
+                "suggestion": "Check annotation format and structure"
+            }),
+            Self::ProcessingTimeout { timeout } => json!({
+                "error": "processing_timeout",
+                "timeoutMs": timeout,
+                "suggestion": "Reduce content size or complexity"
+            }),
+            Self::CapabilityNotSupported { capability } => json!({
+                "error": "capability_not_supported",
+                "requiredCapability": capability,
+                "suggestion": "Check agent capabilities before sending content"
+            }),
+            Self::ContentValidationFailed { details } => json!({
+                "error": "content_validation_failed",
+                "details": details,
+                "suggestion": "Check content structure and format"
+            }),
+            Self::InvalidContentStructure { details } => json!({
+                "error": "invalid_content_structure",
+                "details": details,
+                "suggestion": "Verify content block follows ACP specification"
+            }),
+            Self::MemoryAllocationFailed => json!({
+                "error": "memory_allocation_failed",
+                "suggestion": "Reduce content size or retry later"
+            }),
+            Self::PartialBatchFailure { successful, total } => json!({
+                "error": "partial_batch_failure",
+                "successfulItems": successful,
+                "totalItems": total,
+                "suggestion": "Review individual item errors for details"
+            }),
+            Self::ResourceLinkFetchFailed { uri } => json!({
+                "error": "resource_link_fetch_failed",
+                "uri": uri,
+                "suggestion": "Verify resource link is accessible"
+            }),
+            Self::ContentArrayValidationFailed { details } => json!({
+                "error": "content_array_validation_failed",
+                "details": details,
+                "suggestion": "Check content array structure and elements"
+            }),
+            Self::ContentSecurityValidationFailed(security_error) => {
+                return security_error.to_error_data();
+            }
+        };
+        Some(data)
+    }
 }
 
 #[derive(Debug)]

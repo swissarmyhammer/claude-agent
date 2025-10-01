@@ -3,6 +3,7 @@
 //! This module implements the error handling requirements from the ACP specification
 //! for session setup operations including session/new and session/load.
 
+use crate::error::ToJsonRpcError;
 use agent_client_protocol::SessionId;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -201,9 +202,8 @@ pub enum SessionSetupError {
     },
 }
 
-impl SessionSetupError {
-    /// Convert error to appropriate JSON-RPC error code following ACP specification
-    pub fn to_json_rpc_code(&self) -> i32 {
+impl ToJsonRpcError for SessionSetupError {
+    fn to_json_rpc_code(&self) -> i32 {
         match self {
             // Invalid Request (-32602): Invalid method parameter(s)
             Self::WorkingDirectoryNotAbsolute { .. }
@@ -238,8 +238,14 @@ impl SessionSetupError {
         }
     }
 
+    fn to_error_data(&self) -> Option<Value> {
+        Some(self.to_error_data_internal())
+    }
+}
+
+impl SessionSetupError {
     /// Convert error to structured data for JSON-RPC error response
-    pub fn to_error_data(&self) -> Value {
+    fn to_error_data_internal(&self) -> Value {
         match self {
             Self::WorkingDirectoryNotAbsolute {
                 provided_path,
@@ -566,10 +572,11 @@ impl SessionSetupError {
 
     /// Convert SessionSetupError to agent_client_protocol::Error
     pub fn to_protocol_error(&self) -> agent_client_protocol::Error {
+        let json_rpc_error = self.to_json_rpc_error();
         agent_client_protocol::Error {
-            code: self.to_json_rpc_code(),
-            message: self.to_string(),
-            data: Some(self.to_error_data()),
+            code: json_rpc_error.code,
+            message: json_rpc_error.message,
+            data: json_rpc_error.data,
         }
     }
 }
@@ -590,7 +597,7 @@ mod tests {
         };
 
         assert_eq!(error.to_json_rpc_code(), -32602);
-        let data = error.to_error_data();
+        let data = error.to_error_data().unwrap();
         assert_eq!(data["providedPath"], "./relative");
         assert_eq!(data["requirement"], "absolute_path");
     }
@@ -604,7 +611,7 @@ mod tests {
         };
 
         assert_eq!(error.to_json_rpc_code(), -32603);
-        let data = error.to_error_data();
+        let data = error.to_error_data().unwrap();
         assert_eq!(data["serverName"], "test-server");
         assert_eq!(data["error"], "executable_not_found");
     }
@@ -617,7 +624,7 @@ mod tests {
         };
 
         assert_eq!(error.to_json_rpc_code(), -32602);
-        let data = error.to_error_data();
+        let data = error.to_error_data().unwrap();
         assert_eq!(data["sessionId"], "sess_123");
         assert_eq!(data["error"], "session_not_found");
     }
@@ -631,7 +638,7 @@ mod tests {
         };
 
         assert_eq!(error.to_json_rpc_code(), -32602);
-        let data = error.to_error_data();
+        let data = error.to_error_data().unwrap();
         assert_eq!(data["requestedTransport"], "http");
         assert_eq!(data["declaredCapability"], false);
     }

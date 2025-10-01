@@ -1,7 +1,9 @@
 use crate::base64_validation;
+use crate::error::ToJsonRpcError;
 use crate::validation_utils;
 use agent_client_protocol::ContentBlock;
 use regex::Regex;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
@@ -48,6 +50,120 @@ pub enum ContentSecurityError {
     InvalidContentEncoding { encoding: String },
     #[error("Malicious pattern detected: {pattern_type}")]
     MaliciousPatternDetected { pattern_type: String },
+}
+
+impl ToJsonRpcError for ContentSecurityError {
+    fn to_json_rpc_code(&self) -> i32 {
+        match self {
+            Self::SecurityValidationFailed { .. }
+            | Self::SuspiciousContentDetected { .. }
+            | Self::DoSProtectionTriggered { .. }
+            | Self::UriSecurityViolation { .. }
+            | Self::Base64SecurityViolation { .. }
+            | Self::ContentTypeSpoofingDetected { .. }
+            | Self::ContentSanitizationFailed { .. }
+            | Self::SsrfProtectionTriggered { .. }
+            | Self::MemoryLimitExceeded { .. }
+            | Self::ContentArrayTooLarge { .. }
+            | Self::InvalidContentEncoding { .. }
+            | Self::MaliciousPatternDetected { .. } => -32602, // Invalid params
+            Self::ProcessingTimeout { .. }
+            | Self::RateLimitExceeded { .. } => -32000, // Server error
+        }
+    }
+
+    fn to_error_data(&self) -> Option<Value> {
+        let data = match self {
+            Self::SecurityValidationFailed {
+                reason,
+                policy_violated,
+            } => json!({
+                "error": "security_validation_failed",
+                "details": reason,
+                "policyViolated": policy_violated,
+                "suggestion": "Review content security policies and ensure compliance"
+            }),
+            Self::SuspiciousContentDetected {
+                threat_type,
+                details,
+            } => json!({
+                "error": "suspicious_content_detected",
+                "threatType": threat_type,
+                "details": details,
+                "suggestion": "Remove suspicious content or use a lower security level"
+            }),
+            Self::DoSProtectionTriggered {
+                protection_type,
+                threshold,
+            } => json!({
+                "error": "dos_protection_triggered",
+                "protectionType": protection_type,
+                "threshold": threshold,
+                "suggestion": "Reduce content size or processing complexity"
+            }),
+            Self::UriSecurityViolation { uri, reason } => json!({
+                "error": "uri_security_violation",
+                "uri": uri,
+                "details": reason,
+                "suggestion": "Use allowed URI schemes and avoid private/local addresses"
+            }),
+            Self::Base64SecurityViolation { reason } => json!({
+                "error": "base64_security_violation",
+                "details": reason,
+                "suggestion": "Ensure base64 data is valid and within size limits"
+            }),
+            Self::ContentTypeSpoofingDetected { declared, actual } => json!({
+                "error": "content_type_spoofing_detected",
+                "declaredType": declared,
+                "actualType": actual,
+                "suggestion": "Ensure declared MIME type matches actual content format"
+            }),
+            Self::ContentSanitizationFailed { reason } => json!({
+                "error": "content_sanitization_failed",
+                "details": reason,
+                "suggestion": "Remove potentially dangerous content patterns"
+            }),
+            Self::SsrfProtectionTriggered { target, reason } => json!({
+                "error": "ssrf_protection_triggered",
+                "target": target,
+                "details": reason,
+                "suggestion": "Avoid accessing private networks or sensitive endpoints"
+            }),
+            Self::ProcessingTimeout { timeout } => json!({
+                "error": "processing_timeout",
+                "timeoutMs": timeout,
+                "suggestion": "Reduce content complexity or increase timeout limits"
+            }),
+            Self::MemoryLimitExceeded { actual, limit } => json!({
+                "error": "memory_limit_exceeded",
+                "actualBytes": actual,
+                "limitBytes": limit,
+                "suggestion": "Reduce content size or increase memory limits"
+            }),
+            Self::RateLimitExceeded { operation } => json!({
+                "error": "rate_limit_exceeded",
+                "operation": operation,
+                "suggestion": "Reduce request frequency or wait before retrying"
+            }),
+            Self::ContentArrayTooLarge { length, max_length } => json!({
+                "error": "content_array_too_large",
+                "arrayLength": length,
+                "maxLength": max_length,
+                "suggestion": "Reduce the number of content blocks in the array"
+            }),
+            Self::InvalidContentEncoding { encoding } => json!({
+                "error": "invalid_content_encoding",
+                "encoding": encoding,
+                "suggestion": "Use supported content encoding formats"
+            }),
+            Self::MaliciousPatternDetected { pattern_type } => json!({
+                "error": "malicious_pattern_detected",
+                "patternType": pattern_type,
+                "suggestion": "Remove or sanitize detected malicious patterns"
+            }),
+        };
+        Some(data)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

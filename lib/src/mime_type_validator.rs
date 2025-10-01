@@ -1,3 +1,5 @@
+use crate::error::ToJsonRpcError;
+use serde_json::{json, Value};
 use std::collections::HashSet;
 use thiserror::Error;
 
@@ -26,6 +28,62 @@ pub enum MimeTypeValidationError {
     InvalidFormat { mime_type: String },
     #[error("Content validation failed: {details}")]
     ContentValidation { details: String },
+}
+
+impl ToJsonRpcError for MimeTypeValidationError {
+    fn to_json_rpc_code(&self) -> i32 {
+        -32602 // All MIME type validation errors are invalid params
+    }
+
+    fn to_error_data(&self) -> Option<Value> {
+        let data = match self {
+            Self::UnsupportedMimeType {
+                content_type,
+                mime_type,
+                allowed_types,
+                suggestion,
+            } => json!({
+                "error": "unsupported_mime_type",
+                "contentType": content_type,
+                "providedMimeType": mime_type,
+                "allowedTypes": allowed_types,
+                "suggestion": suggestion.as_ref().unwrap_or(&format!("Use one of the supported {} MIME types", content_type))
+            }),
+            Self::SecurityBlocked {
+                mime_type,
+                reason,
+                allowed_categories,
+            } => json!({
+                "error": "mime_type_security_blocked",
+                "providedMimeType": mime_type,
+                "reason": reason,
+                "allowedCategories": allowed_categories,
+                "suggestion": "Use a MIME type from allowed categories"
+            }),
+            Self::FormatMismatch {
+                expected,
+                detected,
+                mime_type,
+            } => json!({
+                "error": "mime_type_format_mismatch",
+                "declaredMimeType": mime_type,
+                "expectedFormat": expected,
+                "detectedFormat": detected,
+                "suggestion": "Ensure content data matches the declared MIME type"
+            }),
+            Self::InvalidFormat { mime_type } => json!({
+                "error": "invalid_mime_type_format",
+                "providedMimeType": mime_type,
+                "suggestion": "Provide a valid MIME type in format 'type/subtype'"
+            }),
+            Self::ContentValidation { details } => json!({
+                "error": "content_validation_failed",
+                "details": details,
+                "suggestion": "Check content structure and format"
+            }),
+        };
+        Some(data)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -1,6 +1,7 @@
 use crate::base64_processor::Base64ProcessorError;
 use crate::content_block_processor::ContentBlockProcessorError;
 use crate::content_security_validator::ContentSecurityError;
+use crate::error::{JsonRpcError, ToJsonRpcError};
 use crate::mime_type_validator::MimeTypeValidationError;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -15,14 +16,6 @@ use uuid::Uuid;
 // 5. Format errors: Suggest corrective actions
 //
 // All errors must include structured data for client handling.
-
-/// JSON-RPC 2.0 error structure following ACP specification
-#[derive(Debug, Clone)]
-pub struct JsonRpcError {
-    pub code: i32,
-    pub message: String,
-    pub data: Option<Value>,
-}
 
 /// Content processing error with ACP compliance
 #[derive(Debug, Error)]
@@ -73,6 +66,106 @@ pub enum ContentProcessingError {
     FormatDetectionFailed { reason: String },
 }
 
+impl ToJsonRpcError for ContentProcessingError {
+    fn to_json_rpc_code(&self) -> i32 {
+        match self {
+            Self::InvalidStructure(_)
+            | Self::UnsupportedContentType { .. }
+            | Self::InvalidBase64(_)
+            | Self::ContentSizeExceeded { .. }
+            | Self::MimeTypeMismatch { .. }
+            | Self::CapabilityNotSupported { .. }
+            | Self::SecurityViolation { .. }
+            | Self::InvalidUri { .. }
+            | Self::MissingRequiredField { .. }
+            | Self::ContentValidationFailed { .. }
+            | Self::FormatDetectionFailed { .. } => -32602, // Invalid params
+            Self::ProcessingTimeout { .. }
+            | Self::MemoryPressure
+            | Self::ResourceContention => -32603, // Internal error
+        }
+    }
+
+    fn to_error_data(&self) -> Option<Value> {
+        let data = match self {
+            Self::InvalidStructure(details) => json!({
+                "error": "invalid_structure",
+                "details": details,
+                "suggestion": "Verify content block follows ACP specification"
+            }),
+            Self::UnsupportedContentType {
+                content_type,
+                supported,
+            } => json!({
+                "error": "unsupported_content_type",
+                "contentType": content_type,
+                "supportedTypes": supported,
+                "suggestion": "Use one of the supported content types"
+            }),
+            Self::InvalidBase64(details) => json!({
+                "error": "invalid_base64_format",
+                "details": details,
+                "suggestion": "Ensure base64 data is properly encoded with correct padding"
+            }),
+            Self::ContentSizeExceeded { size, limit } => json!({
+                "error": "content_size_exceeded",
+                "providedSize": size,
+                "maxSize": limit,
+                "suggestion": "Reduce content size or split into smaller parts"
+            }),
+            Self::MimeTypeMismatch { mime_type } => json!({
+                "error": "mime_type_mismatch",
+                "mimeType": mime_type,
+                "suggestion": "Ensure content data matches the declared MIME type"
+            }),
+            Self::CapabilityNotSupported { capability } => json!({
+                "error": "capability_not_supported",
+                "requiredCapability": capability,
+                "declaredValue": false,
+                "suggestion": "Check agent capabilities before sending content"
+            }),
+            Self::SecurityViolation { .. } => json!({
+                "error": "security_violation",
+                "suggestion": "Content failed security validation checks"
+            }),
+            Self::ProcessingTimeout { timeout } => json!({
+                "error": "processing_timeout",
+                "timeoutSeconds": timeout,
+                "suggestion": "Reduce content size or complexity"
+            }),
+            Self::MemoryPressure => json!({
+                "error": "memory_pressure",
+                "suggestion": "Reduce content size or retry later"
+            }),
+            Self::ResourceContention => json!({
+                "error": "resource_contention",
+                "suggestion": "Retry request after a brief delay"
+            }),
+            Self::InvalidUri { uri } => json!({
+                "error": "invalid_uri",
+                "uri": uri,
+                "suggestion": "Provide a valid URI with proper scheme"
+            }),
+            Self::MissingRequiredField { field } => json!({
+                "error": "missing_required_field",
+                "field": field,
+                "suggestion": "Ensure all required fields are present"
+            }),
+            Self::ContentValidationFailed { details } => json!({
+                "error": "content_validation_failed",
+                "details": details,
+                "suggestion": "Check content structure and format"
+            }),
+            Self::FormatDetectionFailed { reason } => json!({
+                "error": "format_detection_failed",
+                "reason": reason,
+                "suggestion": "Ensure content format matches MIME type declaration"
+            }),
+        };
+        Some(data)
+    }
+}
+
 /// Error context for debugging and correlation
 #[derive(Debug, Clone)]
 pub struct ErrorContext {
@@ -95,6 +188,30 @@ impl Default for ErrorContext {
 
 /// Convert ContentSecurityError to ACP-compliant JSON-RPC error
 pub fn convert_content_security_error_to_acp(
+    error: ContentSecurityError,
+    context: Option<ErrorContext>,
+) -> JsonRpcError {
+    let mut json_rpc_error = error.to_json_rpc_error();
+    
+    // Add correlation context if available
+    if let Some(ctx) = context {
+        if let Some(ref mut data) = json_rpc_error.data {
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert("correlationId".to_string(), json!(ctx.correlation_id));
+                obj.insert("stage".to_string(), json!(ctx.processing_stage));
+                if let Some(content_type) = ctx.content_type {
+                    obj.insert("contentType".to_string(), json!(content_type));
+                }
+            }
+        }
+    }
+    
+    json_rpc_error
+}
+
+/// Convert ContentSecurityError to ACP-compliant JSON-RPC error (legacy implementation)
+#[allow(dead_code)]
+fn convert_content_security_error_to_acp_legacy(
     error: ContentSecurityError,
     context: Option<ErrorContext>,
 ) -> JsonRpcError {
@@ -280,6 +397,30 @@ pub fn convert_base64_error_to_acp(
     error: Base64ProcessorError,
     context: Option<ErrorContext>,
 ) -> JsonRpcError {
+    let mut json_rpc_error = error.to_json_rpc_error();
+    
+    // Add correlation context if available
+    if let Some(ctx) = context {
+        if let Some(ref mut data) = json_rpc_error.data {
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert("correlationId".to_string(), json!(ctx.correlation_id));
+                obj.insert("stage".to_string(), json!(ctx.processing_stage));
+                if let Some(content_type) = ctx.content_type {
+                    obj.insert("contentType".to_string(), json!(content_type));
+                }
+            }
+        }
+    }
+    
+    json_rpc_error
+}
+
+/// Convert Base64ProcessorError to ACP-compliant JSON-RPC error (legacy implementation)
+#[allow(dead_code)]
+fn convert_base64_error_to_acp_legacy(
+    error: Base64ProcessorError,
+    context: Option<ErrorContext>,
+) -> JsonRpcError {
     let ctx = context.unwrap_or_default();
 
     match error {
@@ -429,6 +570,30 @@ pub fn convert_mime_type_error_to_acp(
     error: MimeTypeValidationError,
     context: Option<ErrorContext>,
 ) -> JsonRpcError {
+    let mut json_rpc_error = error.to_json_rpc_error();
+    
+    // Add correlation context if available
+    if let Some(ctx) = context {
+        if let Some(ref mut data) = json_rpc_error.data {
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert("correlationId".to_string(), json!(ctx.correlation_id));
+                obj.insert("stage".to_string(), json!(ctx.processing_stage));
+                if let Some(content_type) = ctx.content_type {
+                    obj.insert("contentType".to_string(), json!(content_type));
+                }
+            }
+        }
+    }
+    
+    json_rpc_error
+}
+
+/// Convert MimeTypeValidationError to ACP-compliant JSON-RPC error (legacy implementation)
+#[allow(dead_code)]
+fn convert_mime_type_error_to_acp_legacy(
+    error: MimeTypeValidationError,
+    context: Option<ErrorContext>,
+) -> JsonRpcError {
     let ctx = context.unwrap_or_default();
 
     match error {
@@ -514,6 +679,30 @@ pub fn convert_mime_type_error_to_acp(
 
 /// Convert ContentBlockProcessorError to ACP-compliant JSON-RPC error
 pub fn convert_content_block_error_to_acp(
+    error: ContentBlockProcessorError,
+    context: Option<ErrorContext>,
+) -> JsonRpcError {
+    let mut json_rpc_error = error.to_json_rpc_error();
+    
+    // Add correlation context if available
+    if let Some(ctx) = context {
+        if let Some(ref mut data) = json_rpc_error.data {
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert("correlationId".to_string(), json!(ctx.correlation_id));
+                obj.insert("stage".to_string(), json!(ctx.processing_stage));
+                if let Some(content_type) = ctx.content_type {
+                    obj.insert("contentType".to_string(), json!(content_type));
+                }
+            }
+        }
+    }
+    
+    json_rpc_error
+}
+
+/// Convert ContentBlockProcessorError to ACP-compliant JSON-RPC error (legacy implementation)
+#[allow(dead_code)]
+fn convert_content_block_error_to_acp_legacy(
     error: ContentBlockProcessorError,
     context: Option<ErrorContext>,
 ) -> JsonRpcError {
@@ -701,6 +890,30 @@ pub fn convert_content_block_error_to_acp(
 
 /// Convert enhanced ContentProcessingError to ACP-compliant JSON-RPC error
 pub fn convert_content_processing_error_to_acp(
+    error: ContentProcessingError,
+    context: Option<ErrorContext>,
+) -> JsonRpcError {
+    let mut json_rpc_error = error.to_json_rpc_error();
+    
+    // Add correlation context if available
+    if let Some(ctx) = context {
+        if let Some(ref mut data) = json_rpc_error.data {
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert("correlationId".to_string(), json!(ctx.correlation_id));
+                obj.insert("stage".to_string(), json!(ctx.processing_stage));
+                if let Some(content_type) = ctx.content_type {
+                    obj.insert("contentType".to_string(), json!(content_type));
+                }
+            }
+        }
+    }
+    
+    json_rpc_error
+}
+
+/// Convert enhanced ContentProcessingError to ACP-compliant JSON-RPC error (legacy implementation)
+#[allow(dead_code)]
+fn convert_content_processing_error_to_acp_legacy(
     error: ContentProcessingError,
     context: Option<ErrorContext>,
 ) -> JsonRpcError {
@@ -920,7 +1133,7 @@ mod tests {
         let json_rpc_error = convert_base64_error_to_acp(error, Some(context));
 
         assert_eq!(json_rpc_error.code, -32602);
-        assert_eq!(json_rpc_error.message, "Invalid base64 data");
+        assert_eq!(json_rpc_error.message, "Invalid base64 format: Invalid padding");
 
         if let Some(data) = json_rpc_error.data {
             assert_eq!(data["error"], "invalid_base64_format");
@@ -951,7 +1164,7 @@ mod tests {
         assert_eq!(json_rpc_error.code, -32602);
         assert_eq!(
             json_rpc_error.message,
-            "Content size exceeded maximum limit"
+            "Data exceeds maximum size limit of 1024 bytes (actual: 2048)"
         );
 
         if let Some(data) = json_rpc_error.data {
@@ -994,7 +1207,7 @@ mod tests {
         let json_rpc_error = convert_content_processing_error_to_acp(error, None);
 
         assert_eq!(json_rpc_error.code, -32602);
-        assert_eq!(json_rpc_error.message, "Security validation failed");
+        assert_eq!(json_rpc_error.message, "Security validation failed: sensitive internal details");
 
         if let Some(data) = json_rpc_error.data {
             assert_eq!(data["error"], "security_violation");

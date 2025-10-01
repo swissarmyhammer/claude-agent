@@ -1,6 +1,38 @@
 //! Error types for the Claude Agent
 
+use serde_json::Value;
 use thiserror::Error;
+
+/// JSON-RPC 2.0 error structure following ACP specification
+#[derive(Debug, Clone)]
+pub struct JsonRpcError {
+    pub code: i32,
+    pub message: String,
+    pub data: Option<Value>,
+}
+
+/// Trait for converting errors to JSON-RPC format
+///
+/// All error types in the system should implement this trait to ensure
+/// consistent error handling and reporting across the ACP protocol boundary.
+pub trait ToJsonRpcError: std::fmt::Display {
+    /// Convert error to JSON-RPC error code
+    fn to_json_rpc_code(&self) -> i32;
+
+    /// Convert error to structured error data (optional)
+    fn to_error_data(&self) -> Option<Value> {
+        None
+    }
+
+    /// Convert error to complete JSON-RPC error structure
+    fn to_json_rpc_error(&self) -> JsonRpcError {
+        JsonRpcError {
+            code: self.to_json_rpc_code(),
+            message: self.to_string(),
+            data: self.to_error_data(),
+        }
+    }
+}
 
 /// MCP-specific error types for better error handling and debugging
 #[derive(Error, Debug)]
@@ -112,9 +144,8 @@ pub enum McpError {
     ProcessCrashed,
 }
 
-impl McpError {
-    /// Convert MCP error to JSON-RPC error code
-    pub fn to_json_rpc_error(&self) -> i32 {
+impl ToJsonRpcError for McpError {
+    fn to_json_rpc_code(&self) -> i32 {
         match self {
             McpError::ProtocolError(_) => -32600,       // Invalid Request
             McpError::SerializationFailed(_) => -32700, // Parse error
@@ -124,6 +155,14 @@ impl McpError {
             McpError::ProcessCrashed => -32000,         // Server error
             _ => -32603,                                // Internal error (default)
         }
+    }
+}
+
+impl McpError {
+    /// Convert MCP error to JSON-RPC error code (deprecated, use trait method)
+    #[deprecated(note = "Use ToJsonRpcError trait method instead")]
+    pub fn to_json_rpc_error(&self) -> i32 {
+        self.to_json_rpc_code()
     }
 }
 
@@ -173,11 +212,10 @@ pub enum AgentError {
     Internal(String),
 }
 
-impl AgentError {
-    /// Convert agent error to JSON-RPC error code
-    pub fn to_json_rpc_error(&self) -> i32 {
+impl ToJsonRpcError for AgentError {
+    fn to_json_rpc_code(&self) -> i32 {
         match self {
-            AgentError::Mcp(mcp_error) => mcp_error.to_json_rpc_error(),
+            AgentError::Mcp(mcp_error) => mcp_error.to_json_rpc_code(),
             AgentError::PathValidation(_) => -32602, // Invalid params
             AgentError::Protocol(_) => -32600,       // Invalid Request
             AgentError::MethodNotFound(_) => -32601, // Method not found
@@ -192,6 +230,14 @@ impl AgentError {
     }
 }
 
+impl AgentError {
+    /// Convert agent error to JSON-RPC error code (deprecated, use trait method)
+    #[deprecated(note = "Use ToJsonRpcError trait method instead")]
+    pub fn to_json_rpc_error(&self) -> i32 {
+        self.to_json_rpc_code()
+    }
+}
+
 /// Convenience type alias for Results using AgentError
 pub type Result<T> = std::result::Result<T, AgentError>;
 
@@ -199,6 +245,35 @@ pub type Result<T> = std::result::Result<T, AgentError>;
 mod tests {
     use super::*;
     use std::io;
+
+    #[test]
+    fn test_to_json_rpc_error_trait() {
+        // Test AgentError trait implementation
+        let error = AgentError::Protocol("test protocol error".to_string());
+        let json_rpc = <AgentError as ToJsonRpcError>::to_json_rpc_error(&error);
+        assert_eq!(json_rpc.code, -32600);
+        assert_eq!(json_rpc.message, "Protocol error: test protocol error");
+        assert!(json_rpc.data.is_none());
+
+        // Test McpError trait implementation
+        let mcp_error = McpError::ProtocolError("bad protocol".to_string());
+        let json_rpc = <McpError as ToJsonRpcError>::to_json_rpc_error(&mcp_error);
+        assert_eq!(json_rpc.code, -32600);
+        assert!(json_rpc.message.contains("bad protocol"));
+    }
+
+    #[test]
+    fn test_trait_json_rpc_error_codes() {
+        // Test all error code mappings using trait
+        assert_eq!(AgentError::Protocol("test".to_string()).to_json_rpc_code(), -32600);
+        assert_eq!(AgentError::MethodNotFound("test".to_string()).to_json_rpc_code(), -32601);
+        assert_eq!(AgentError::InvalidRequest("test".to_string()).to_json_rpc_code(), -32602);
+        assert_eq!(AgentError::Internal("test".to_string()).to_json_rpc_code(), -32603);
+        
+        // Test MCP error codes
+        assert_eq!(McpError::ProtocolError("test".to_string()).to_json_rpc_code(), -32600);
+        assert_eq!(McpError::RequestTimeout.to_json_rpc_code(), -32000);
+    }
 
     #[test]
     fn test_error_display() {
@@ -239,33 +314,33 @@ mod tests {
     #[test]
     fn test_json_rpc_error_codes() {
         let err = AgentError::Protocol("test".to_string());
-        assert_eq!(err.to_json_rpc_error(), -32600);
+        assert_eq!(err.to_json_rpc_code(), -32600);
 
         let err = AgentError::MethodNotFound("test".to_string());
-        assert_eq!(err.to_json_rpc_error(), -32601);
+        assert_eq!(err.to_json_rpc_code(), -32601);
 
         let err = AgentError::InvalidRequest("test".to_string());
-        assert_eq!(err.to_json_rpc_error(), -32602);
+        assert_eq!(err.to_json_rpc_code(), -32602);
 
         let err = AgentError::Internal("test".to_string());
-        assert_eq!(err.to_json_rpc_error(), -32603);
+        assert_eq!(err.to_json_rpc_code(), -32603);
 
         let err = AgentError::PermissionDenied("test".to_string());
-        assert_eq!(err.to_json_rpc_error(), -32000);
+        assert_eq!(err.to_json_rpc_code(), -32000);
 
         let err = AgentError::ToolExecution("test".to_string());
-        assert_eq!(err.to_json_rpc_error(), -32000);
+        assert_eq!(err.to_json_rpc_code(), -32000);
 
         let err = AgentError::Session("test".to_string());
-        assert_eq!(err.to_json_rpc_error(), -32000);
+        assert_eq!(err.to_json_rpc_code(), -32000);
 
         let err = AgentError::Config("test".to_string());
-        assert_eq!(err.to_json_rpc_error(), -32000);
+        assert_eq!(err.to_json_rpc_code(), -32000);
 
         // Test PathValidation error code
         let path_err = crate::path_validator::PathValidationError::NotAbsolute("test".to_string());
         let err = AgentError::PathValidation(path_err);
-        assert_eq!(err.to_json_rpc_error(), -32602);
+        assert_eq!(err.to_json_rpc_code(), -32602);
     }
 
     #[test]

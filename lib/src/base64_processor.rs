@@ -1,7 +1,9 @@
 use crate::base64_validation;
 use crate::content_security_validator::{ContentSecurityError, ContentSecurityValidator};
+use crate::error::ToJsonRpcError;
 use crate::mime_type_validator::{MimeTypeValidationError, MimeTypeValidator};
 use base64::{engine::general_purpose, Engine as _};
+use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -34,6 +36,95 @@ pub enum Base64ProcessorError {
     ContentValidationFailed { details: String },
     #[error("MIME type validation failed: {0}")]
     MimeTypeValidationFailed(#[from] MimeTypeValidationError),
+}
+
+impl ToJsonRpcError for Base64ProcessorError {
+    fn to_json_rpc_code(&self) -> i32 {
+        match self {
+            Self::InvalidBase64(_)
+            | Self::SizeExceeded { .. }
+            | Self::MimeTypeNotAllowed(_)
+            | Self::FormatMismatch { .. }
+            | Self::UnsupportedImageFormat(_)
+            | Self::UnsupportedAudioFormat(_)
+            | Self::CapabilityNotSupported { .. }
+            | Self::SecurityValidationFailed
+            | Self::ContentValidationFailed { .. } => -32602, // Invalid params
+            Self::ProcessingTimeout { .. }
+            | Self::MemoryAllocationFailed
+            | Self::EnhancedSecurityValidationFailed(_)
+            | Self::MimeTypeValidationFailed(_) => -32603, // Internal error
+        }
+    }
+
+    fn to_error_data(&self) -> Option<Value> {
+        let data = match self {
+            Self::InvalidBase64(details) => json!({
+                "error": "invalid_base64_format",
+                "details": details,
+                "suggestion": "Ensure base64 data is properly encoded with correct padding"
+            }),
+            Self::SizeExceeded { limit, actual } => json!({
+                "error": "content_size_exceeded",
+                "providedSize": actual,
+                "maxSize": limit,
+                "suggestion": "Reduce content size or split into smaller parts"
+            }),
+            Self::UnsupportedImageFormat(format) => json!({
+                "error": "unsupported_image_format",
+                "format": format,
+                "supportedFormats": ["png", "jpeg", "gif", "webp"],
+                "suggestion": "Convert image to a supported format"
+            }),
+            Self::UnsupportedAudioFormat(format) => json!({
+                "error": "unsupported_audio_format",
+                "format": format,
+                "supportedFormats": ["wav", "mp3", "mpeg", "ogg", "aac"],
+                "suggestion": "Convert audio to a supported format"
+            }),
+            Self::FormatMismatch { expected, actual } => json!({
+                "error": "format_mismatch",
+                "expectedFormat": expected,
+                "actualFormat": actual,
+                "suggestion": "Ensure content data matches the declared MIME type"
+            }),
+            Self::MimeTypeNotAllowed(mime_type) => json!({
+                "error": "mime_type_not_allowed",
+                "mimeType": mime_type,
+                "suggestion": "Use an allowed MIME type"
+            }),
+            Self::ProcessingTimeout { timeout } => json!({
+                "error": "processing_timeout",
+                "timeoutMs": timeout,
+                "suggestion": "Reduce content size or complexity"
+            }),
+            Self::MemoryAllocationFailed => json!({
+                "error": "memory_allocation_failed",
+                "suggestion": "Reduce content size or retry later"
+            }),
+            Self::CapabilityNotSupported { capability } => json!({
+                "error": "capability_not_supported",
+                "requiredCapability": capability,
+                "suggestion": "Check agent capabilities before sending content"
+            }),
+            Self::SecurityValidationFailed => json!({
+                "error": "security_validation_failed",
+                "suggestion": "Content failed security validation checks"
+            }),
+            Self::ContentValidationFailed { details } => json!({
+                "error": "content_validation_failed",
+                "details": details,
+                "suggestion": "Check content structure and format"
+            }),
+            Self::EnhancedSecurityValidationFailed(security_error) => {
+                return security_error.to_error_data();
+            }
+            Self::MimeTypeValidationFailed(mime_error) => {
+                return mime_error.to_error_data();
+            }
+        };
+        Some(data)
+    }
 }
 
 #[derive(Clone)]
