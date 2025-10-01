@@ -32,6 +32,7 @@ pub mod session;
 pub mod session_errors;
 pub mod session_loading;
 pub mod session_validation;
+pub mod size_validator;
 pub mod terminal_manager;
 #[cfg(test)]
 mod tool_call_lifecycle_tests;

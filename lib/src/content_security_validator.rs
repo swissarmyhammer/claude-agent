@@ -1,5 +1,6 @@
 use crate::base64_validation;
 use crate::error::ToJsonRpcError;
+use crate::size_validator::{SizeValidationError, SizeValidator};
 use crate::validation_utils;
 use agent_client_protocol::ContentBlock;
 use regex::Regex;
@@ -165,6 +166,21 @@ impl ToJsonRpcError for ContentSecurityError {
     }
 }
 
+impl From<SizeValidationError> for ContentSecurityError {
+    fn from(error: SizeValidationError) -> Self {
+        match error {
+            SizeValidationError::SizeExceeded {
+                field,
+                actual,
+                limit,
+            } => ContentSecurityError::UriSecurityViolation {
+                uri: format!("{} ({} bytes)", field, actual),
+                reason: format!("Size exceeds limit: {} > {}", actual, limit),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SecurityLevel {
     Strict,
@@ -294,6 +310,7 @@ pub struct ContentSecurityValidator {
     blocked_uri_regexes: Vec<Regex>,
     processing_stats: HashMap<String, u32>,
     last_rate_limit_reset: Instant,
+    size_validator: SizeValidator,
 }
 
 impl Clone for ContentSecurityValidator {
@@ -311,6 +328,7 @@ impl Clone for ContentSecurityValidator {
             blocked_uri_regexes,
             processing_stats: self.processing_stats.clone(),
             last_rate_limit_reset: self.last_rate_limit_reset,
+            size_validator: self.size_validator.clone(),
         }
     }
 }
@@ -330,11 +348,17 @@ impl ContentSecurityValidator {
             }
         }
 
+        let size_validator = SizeValidator::new(crate::size_validator::SizeLimits {
+            max_uri_length: policy.max_uri_length,
+            ..Default::default()
+        });
+
         Ok(Self {
             policy,
             blocked_uri_regexes,
             processing_stats: HashMap::new(),
             last_rate_limit_reset: Instant::now(),
+            size_validator,
         })
     }
 
@@ -528,16 +552,7 @@ impl ContentSecurityValidator {
             });
         }
 
-        if uri.len() > self.policy.max_uri_length {
-            return Err(ContentSecurityError::UriSecurityViolation {
-                uri: uri.to_string(),
-                reason: format!(
-                    "URI too long: {} > {}",
-                    uri.len(),
-                    self.policy.max_uri_length
-                ),
-            });
-        }
+        self.size_validator.validate_uri_length(uri)?;
 
         // Parse URI
         let parsed_uri = match Url::parse(uri) {

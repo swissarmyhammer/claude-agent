@@ -1,6 +1,7 @@
 use crate::base64_processor::{Base64Processor, Base64ProcessorError};
 use crate::content_security_validator::{ContentSecurityError, ContentSecurityValidator};
 use crate::error::ToJsonRpcError;
+use crate::size_validator::{SizeValidationError, SizeValidator};
 use agent_client_protocol::{ContentBlock, TextContent};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -169,6 +170,16 @@ impl ToJsonRpcError for ContentBlockProcessorError {
     }
 }
 
+impl From<SizeValidationError> for ContentBlockProcessorError {
+    fn from(error: SizeValidationError) -> Self {
+        match error {
+            SizeValidationError::SizeExceeded {
+                actual, limit, ..
+            } => ContentBlockProcessorError::ContentSizeExceeded { actual, limit },
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ProcessedContent {
     pub content_type: ProcessedContentType,
@@ -198,13 +209,13 @@ pub enum ProcessedContentType {
 
 pub struct ContentBlockProcessor {
     base64_processor: Base64Processor,
-    max_resource_size: usize,
     enable_uri_validation: bool,
     processing_timeout: Duration,
     enable_capability_validation: bool,
     supported_capabilities: HashMap<String, bool>,
     enable_batch_recovery: bool,
     content_security_validator: Option<ContentSecurityValidator>,
+    size_validator: SizeValidator,
 }
 
 impl Default for ContentBlockProcessor {
@@ -216,15 +227,17 @@ impl Default for ContentBlockProcessor {
         supported_capabilities.insert("resource".to_string(), true);
         supported_capabilities.insert("resource_link".to_string(), true);
 
+        let size_validator = SizeValidator::default();
+
         Self {
             base64_processor: Base64Processor::default(),
-            max_resource_size: 50 * 1024 * 1024, // 50MB for resources
             enable_uri_validation: true,
             processing_timeout: Duration::from_secs(30),
             enable_capability_validation: true,
             supported_capabilities,
             enable_batch_recovery: true,
             content_security_validator: None, // Default to no enhanced security validation
+            size_validator,
         }
     }
 }
@@ -235,10 +248,15 @@ impl ContentBlockProcessor {
         max_resource_size: usize,
         enable_uri_validation: bool,
     ) -> Self {
+        let size_validator = SizeValidator::new(crate::size_validator::SizeLimits {
+            max_content_size: max_resource_size,
+            ..Default::default()
+        });
+
         Self {
             base64_processor,
-            max_resource_size,
             enable_uri_validation,
+            size_validator,
             ..Default::default()
         }
     }
@@ -252,15 +270,20 @@ impl ContentBlockProcessor {
         supported_capabilities: HashMap<String, bool>,
         enable_batch_recovery: bool,
     ) -> Self {
+        let size_validator = SizeValidator::new(crate::size_validator::SizeLimits {
+            max_content_size: max_resource_size,
+            ..Default::default()
+        });
+
         Self {
             base64_processor,
-            max_resource_size,
             enable_uri_validation,
             processing_timeout,
             enable_capability_validation,
             supported_capabilities,
             enable_batch_recovery,
             content_security_validator: None,
+            size_validator,
         }
     }
 
@@ -270,11 +293,16 @@ impl ContentBlockProcessor {
         enable_uri_validation: bool,
         content_security_validator: ContentSecurityValidator,
     ) -> Self {
+        let size_validator = SizeValidator::new(crate::size_validator::SizeLimits {
+            max_content_size: max_resource_size,
+            ..Default::default()
+        });
+
         Self {
             base64_processor,
-            max_resource_size,
             enable_uri_validation,
             content_security_validator: Some(content_security_validator),
+            size_validator,
             ..Default::default()
         }
     }
@@ -283,15 +311,20 @@ impl ContentBlockProcessor {
         base64_processor: Base64Processor,
         config: EnhancedSecurityConfig,
     ) -> Self {
+        let size_validator = SizeValidator::new(crate::size_validator::SizeLimits {
+            max_content_size: config.max_resource_size,
+            ..Default::default()
+        });
+
         Self {
             base64_processor,
-            max_resource_size: config.max_resource_size,
             enable_uri_validation: config.enable_uri_validation,
             processing_timeout: config.processing_timeout,
             enable_capability_validation: config.enable_capability_validation,
             supported_capabilities: config.supported_capabilities,
             enable_batch_recovery: config.enable_batch_recovery,
             content_security_validator: Some(config.content_security_validator),
+            size_validator,
         }
     }
 
@@ -433,12 +466,7 @@ impl ContentBlockProcessor {
                     .decode_image_data(&image_content.data, &image_content.mime_type)?;
 
                 // Check resource size limit
-                if decoded_data.len() > self.max_resource_size {
-                    return Err(ContentBlockProcessorError::ContentSizeExceeded {
-                        actual: decoded_data.len(),
-                        limit: self.max_resource_size,
-                    });
-                }
+                self.size_validator.validate_content_size(decoded_data.len())?;
 
                 let mut metadata = HashMap::new();
                 metadata.insert("mime_type".to_string(), image_content.mime_type.clone());
@@ -479,12 +507,7 @@ impl ContentBlockProcessor {
                     .decode_audio_data(&audio_content.data, &audio_content.mime_type)?;
 
                 // Check resource size limit
-                if decoded_data.len() > self.max_resource_size {
-                    return Err(ContentBlockProcessorError::ContentSizeExceeded {
-                        actual: decoded_data.len(),
-                        limit: self.max_resource_size,
-                    });
-                }
+                self.size_validator.validate_content_size(decoded_data.len())?;
 
                 let mut metadata = HashMap::new();
                 metadata.insert("mime_type".to_string(), audio_content.mime_type.clone());

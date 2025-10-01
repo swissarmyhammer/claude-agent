@@ -5,16 +5,32 @@
 //! detailed error reporting as required by the ACP specification.
 
 use crate::session_errors::{SessionSetupError, SessionSetupResult};
+use crate::size_validator::SizeValidator;
 use crate::validation_utils;
 use agent_client_protocol::{LoadSessionRequest, NewSessionRequest, SessionId};
 use serde_json::Value;
 
 /// Comprehensive request validator for ACP session operations
-pub struct RequestValidator;
+pub struct RequestValidator {
+    size_validator: SizeValidator,
+}
+
+impl Default for RequestValidator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl RequestValidator {
+    /// Create a new request validator with default size limits
+    pub fn new() -> Self {
+        Self {
+            size_validator: SizeValidator::default(),
+        }
+    }
+
     /// Validate a session/new request with comprehensive error handling
-    pub fn validate_new_session_request(request: &NewSessionRequest) -> SessionSetupResult<()> {
+    pub fn validate_new_session_request(&self, request: &NewSessionRequest) -> SessionSetupResult<()> {
         // Validate working directory parameter (always present in ACP)
         Self::validate_working_directory_parameter(&request.cwd, "session/new")?;
 
@@ -24,14 +40,14 @@ impl RequestValidator {
 
         // Validate meta parameter format if provided
         if let Some(meta) = &request.meta {
-            Self::validate_meta_parameter(meta, "session/new")?;
+            self.validate_meta_parameter(meta, "session/new")?;
         }
 
         Ok(())
     }
 
     /// Validate a session/load request with comprehensive error handling
-    pub fn validate_load_session_request(request: &LoadSessionRequest) -> SessionSetupResult<()> {
+    pub fn validate_load_session_request(&self, request: &LoadSessionRequest) -> SessionSetupResult<()> {
         // Validate session ID parameter (required)
         Self::validate_session_id_parameter(&request.session_id, "session/load")?;
 
@@ -44,7 +60,7 @@ impl RequestValidator {
 
         // Validate meta parameter format if provided
         if let Some(meta) = &request.meta {
-            Self::validate_meta_parameter(meta, "session/load")?;
+            self.validate_meta_parameter(meta, "session/load")?;
         }
 
         Ok(())
@@ -95,7 +111,7 @@ impl RequestValidator {
     }
 
     /// Validate meta parameter format
-    fn validate_meta_parameter(meta: &Value, request_type: &str) -> SessionSetupResult<()> {
+    fn validate_meta_parameter(&self, meta: &Value, request_type: &str) -> SessionSetupResult<()> {
         // Meta should be a JSON object or null
         if !meta.is_object() && !meta.is_null() {
             return Err(SessionSetupError::InvalidParameterType(Box::new(
@@ -142,16 +158,17 @@ impl RequestValidator {
 
             // Check for excessively large meta objects
             let meta_str = serde_json::to_string(meta).unwrap_or_default();
-            if meta_str.len() > 100_000 {
+            if self.size_validator.validate_meta_size(meta_str.len()).is_err() {
+                let limit = self.size_validator.limits().max_meta_size;
                 return Err(SessionSetupError::InvalidParameterType(Box::new(
                     crate::session_errors::InvalidParameterTypeDetails {
                         request_type: request_type.to_string(),
                         parameter_name: "meta".to_string(),
-                        expected_type: "reasonably sized object (<100KB)".to_string(),
+                        expected_type: format!("reasonably sized object (<{}KB)", limit / 1000),
                         actual_type: "excessively large object".to_string(),
                         provided_value: serde_json::json!({
                             "sizeBytes": meta_str.len(),
-                            "maxSizeBytes": 100_000
+                            "maxSizeBytes": limit
                         }),
                     },
                 )));
@@ -534,24 +551,27 @@ mod tests {
 
     #[test]
     fn test_validate_new_session_request_valid() {
+        let validator = RequestValidator::new();
         let request = create_test_new_session_request();
-        let result = RequestValidator::validate_new_session_request(&request);
+        let result = validator.validate_new_session_request(&request);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_load_session_request_valid() {
+        let validator = RequestValidator::new();
         let request = create_test_load_session_request();
-        let result = RequestValidator::validate_load_session_request(&request);
+        let result = validator.validate_load_session_request(&request);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_load_session_request_invalid_session_id() {
+        let validator = RequestValidator::new();
         let mut request = create_test_load_session_request();
         request.session_id = SessionId("invalid-session-id".to_string().into());
 
-        let result = RequestValidator::validate_load_session_request(&request);
+        let result = validator.validate_load_session_request(&request);
         assert!(result.is_err());
 
         if let Err(SessionSetupError::InvalidSessionId { .. }) = result {
@@ -576,8 +596,9 @@ mod tests {
 
     #[test]
     fn test_validate_meta_parameter_invalid_type() {
+        let validator = RequestValidator::new();
         let invalid_meta = serde_json::json!("not an object");
-        let result = RequestValidator::validate_meta_parameter(&invalid_meta, "test");
+        let result = validator.validate_meta_parameter(&invalid_meta, "test");
 
         assert!(result.is_err());
         if let Err(SessionSetupError::InvalidParameterType(..)) = result {
@@ -589,8 +610,9 @@ mod tests {
 
     #[test]
     fn test_validate_meta_parameter_reserved_key() {
+        let validator = RequestValidator::new();
         let meta_with_reserved = serde_json::json!({"_system": "reserved"});
-        let result = RequestValidator::validate_meta_parameter(&meta_with_reserved, "test");
+        let result = validator.validate_meta_parameter(&meta_with_reserved, "test");
 
         assert!(result.is_err());
         if let Err(SessionSetupError::InvalidParameterType(..)) = result {

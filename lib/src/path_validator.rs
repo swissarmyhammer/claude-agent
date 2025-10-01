@@ -1,3 +1,4 @@
+use crate::size_validator::{SizeValidationError, SizeValidator};
 use crate::validation_utils;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -5,12 +6,12 @@ use thiserror::Error;
 /// ACP-compliant path validator with comprehensive security and platform validation
 #[derive(Debug, Clone)]
 pub struct PathValidator {
-    /// Maximum allowed path length in characters
-    max_path_length: usize,
     /// Allowed root directories for file operations
     allowed_roots: Vec<PathBuf>,
     /// Whether to perform strict canonicalization (default: true)
     strict_canonicalization: bool,
+    /// Size validator for path length validation
+    size_validator: SizeValidator,
 }
 
 /// Errors that can occur during path validation
@@ -44,6 +45,16 @@ pub enum PathValidationError {
     EmptyPath,
 }
 
+impl From<SizeValidationError> for PathValidationError {
+    fn from(error: SizeValidationError) -> Self {
+        match error {
+            SizeValidationError::SizeExceeded {
+                actual, limit, ..
+            } => PathValidationError::PathTooLong(actual, limit),
+        }
+    }
+}
+
 impl Default for PathValidator {
     fn default() -> Self {
         Self::new()
@@ -53,17 +64,24 @@ impl Default for PathValidator {
 impl PathValidator {
     /// Create a new path validator with default settings
     pub fn new() -> Self {
+        let size_validator = SizeValidator::default();
+
         Self {
-            max_path_length: 4096,
             allowed_roots: Vec::new(),
             strict_canonicalization: true,
+            size_validator,
         }
     }
 
     /// Create a path validator with custom maximum path length
     pub fn with_max_length(max_length: usize) -> Self {
-        Self {
+        let size_validator = SizeValidator::new(crate::size_validator::SizeLimits {
             max_path_length: max_length,
+            ..Default::default()
+        });
+
+        Self {
+            size_validator,
             ..Self::new()
         }
     }
@@ -102,12 +120,7 @@ impl PathValidator {
         }
 
         // Check path length
-        if path_str.len() > self.max_path_length {
-            return Err(PathValidationError::PathTooLong(
-                path_str.len(),
-                self.max_path_length,
-            ));
-        }
+        self.size_validator.validate_path_length(path_str)?;
 
         // Check for null bytes
         if path_str.contains('\0') {
@@ -488,7 +501,7 @@ mod tests {
     #[test]
     fn test_path_validator_builder_methods() {
         let validator = PathValidator::with_max_length(1024);
-        assert_eq!(validator.max_path_length, 1024);
+        assert_eq!(validator.size_validator.limits().max_path_length, 1024);
 
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path().to_path_buf();

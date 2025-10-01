@@ -2,6 +2,7 @@ use crate::base64_validation;
 use crate::content_security_validator::{ContentSecurityError, ContentSecurityValidator};
 use crate::error::ToJsonRpcError;
 use crate::mime_type_validator::{MimeTypeValidationError, MimeTypeValidator};
+use crate::size_validator::{SizeValidationError, SizeValidator};
 use base64::{engine::general_purpose, Engine as _};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -127,9 +128,18 @@ impl ToJsonRpcError for Base64ProcessorError {
     }
 }
 
+impl From<SizeValidationError> for Base64ProcessorError {
+    fn from(error: SizeValidationError) -> Self {
+        match error {
+            SizeValidationError::SizeExceeded {
+                actual, limit, ..
+            } => Base64ProcessorError::SizeExceeded { limit, actual },
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Base64Processor {
-    max_size: usize,
     allowed_blob_mime_types: HashSet<String>,
     processing_timeout: Duration,
     max_memory_usage: usize,
@@ -138,6 +148,7 @@ pub struct Base64Processor {
     supported_capabilities: HashSet<String>,
     content_security_validator: Option<ContentSecurityValidator>,
     mime_type_validator: MimeTypeValidator,
+    size_validator: SizeValidator,
 }
 
 impl Default for Base64Processor {
@@ -163,8 +174,9 @@ impl Default for Base64Processor {
         supported_capabilities.insert("audio".to_string());
         supported_capabilities.insert("text".to_string());
 
+        let size_validator = SizeValidator::default();
+
         Self {
-            max_size: 10 * 1024 * 1024, // 10MB default limit
             allowed_blob_mime_types,
             processing_timeout: Duration::from_secs(30),
             max_memory_usage: 50 * 1024 * 1024, // 50MB memory limit
@@ -173,14 +185,20 @@ impl Default for Base64Processor {
             supported_capabilities,
             content_security_validator: None, // Default to no enhanced security validation
             mime_type_validator: MimeTypeValidator::moderate(),
+            size_validator,
         }
     }
 }
 
 impl Base64Processor {
     pub fn new(max_size: usize) -> Self {
+        let size_validator = SizeValidator::new(crate::size_validator::SizeLimits {
+            max_base64_size: max_size,
+            ..Default::default()
+        });
+
         Self {
-            max_size,
+            size_validator,
             ..Default::default()
         }
     }
@@ -193,8 +211,12 @@ impl Base64Processor {
         enable_security_validation: bool,
         supported_capabilities: HashSet<String>,
     ) -> Self {
+        let size_validator = SizeValidator::new(crate::size_validator::SizeLimits {
+            max_base64_size: max_size,
+            ..Default::default()
+        });
+
         Self {
-            max_size,
             processing_timeout,
             max_memory_usage,
             enable_capability_validation,
@@ -202,6 +224,7 @@ impl Base64Processor {
             supported_capabilities,
             content_security_validator: None,
             mime_type_validator: MimeTypeValidator::moderate(),
+            size_validator,
             ..Default::default()
         }
     }
@@ -210,10 +233,15 @@ impl Base64Processor {
         max_size: usize,
         content_security_validator: ContentSecurityValidator,
     ) -> Self {
+        let size_validator = SizeValidator::new(crate::size_validator::SizeLimits {
+            max_base64_size: max_size,
+            ..Default::default()
+        });
+
         Self {
-            max_size,
             content_security_validator: Some(content_security_validator),
             mime_type_validator: MimeTypeValidator::moderate(),
+            size_validator,
             ..Default::default()
         }
     }
@@ -227,8 +255,12 @@ impl Base64Processor {
         supported_capabilities: HashSet<String>,
         content_security_validator: ContentSecurityValidator,
     ) -> Self {
+        let size_validator = SizeValidator::new(crate::size_validator::SizeLimits {
+            max_base64_size: max_size,
+            ..Default::default()
+        });
+
         Self {
-            max_size,
             processing_timeout,
             max_memory_usage,
             enable_capability_validation,
@@ -236,6 +268,7 @@ impl Base64Processor {
             supported_capabilities,
             content_security_validator: Some(content_security_validator),
             mime_type_validator: MimeTypeValidator::moderate(),
+            size_validator,
             ..Default::default()
         }
     }
@@ -448,16 +481,7 @@ impl Base64Processor {
     }
 
     fn check_size_limits(&self, data: &str) -> Result<(), Base64ProcessorError> {
-        // Estimate decoded size (base64 encodes 3 bytes as 4 characters)
-        let estimated_decoded_size = (data.len() * 3) / 4;
-
-        if estimated_decoded_size > self.max_size {
-            return Err(Base64ProcessorError::SizeExceeded {
-                limit: self.max_size,
-                actual: estimated_decoded_size,
-            });
-        }
-
+        self.size_validator.validate_base64_size(data)?;
         Ok(())
     }
 
