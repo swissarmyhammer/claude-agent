@@ -27,6 +27,7 @@ pub enum TransportConnection {
         client: Arc<Client>,
         url: String,
         headers: Vec<crate::config::HttpHeader>,
+        session_id: Arc<RwLock<Option<String>>>,
     },
     /// SSE transport using WebSocket connection
     Sse {
@@ -178,14 +179,16 @@ impl McpServerManager {
                     })?;
 
                 // Initialize MCP connection via HTTP
+                let session_id = Arc::new(RwLock::new(None));
                 let tools = self
-                    .initialize_http_mcp_connection(&client, http_config)
+                    .initialize_http_mcp_connection(&client, http_config, session_id.clone())
                     .await?;
 
                 let transport = TransportConnection::Http {
                     client: Arc::new(client),
                     url: http_config.url.clone(),
                     headers: http_config.headers.clone(),
+                    session_id,
                 };
 
                 let connection = McpServerConnection {
@@ -376,13 +379,36 @@ impl McpServerManager {
         Ok(final_tools)
     }
 
-    /// Initialize HTTP MCP connection
+    /// Initialize HTTP MCP connection using the MCP Streamable HTTP transport protocol.
+    ///
+    /// Implements the three-step initialization handshake:
+    /// 1. Send initialize request and parse response (JSON or SSE)
+    /// 2. Send initialized notification (expects HTTP 202)
+    /// 3. Request tools list and extract tool names
+    ///
+    /// # Arguments
+    /// * `client` - HTTP client to use for requests
+    /// * `config` - HTTP transport configuration including URL and headers
+    /// * `session_id` - Arc-wrapped session ID storage for subsequent requests
+    ///
+    /// # Returns
+    /// List of available tool names from the MCP server
+    ///
+    /// # Errors
+    /// Returns error if:
+    /// - Connection fails
+    /// - Server returns non-success status
+    /// - Response parsing fails
+    /// - Protocol negotiation fails
     async fn initialize_http_mcp_connection(
         &self,
         client: &Client,
         config: &crate::config::HttpTransport,
+        session_id: Arc<RwLock<Option<String>>>,
     ) -> crate::Result<Vec<String>> {
-        // Send initialize request via HTTP POST
+        tracing::info!("Initializing HTTP MCP protocol for {}", config.name);
+
+        // Step 1: Send initialize request via HTTP POST
         let initialize_request = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -401,6 +427,8 @@ impl McpServerManager {
 
         let response = client
             .post(&config.url)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
             .json(&initialize_request)
             .send()
             .await
@@ -411,21 +439,94 @@ impl McpServerManager {
                 ))
             })?;
 
-        let _response_json: Value = response.json().await.map_err(|e| {
-            crate::AgentError::ToolExecution(format!(
-                "Failed to parse initialize response from HTTP MCP server: {}",
-                e
-            ))
-        })?;
+        if !response.status().is_success() {
+            return Err(crate::AgentError::ToolExecution(format!(
+                "Initialize request failed with status: {}",
+                response.status()
+            )));
+        }
 
-        // Send initialized notification
+        // Extract session ID if present
+        if let Some(session_id_header) = response.headers().get("Mcp-Session-Id") {
+            if let Ok(session_id_str) = session_id_header.to_str() {
+                let mut session_id_write = session_id.write().await;
+                *session_id_write = Some(session_id_str.to_string());
+                tracing::debug!("Stored session ID: {}", session_id_str);
+            }
+        }
+
+        // Parse response body - handle both JSON and SSE formats
+        let content_type = response
+            .headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/json");
+
+        let initialize_response: Value = if content_type.contains("text/event-stream") {
+            // Handle SSE response format
+            let body = response.text().await.map_err(|e| {
+                crate::AgentError::ToolExecution(format!(
+                    "Failed to read SSE response from HTTP MCP server: {}",
+                    e
+                ))
+            })?;
+
+            // Parse SSE format - look for data: lines
+            let mut json_data = String::new();
+            for line in body.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    json_data = data.to_string();
+                    break;
+                }
+            }
+
+            if json_data.is_empty() {
+                return Err(crate::AgentError::ToolExecution(
+                    "No data in SSE response from HTTP MCP server".to_string(),
+                ));
+            }
+
+            serde_json::from_str(&json_data).map_err(|e| {
+                crate::AgentError::ToolExecution(format!(
+                    "Invalid JSON in SSE response from HTTP MCP server: {}",
+                    e
+                ))
+            })?
+        } else {
+            // Handle JSON response format
+            response.json().await.map_err(|e| {
+                crate::AgentError::ToolExecution(format!(
+                    "Failed to parse initialize response from HTTP MCP server: {}",
+                    e
+                ))
+            })?
+        };
+
+        // Validate initialize response
+        if let Some(error) = initialize_response.get("error") {
+            return Err(crate::AgentError::ToolExecution(format!(
+                "HTTP MCP server returned error: {}",
+                error
+            )));
+        }
+
+        // Step 2: Send initialized notification
         let initialized_notification = json!({
             "jsonrpc": "2.0",
             "method": "initialized"
         });
 
-        let _notify_response = client
+        let mut notify_request = client
             .post(&config.url)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json");
+
+        // Include session ID if present
+        if let Some(session_id_value) = session_id.read().await.as_ref() {
+            notify_request = notify_request.header("Mcp-Session-Id", session_id_value);
+        }
+
+        let notify_response = notify_request
             .json(&initialized_notification)
             .send()
             .await
@@ -436,15 +537,32 @@ impl McpServerManager {
                 ))
             })?;
 
-        // Request list of available tools
+        // Expect 202 Accepted for notification
+        if notify_response.status() != reqwest::StatusCode::ACCEPTED {
+            tracing::warn!(
+                "Initialized notification returned status: {} (expected 202 Accepted)",
+                notify_response.status()
+            );
+        }
+
+        // Step 3: Request list of available tools
         let tools_list_request = json!({
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/list"
         });
 
-        let tools_response = client
+        let mut tools_request = client
             .post(&config.url)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json");
+
+        // Include session ID if present
+        if let Some(session_id_value) = session_id.read().await.as_ref() {
+            tools_request = tools_request.header("Mcp-Session-Id", session_id_value);
+        }
+
+        let tools_response = tools_request
             .json(&tools_list_request)
             .send()
             .await
@@ -455,12 +573,59 @@ impl McpServerManager {
                 ))
             })?;
 
-        let tools_response_json: Value = tools_response.json().await.map_err(|e| {
-            crate::AgentError::ToolExecution(format!(
-                "Failed to parse tools/list response from HTTP MCP server: {}",
-                e
-            ))
-        })?;
+        if !tools_response.status().is_success() {
+            return Err(crate::AgentError::ToolExecution(format!(
+                "Tools list request failed with status: {}",
+                tools_response.status()
+            )));
+        }
+
+        // Parse tools response - handle both JSON and SSE formats
+        let tools_content_type = tools_response
+            .headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/json");
+
+        let tools_response_json: Value = if tools_content_type.contains("text/event-stream") {
+            // Handle SSE response format
+            let body = tools_response.text().await.map_err(|e| {
+                crate::AgentError::ToolExecution(format!(
+                    "Failed to read tools SSE response from HTTP MCP server: {}",
+                    e
+                ))
+            })?;
+
+            // Parse SSE format - look for data: lines
+            let mut json_data = String::new();
+            for line in body.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    json_data = data.to_string();
+                    break;
+                }
+            }
+
+            if json_data.is_empty() {
+                return Err(crate::AgentError::ToolExecution(
+                    "No data in tools SSE response from HTTP MCP server".to_string(),
+                ));
+            }
+
+            serde_json::from_str(&json_data).map_err(|e| {
+                crate::AgentError::ToolExecution(format!(
+                    "Invalid JSON in tools SSE response from HTTP MCP server: {}",
+                    e
+                ))
+            })?
+        } else {
+            // Handle JSON response format
+            tools_response.json().await.map_err(|e| {
+                crate::AgentError::ToolExecution(format!(
+                    "Failed to parse tools/list response from HTTP MCP server: {}",
+                    e
+                ))
+            })?
+        };
 
         let final_tools = self.extract_tools_from_list_response(&tools_response_json)?;
 
@@ -601,19 +766,29 @@ impl McpServerManager {
 
                 Ok(response)
             }
-            TransportConnection::Http { client, url, .. } => {
-                // Send HTTP request
-                let response = client
+            TransportConnection::Http {
+                client,
+                url,
+                session_id,
+                ..
+            } => {
+                // Send HTTP request with session ID if available
+                let mut request = client
                     .post(url)
-                    .json(&mcp_request)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        crate::AgentError::ToolExecution(format!(
-                            "Failed to send HTTP tool call request to MCP server: {}",
-                            e
-                        ))
-                    })?;
+                    .header("Accept", "application/json, text/event-stream")
+                    .header("Content-Type", "application/json");
+
+                // Include session ID if present
+                if let Some(session_id_value) = session_id.read().await.as_ref() {
+                    request = request.header("Mcp-Session-Id", session_id_value);
+                }
+
+                let response = request.json(&mcp_request).send().await.map_err(|e| {
+                    crate::AgentError::ToolExecution(format!(
+                        "Failed to send HTTP tool call request to MCP server: {}",
+                        e
+                    ))
+                })?;
 
                 let response_json: Value = response.json().await.map_err(|e| {
                     McpError::ProtocolError(format!(
@@ -1144,5 +1319,85 @@ mod tests {
         // Should be able to shutdown cleanly regardless of connection failures
         let shutdown_result = manager.shutdown().await;
         assert!(shutdown_result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_sse_response_with_data() {
+        let sse_body = "data: {\"jsonrpc\":\"2.0\",\"result\":{\"tools\":[]}}\n\n";
+        
+        let mut json_data = String::new();
+        for line in sse_body.lines() {
+            if let Some(data) = line.strip_prefix("data: ") {
+                json_data = data.to_string();
+                break;
+            }
+        }
+        
+        assert!(!json_data.is_empty());
+        let parsed: Value = serde_json::from_str(&json_data).unwrap();
+        assert_eq!(parsed["jsonrpc"], "2.0");
+    }
+
+    #[test]
+    fn test_parse_sse_response_empty() {
+        let sse_body = "event: message\n\n";
+        
+        let mut json_data = String::new();
+        for line in sse_body.lines() {
+            if let Some(data) = line.strip_prefix("data: ") {
+                json_data = data.to_string();
+                break;
+            }
+        }
+        
+        assert!(json_data.is_empty());
+    }
+
+    #[test]
+    fn test_session_id_storage() {
+        use tokio::runtime::Runtime;
+        
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let session_id = Arc::new(RwLock::new(None));
+            
+            // Test initial state
+            assert!(session_id.read().await.is_none());
+            
+            // Test storing session ID
+            {
+                let mut write_lock = session_id.write().await;
+                *write_lock = Some("test-session-123".to_string());
+            }
+            
+            // Test reading session ID
+            let read_lock = session_id.read().await;
+            assert_eq!(read_lock.as_ref().unwrap(), "test-session-123");
+        });
+    }
+
+    #[test]
+    fn test_http_transport_connection_has_session_id() {
+        use tokio::runtime::Runtime;
+        
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let client = reqwest::Client::new();
+            let session_id = Arc::new(RwLock::new(Some("session-abc".to_string())));
+            
+            let transport = TransportConnection::Http {
+                client: Arc::new(client),
+                url: "http://localhost:8080".to_string(),
+                headers: vec![],
+                session_id: session_id.clone(),
+            };
+            
+            match transport {
+                TransportConnection::Http { session_id: sid, .. } => {
+                    assert_eq!(sid.read().await.as_ref().unwrap(), "session-abc");
+                }
+                _ => panic!("Expected HTTP transport"),
+            }
+        });
     }
 }

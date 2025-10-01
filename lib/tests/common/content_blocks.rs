@@ -3,8 +3,8 @@
 //! This module provides helper functions to create various types of content blocks
 //! with sensible defaults for testing purposes.
 
-use agent_client_protocol::{AudioContent, ContentBlock, ImageContent, ResourceLink, TextContent};
 use super::test_data;
+use agent_client_protocol::{AudioContent, ContentBlock, ImageContent, ResourceLink, TextContent};
 
 /// Create a text content block with the given text
 pub fn text(content: &str) -> ContentBlock {

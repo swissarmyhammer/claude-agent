@@ -30,7 +30,10 @@ impl RequestValidator {
     }
 
     /// Validate a session/new request with comprehensive error handling
-    pub fn validate_new_session_request(&self, request: &NewSessionRequest) -> SessionSetupResult<()> {
+    pub fn validate_new_session_request(
+        &self,
+        request: &NewSessionRequest,
+    ) -> SessionSetupResult<()> {
         // Validate working directory parameter (always present in ACP)
         Self::validate_working_directory_parameter(&request.cwd, "session/new")?;
 
@@ -47,7 +50,10 @@ impl RequestValidator {
     }
 
     /// Validate a session/load request with comprehensive error handling
-    pub fn validate_load_session_request(&self, request: &LoadSessionRequest) -> SessionSetupResult<()> {
+    pub fn validate_load_session_request(
+        &self,
+        request: &LoadSessionRequest,
+    ) -> SessionSetupResult<()> {
         // Validate session ID parameter (required)
         Self::validate_session_id_parameter(&request.session_id, "session/load")?;
 
@@ -158,7 +164,11 @@ impl RequestValidator {
 
             // Check for excessively large meta objects
             let meta_str = serde_json::to_string(meta).unwrap_or_default();
-            if self.size_validator.validate_meta_size(meta_str.len()).is_err() {
+            if self
+                .size_validator
+                .validate_meta_size(meta_str.len())
+                .is_err()
+            {
                 let limit = self.size_validator.limits().max_meta_size;
                 return Err(SessionSetupError::InvalidParameterType(Box::new(
                     crate::session_errors::InvalidParameterTypeDetails {

@@ -356,14 +356,16 @@ impl EnhancedMcpServerManager {
             })?;
 
         // Test connection and initialize protocol
+        let session_id = Arc::new(RwLock::new(None));
         let tools = self
-            .initialize_http_mcp_protocol_enhanced(&client, http_config)
+            .initialize_http_mcp_protocol_enhanced(&client, http_config, session_id.clone())
             .await?;
 
         let transport = TransportConnection::Http {
             client: Arc::new(client),
             url: parsed_url.to_string(),
             headers: http_config.headers.clone(),
+            session_id,
         };
 
         let connection = McpServerConnection {
@@ -598,31 +600,265 @@ impl EnhancedMcpServerManager {
         &self,
         client: &Client,
         http_config: &crate::config::HttpTransport,
+        session_id: Arc<RwLock<Option<String>>>,
     ) -> SessionSetupResult<Vec<String>> {
-        // This is a placeholder implementation - HTTP MCP protocol would need actual specification
-        tracing::warn!("HTTP MCP protocol initialization is not fully implemented");
+        tracing::info!("Initializing HTTP MCP protocol for {}", http_config.name);
 
-        // Test basic connectivity
-        let test_response = client.get(&http_config.url).send().await.map_err(|e| {
-            SessionSetupError::McpServerConnectionFailed {
-                server_name: http_config.name.clone(),
-                error: format!("HTTP connection failed: {}", e),
-                transport_type: "http".to_string(),
+        // Step 1: Send initialize request
+        let initialize_request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "roots": {
+                        "listChanged": true
+                    },
+                    "sampling": {}
+                },
+                "clientInfo": {
+                    "name": "claude-agent",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
             }
-        })?;
+        });
 
-        if !test_response.status().is_success() {
+        let response = client
+            .post(&http_config.url)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
+            .json(&initialize_request)
+            .send()
+            .await
+            .map_err(|e| SessionSetupError::McpServerConnectionFailed {
+                server_name: http_config.name.clone(),
+                error: format!("Failed to send initialize request: {}", e),
+                transport_type: "http".to_string(),
+            })?;
+
+        if !response.status().is_success() {
             return Err(SessionSetupError::McpServerConnectionFailed {
                 server_name: http_config.name.clone(),
                 error: format!(
-                    "HTTP connection failed with status: {}",
-                    test_response.status()
+                    "Initialize request failed with status: {}",
+                    response.status()
                 ),
                 transport_type: "http".to_string(),
             });
         }
 
-        Ok(vec!["http_placeholder_tool".to_string()])
+        // Extract session ID if present
+        if let Some(session_id_header) = response.headers().get("Mcp-Session-Id") {
+            if let Ok(session_id_str) = session_id_header.to_str() {
+                let mut session_id_write = session_id.write().await;
+                *session_id_write = Some(session_id_str.to_string());
+                tracing::debug!("Stored session ID: {}", session_id_str);
+            }
+        }
+
+        // Parse response body
+        let content_type = response
+            .headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/json");
+
+        let initialize_response: Value = if content_type.contains("text/event-stream") {
+            // Handle SSE response
+            let body = response.text().await.map_err(|e| {
+                SessionSetupError::McpServerConnectionFailed {
+                    server_name: http_config.name.clone(),
+                    error: format!("Failed to read SSE response: {}", e),
+                    transport_type: "http".to_string(),
+                }
+            })?;
+
+            // Parse SSE format - look for data: lines
+            let mut json_data = String::new();
+            for line in body.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    json_data = data.to_string();
+                    break;
+                }
+            }
+
+            if json_data.is_empty() {
+                return Err(SessionSetupError::McpServerProtocolNegotiationFailed {
+                    server_name: http_config.name.clone(),
+                    expected_version: "2024-11-05".to_string(),
+                    actual_version: Some("No data in SSE response".to_string()),
+                });
+            }
+
+            serde_json::from_str(&json_data).map_err(|e| {
+                SessionSetupError::McpServerProtocolNegotiationFailed {
+                    server_name: http_config.name.clone(),
+                    expected_version: "2024-11-05".to_string(),
+                    actual_version: Some(format!("Invalid JSON in SSE: {}", e)),
+                }
+            })?
+        } else {
+            // Handle JSON response
+            response.json().await.map_err(|e| {
+                SessionSetupError::McpServerConnectionFailed {
+                    server_name: http_config.name.clone(),
+                    error: format!("Failed to parse initialize response: {}", e),
+                    transport_type: "http".to_string(),
+                }
+            })?
+        };
+
+        // Validate initialize response
+        if let Some(error) = initialize_response.get("error") {
+            return Err(SessionSetupError::McpServerProtocolNegotiationFailed {
+                server_name: http_config.name.clone(),
+                expected_version: "2024-11-05".to_string(),
+                actual_version: Some(format!("Server error: {}", error)),
+            });
+        }
+
+        // Step 2: Send initialized notification
+        let initialized_notification = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        });
+
+        let mut notify_request = client
+            .post(&http_config.url)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json");
+
+        // Include session ID if present
+        if let Some(session_id_value) = session_id.read().await.as_ref() {
+            notify_request = notify_request.header("Mcp-Session-Id", session_id_value);
+        }
+
+        let notif_response = notify_request
+            .json(&initialized_notification)
+            .send()
+            .await
+            .map_err(|e| SessionSetupError::McpServerConnectionFailed {
+                server_name: http_config.name.clone(),
+                error: format!("Failed to send initialized notification: {}", e),
+                transport_type: "http".to_string(),
+            })?;
+
+        // Expect 202 Accepted for notification
+        if notif_response.status() != reqwest::StatusCode::ACCEPTED {
+            tracing::warn!(
+                "Initialized notification returned status: {}",
+                notif_response.status()
+            );
+        }
+
+        // Step 3: Request tools list
+        let tools_request = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list"
+        });
+
+        let mut tools_request_builder = client
+            .post(&http_config.url)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json");
+
+        // Include session ID if present
+        if let Some(session_id_value) = session_id.read().await.as_ref() {
+            tools_request_builder = tools_request_builder.header("Mcp-Session-Id", session_id_value);
+        }
+
+        let tools_response = tools_request_builder
+            .json(&tools_request)
+            .send()
+            .await
+            .map_err(|e| SessionSetupError::McpServerConnectionFailed {
+                server_name: http_config.name.clone(),
+                error: format!("Failed to send tools/list request: {}", e),
+                transport_type: "http".to_string(),
+            })?;
+
+        if !tools_response.status().is_success() {
+            return Err(SessionSetupError::McpServerConnectionFailed {
+                server_name: http_config.name.clone(),
+                error: format!(
+                    "Tools list request failed with status: {}",
+                    tools_response.status()
+                ),
+                transport_type: "http".to_string(),
+            });
+        }
+
+        // Parse tools response
+        let tools_content_type = tools_response
+            .headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/json");
+
+        let tools_result: Value = if tools_content_type.contains("text/event-stream") {
+            // Handle SSE response
+            let body = tools_response.text().await.map_err(|e| {
+                SessionSetupError::McpServerConnectionFailed {
+                    server_name: http_config.name.clone(),
+                    error: format!("Failed to read tools SSE response: {}", e),
+                    transport_type: "http".to_string(),
+                }
+            })?;
+
+            // Parse SSE format - look for data: lines
+            let mut json_data = String::new();
+            for line in body.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    json_data = data.to_string();
+                    break;
+                }
+            }
+
+            if json_data.is_empty() {
+                return Err(SessionSetupError::McpServerConnectionFailed {
+                    server_name: http_config.name.clone(),
+                    error: "No data in tools SSE response".to_string(),
+                    transport_type: "http".to_string(),
+                });
+            }
+
+            serde_json::from_str(&json_data).map_err(|e| {
+                SessionSetupError::McpServerConnectionFailed {
+                    server_name: http_config.name.clone(),
+                    error: format!("Invalid JSON in tools SSE: {}", e),
+                    transport_type: "http".to_string(),
+                }
+            })?
+        } else {
+            // Handle JSON response
+            tools_response.json().await.map_err(|e| {
+                SessionSetupError::McpServerConnectionFailed {
+                    server_name: http_config.name.clone(),
+                    error: format!("Failed to parse tools response: {}", e),
+                    transport_type: "http".to_string(),
+                }
+            })?
+        };
+
+        // Extract tool names from response
+        let tools = if let Some(result) = tools_result.get("result") {
+            if let Some(tools_array) = result.get("tools").and_then(|t| t.as_array()) {
+                tools_array
+                    .iter()
+                    .filter_map(|tool| tool.get("name").and_then(|name| name.as_str()))
+                    .map(|name| name.to_string())
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        tracing::info!("MCP server {} reported {} tools", http_config.name, tools.len());
+        Ok(tools)
     }
 
     /// Initialize SSE MCP protocol with comprehensive error handling

@@ -670,8 +670,6 @@ impl ContentSecurityValidator {
         false
     }
 
-
-
     /// Validate text content for potentially dangerous content
     fn validate_text_content_safety(&self, text: &str) -> Result<(), ContentSecurityError> {
         // Check for basic script injection patterns

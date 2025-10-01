@@ -321,7 +321,8 @@ impl ToolCallHandler {
         let title = ToolCallReport::generate_title(tool_name, arguments);
         let kind = ToolKind::classify_tool(tool_name, arguments);
 
-        let mut report = ToolCallReport::new(tool_call_id.clone(), title, kind, tool_name.to_string());
+        let mut report =
+            ToolCallReport::new(tool_call_id.clone(), title, kind, tool_name.to_string());
         report.set_raw_input(arguments.clone());
 
         // Extract and add file locations for ACP follow-along features
@@ -1850,9 +1851,9 @@ mod tests {
     use super::*;
     use crate::permissions::{FilePermissionStorage, PermissionPolicyEngine};
     use crate::session::SessionManager;
+    use agent_client_protocol::SessionId;
     use serde_json::json;
     use std::sync::Arc;
-    use agent_client_protocol::SessionId;
 
     fn create_permission_engine() -> Arc<PermissionPolicyEngine> {
         let temp_dir = tempfile::tempdir().unwrap();

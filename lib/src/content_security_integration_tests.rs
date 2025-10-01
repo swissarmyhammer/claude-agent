@@ -8,11 +8,12 @@ use std::time::Duration;
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     // Test data constants
     const VALID_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
     const VALID_WAV_BASE64: &str = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAAA";
-    const MALICIOUS_PE_BASE64: &str = "TVqQAAMAAAAEAAAA//8AALgAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const MALICIOUS_PE_BASE64: &str =
+        "TVqQAAMAAAAEAAAA//8AALgAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     // Helper functions to create content blocks
     fn image(mime_type: &str, data: &str) -> ContentBlock {
@@ -24,7 +25,6 @@ mod tests {
             meta: None,
         })
     }
-    
 
     fn audio(mime_type: &str, data: &str) -> ContentBlock {
         ContentBlock::Audio(agent_client_protocol::AudioContent {
@@ -34,11 +34,10 @@ mod tests {
             meta: None,
         })
     }
-    
+
     fn audio_wav() -> ContentBlock {
         audio("audio/wav", VALID_WAV_BASE64)
     }
-    
 
     /// Create a ContentBlockProcessor with strict security validation
     fn create_strict_secure_processor() -> ContentBlockProcessor {

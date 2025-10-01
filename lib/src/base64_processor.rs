@@ -132,9 +132,9 @@ impl ToJsonRpcError for Base64ProcessorError {
 impl From<SizeValidationError> for Base64ProcessorError {
     fn from(error: SizeValidationError) -> Self {
         match error {
-            SizeValidationError::SizeExceeded {
-                actual, limit, ..
-            } => Base64ProcessorError::SizeExceeded { limit, actual },
+            SizeValidationError::SizeExceeded { actual, limit, .. } => {
+                Base64ProcessorError::SizeExceeded { limit, actual }
+            }
         }
     }
 }

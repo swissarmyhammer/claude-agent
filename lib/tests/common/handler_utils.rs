@@ -11,10 +11,8 @@ use tokio::sync::broadcast;
 use super::fixtures;
 
 /// Create a test handler with notification sender and receiver
-pub async fn create_handler_with_notifications() -> (
-    ToolCallHandler,
-    broadcast::Receiver<SessionNotification>,
-) {
+pub async fn create_handler_with_notifications(
+) -> (ToolCallHandler, broadcast::Receiver<SessionNotification>) {
     let permissions = fixtures::tool_permissions();
     let session_manager = fixtures::session_manager();
     let permission_engine = fixtures::permission_engine();
@@ -29,10 +27,7 @@ pub async fn create_handler_with_notifications() -> (
 /// Create a test handler with custom permissions and notifications
 pub async fn create_handler_with_custom_permissions(
     permissions: claude_agent_lib::tools::ToolPermissions,
-) -> (
-    ToolCallHandler,
-    broadcast::Receiver<SessionNotification>,
-) {
+) -> (ToolCallHandler, broadcast::Receiver<SessionNotification>) {
     let session_manager = fixtures::session_manager();
     let permission_engine = fixtures::permission_engine();
 
@@ -58,10 +53,7 @@ pub fn create_handler_without_notifications() -> ToolCallHandler {
 pub async fn consume_notification(
     receiver: &mut broadcast::Receiver<SessionNotification>,
 ) -> SessionNotification {
-    receiver
-        .recv()
-        .await
-        .expect("Should receive notification")
+    receiver.recv().await.expect("Should receive notification")
 }
 
 /// Try to consume a notification without blocking
@@ -95,7 +87,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_handler_with_notifications() {
         let (_handler, _receiver) = create_handler_with_notifications().await;
-        
+
         // Handler creation succeeded if we got here
     }
 
@@ -108,14 +100,14 @@ mod tests {
         };
 
         let (_handler, _receiver) = create_handler_with_custom_permissions(custom_perms).await;
-        
+
         // Handler creation succeeded if we got here
     }
 
     #[test]
     fn test_create_handler_without_notifications() {
         let _handler = create_handler_without_notifications();
-        
+
         // Handler creation succeeded if we got here
     }
 

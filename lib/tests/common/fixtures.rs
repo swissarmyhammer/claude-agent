@@ -1,11 +1,11 @@
 //! Core test fixtures for common test setup patterns
 
-use std::path::PathBuf;
-use std::sync::Arc;
-use tempfile::TempDir;
 use claude_agent_lib::permissions::{FilePermissionStorage, PermissionPolicyEngine};
 use claude_agent_lib::session::SessionManager;
 use claude_agent_lib::tools::ToolPermissions;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tempfile::TempDir;
 
 /// Create test permission engine with temporary file storage
 pub fn permission_engine() -> Arc<PermissionPolicyEngine> {

@@ -175,9 +175,9 @@ impl ToJsonRpcError for ContentBlockProcessorError {
 impl From<SizeValidationError> for ContentBlockProcessorError {
     fn from(error: SizeValidationError) -> Self {
         match error {
-            SizeValidationError::SizeExceeded {
-                actual, limit, ..
-            } => ContentBlockProcessorError::ContentSizeExceeded { actual, limit },
+            SizeValidationError::SizeExceeded { actual, limit, .. } => {
+                ContentBlockProcessorError::ContentSizeExceeded { actual, limit }
+            }
         }
     }
 }
@@ -468,7 +468,8 @@ impl ContentBlockProcessor {
                     .decode_image_data(&image_content.data, &image_content.mime_type)?;
 
                 // Check resource size limit
-                self.size_validator.validate_content_size(decoded_data.len())?;
+                self.size_validator
+                    .validate_content_size(decoded_data.len())?;
 
                 let mut metadata = HashMap::new();
                 metadata.insert("mime_type".to_string(), image_content.mime_type.clone());
@@ -509,7 +510,8 @@ impl ContentBlockProcessor {
                     .decode_audio_data(&audio_content.data, &audio_content.mime_type)?;
 
                 // Check resource size limit
-                self.size_validator.validate_content_size(decoded_data.len())?;
+                self.size_validator
+                    .validate_content_size(decoded_data.len())?;
 
                 let mut metadata = HashMap::new();
                 metadata.insert("mime_type".to_string(), audio_content.mime_type.clone());
@@ -608,9 +610,12 @@ impl ContentBlockProcessor {
 
         // Allow common schemes
         let allowed_schemes = ["file", "http", "https", "data", "ftp"];
-        
+
         if !url_validation::is_allowed_scheme(&parsed_uri, &allowed_schemes) {
-            warn!("Potentially unsupported URI scheme: {}", parsed_uri.scheme());
+            warn!(
+                "Potentially unsupported URI scheme: {}",
+                parsed_uri.scheme()
+            );
         }
 
         Ok(())

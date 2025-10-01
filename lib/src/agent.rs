@@ -1906,7 +1906,7 @@ impl ClaudeAgent {
         let tool_handler = self.tool_handler.read().await;
         let tool_names = tool_handler.list_all_available_tools().await;
         drop(tool_handler);
-        
+
         // Get client capabilities to filter tools
         let client_caps = self.client_capabilities.read().await;
         let has_fs_read = client_caps
@@ -1915,9 +1915,7 @@ impl ClaudeAgent {
         let has_fs_write = client_caps
             .as_ref()
             .is_some_and(|caps| caps.fs.write_text_file);
-        let has_terminal_capability = client_caps
-            .as_ref()
-            .is_some_and(|caps| caps.terminal);
+        let has_terminal_capability = client_caps.as_ref().is_some_and(|caps| caps.terminal);
         drop(client_caps);
 
         for tool_name in tool_names {
@@ -1955,8 +1953,29 @@ impl ClaudeAgent {
             "Generated {} available commands for session {} (mcp: {}, tool_handler: {})",
             commands.len(),
             session_id,
-            if self.mcp_manager.is_some() { commands.iter().filter(|c| c.meta.as_ref().and_then(|m| m.get("source")).and_then(|s| s.as_str()) == Some("mcp_server")).count() } else { 0 },
-            commands.iter().filter(|c| c.meta.as_ref().and_then(|m| m.get("source")).and_then(|s| s.as_str()) == Some("tool_handler")).count()
+            if self.mcp_manager.is_some() {
+                commands
+                    .iter()
+                    .filter(|c| {
+                        c.meta
+                            .as_ref()
+                            .and_then(|m| m.get("source"))
+                            .and_then(|s| s.as_str())
+                            == Some("mcp_server")
+                    })
+                    .count()
+            } else {
+                0
+            },
+            commands
+                .iter()
+                .filter(|c| c
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.get("source"))
+                    .and_then(|s| s.as_str())
+                    == Some("tool_handler"))
+                .count()
         );
         commands
     }
@@ -3291,7 +3310,10 @@ impl ClaudeAgent {
             match active_calls.get(&request.tool_call.tool_call_id) {
                 Some(report) => {
                     let name = report.tool_name.clone();
-                    let args = report.raw_input.clone().unwrap_or_else(|| serde_json::json!({}));
+                    let args = report
+                        .raw_input
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!({}));
                     (name, args)
                 }
                 None => {
@@ -7272,18 +7294,14 @@ mod tests {
     #[tokio::test]
     async fn test_request_permission_extracts_tool_metadata_success() {
         let (agent, session_id) = setup_agent_with_session().await;
-        
+
         // Create a tool call in the handler with specific name and arguments
         let tool_name = "test_read_tool";
         let tool_args = serde_json::json!({"file_path": "/test/file.txt"});
-        
+
         let tool_handler = agent.tool_handler.read().await;
         let report = tool_handler
-            .create_tool_call_report(
-                &SessionId(session_id.clone().into()),
-                tool_name,
-                &tool_args,
-            )
+            .create_tool_call_report(&SessionId(session_id.clone().into()), tool_name, &tool_args)
             .await;
         let tool_call_id = report.tool_call_id.clone();
         drop(tool_handler);
@@ -7314,7 +7332,7 @@ mod tests {
     #[tokio::test]
     async fn test_request_permission_handles_missing_tool_call() {
         let (agent, session_id) = setup_agent_with_session().await;
-        
+
         // Create a permission request with a non-existent tool_call_id
         let fake_tool_call_id = "nonexistent_tool_call_id_12345";
         let request = PermissionRequest {
@@ -7336,7 +7354,7 @@ mod tests {
     #[tokio::test]
     async fn test_request_permission_with_complex_tool_args() {
         let (agent, session_id) = setup_agent_with_session().await;
-        
+
         // Create a tool call with complex nested arguments
         let tool_name = "complex_test_tool";
         let tool_args = serde_json::json!({
@@ -7350,14 +7368,10 @@ mod tests {
                 "force": false
             }
         });
-        
+
         let tool_handler = agent.tool_handler.read().await;
         let report = tool_handler
-            .create_tool_call_report(
-                &SessionId(session_id.clone().into()),
-                tool_name,
-                &tool_args,
-            )
+            .create_tool_call_report(&SessionId(session_id.clone().into()), tool_name, &tool_args)
             .await;
         let tool_call_id = report.tool_call_id.clone();
         drop(tool_handler);
@@ -7373,7 +7387,7 @@ mod tests {
 
         // Request permission - should extract complex arguments correctly
         let result = agent.request_permission(request).await;
-        
+
         // Verify we got a valid response
         assert!(result.is_ok());
     }
@@ -7381,29 +7395,27 @@ mod tests {
     #[tokio::test]
     async fn test_request_permission_with_missing_raw_input() {
         let (agent, session_id) = setup_agent_with_session().await;
-        
+
         // Create a tool call but with None for raw_input
         let tool_name = "test_tool_no_args";
         let tool_args = serde_json::json!(null);
-        
+
         let tool_handler = agent.tool_handler.read().await;
         let report = tool_handler
-            .create_tool_call_report(
-                &SessionId(session_id.clone().into()),
-                tool_name,
-                &tool_args,
-            )
+            .create_tool_call_report(&SessionId(session_id.clone().into()), tool_name, &tool_args)
             .await;
         let tool_call_id = report.tool_call_id.clone();
-        
+
         // Manually update the report to have None for raw_input
-        tool_handler.update_tool_call_report(
-            &SessionId(session_id.clone().into()),
-            &tool_call_id,
-            |report| {
-                report.raw_input = None;
-            }
-        ).await;
+        tool_handler
+            .update_tool_call_report(
+                &SessionId(session_id.clone().into()),
+                &tool_call_id,
+                |report| {
+                    report.raw_input = None;
+                },
+            )
+            .await;
         drop(tool_handler);
 
         // Create a permission request
@@ -7417,7 +7429,7 @@ mod tests {
 
         // Request permission - should default to empty JSON object for missing raw_input
         let result = agent.request_permission(request).await;
-        
+
         // Verify we got a valid response
         assert!(result.is_ok());
     }
@@ -7444,20 +7456,14 @@ mod tests {
             .iter()
             .find(|cmd| cmd.name == "create_plan")
             .unwrap();
-        assert_eq!(
-            create_plan.meta.as_ref().unwrap()["source"],
-            "core"
-        );
-        assert_eq!(
-            create_plan.meta.as_ref().unwrap()["category"],
-            "planning"
-        );
+        assert_eq!(create_plan.meta.as_ref().unwrap()["source"], "core");
+        assert_eq!(create_plan.meta.as_ref().unwrap()["category"], "planning");
     }
 
     #[tokio::test]
     async fn test_command_discovery_includes_tool_handler_commands() {
         let agent = create_test_agent().await;
-        
+
         // Set client capabilities to enable filesystem tools
         let caps = agent_client_protocol::ClientCapabilities {
             fs: agent_client_protocol::FileSystemCapability {
@@ -7468,11 +7474,11 @@ mod tests {
             terminal: false,
             meta: None,
         };
-        
+
         let mut client_caps = agent.client_capabilities.write().await;
         *client_caps = Some(caps.clone());
         drop(client_caps);
-        
+
         // Also set tool handler capabilities
         let mut tool_handler = agent.tool_handler.write().await;
         tool_handler.set_client_capabilities(caps);
@@ -7493,20 +7499,14 @@ mod tests {
 
         // Verify tool handler commands have proper metadata
         let fs_read = commands.iter().find(|cmd| cmd.name == "fs_read").unwrap();
-        assert_eq!(
-            fs_read.meta.as_ref().unwrap()["source"],
-            "tool_handler"
-        );
-        assert_eq!(
-            fs_read.meta.as_ref().unwrap()["category"],
-            "filesystem"
-        );
+        assert_eq!(fs_read.meta.as_ref().unwrap()["source"], "tool_handler");
+        assert_eq!(fs_read.meta.as_ref().unwrap()["category"], "filesystem");
     }
 
     #[tokio::test]
     async fn test_command_discovery_filters_by_capabilities() {
         let agent = create_test_agent().await;
-        
+
         // Set capabilities with only read enabled
         let caps = agent_client_protocol::ClientCapabilities {
             fs: agent_client_protocol::FileSystemCapability {
@@ -7517,11 +7517,11 @@ mod tests {
             terminal: false,
             meta: None,
         };
-        
+
         let mut client_caps = agent.client_capabilities.write().await;
         *client_caps = Some(caps.clone());
         drop(client_caps);
-        
+
         // Also set tool handler capabilities
         let mut tool_handler = agent.tool_handler.write().await;
         tool_handler.set_client_capabilities(caps);
@@ -7552,7 +7552,7 @@ mod tests {
     #[tokio::test]
     async fn test_command_discovery_includes_terminal_commands() {
         let agent = create_test_agent().await;
-        
+
         // Enable terminal capability
         let caps = agent_client_protocol::ClientCapabilities {
             fs: agent_client_protocol::FileSystemCapability {
@@ -7563,11 +7563,11 @@ mod tests {
             terminal: true,
             meta: None,
         };
-        
+
         let mut client_caps = agent.client_capabilities.write().await;
         *client_caps = Some(caps.clone());
         drop(client_caps);
-        
+
         // Also set tool handler capabilities
         let mut tool_handler = agent.tool_handler.write().await;
         tool_handler.set_client_capabilities(caps);
@@ -7580,7 +7580,7 @@ mod tests {
         // Since we don't filter them out in our code (terminal tools pass through),
         // they should be present if tool handler included them
         let has_terminal_create = commands.iter().any(|cmd| cmd.name == "terminal_create");
-        
+
         // If terminal commands aren't present, it means tool handler didn't include them
         // This could be because tool handler doesn't have terminal manager initialized
         // For now, just verify that IF they are present, they have correct metadata
@@ -7598,7 +7598,7 @@ mod tests {
                 "terminal"
             );
         }
-        
+
         // At minimum, verify core commands and capability filtering works
         assert!(
             commands.iter().any(|cmd| cmd.name == "create_plan"),
@@ -7609,7 +7609,7 @@ mod tests {
     #[tokio::test]
     async fn test_command_discovery_with_no_capabilities() {
         let agent = create_test_agent().await;
-        
+
         // No capabilities set (None)
         let session_id = SessionId("test_session_no_caps".to_string().into());
         let commands = agent.get_available_commands_for_session(&session_id).await;
@@ -7634,7 +7634,7 @@ mod tests {
     #[tokio::test]
     async fn test_command_discovery_logs_command_sources() {
         let agent = create_test_agent().await;
-        
+
         // Enable all capabilities
         let caps = agent_client_protocol::ClientCapabilities {
             fs: agent_client_protocol::FileSystemCapability {
@@ -7645,11 +7645,11 @@ mod tests {
             terminal: true,
             meta: None,
         };
-        
+
         let mut client_caps = agent.client_capabilities.write().await;
         *client_caps = Some(caps.clone());
         drop(client_caps);
-        
+
         // Also set tool handler capabilities
         let mut tool_handler = agent.tool_handler.write().await;
         tool_handler.set_client_capabilities(caps);
@@ -7681,10 +7681,7 @@ mod tests {
             })
             .collect();
 
-        assert!(
-            !core_commands.is_empty(),
-            "Should have core commands"
-        );
+        assert!(!core_commands.is_empty(), "Should have core commands");
         assert!(
             !tool_handler_commands.is_empty(),
             "Should have tool_handler commands"

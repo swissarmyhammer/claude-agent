@@ -249,14 +249,10 @@ mod tests {
         assert!(is_private_ipv6(&Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)));
 
         // Link-local (fe80::/10)
-        assert!(is_private_ipv6(&Ipv6Addr::new(
-            0xfe80, 0, 0, 0, 0, 0, 0, 1
-        )));
+        assert!(is_private_ipv6(&Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)));
 
         // Unique local (fc00::/7)
-        assert!(is_private_ipv6(&Ipv6Addr::new(
-            0xfc00, 0, 0, 0, 0, 0, 0, 1
-        )));
+        assert!(is_private_ipv6(&Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1)));
 
         // Public addresses
         assert!(!is_private_ipv6(&Ipv6Addr::new(

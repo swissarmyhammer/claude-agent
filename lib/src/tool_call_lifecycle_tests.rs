@@ -5,16 +5,16 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::tool_types::ToolCallStatus;
-    use crate::tools::ToolCallHandler;
-    use crate::ToolPermissions;
     use crate::agent::NotificationSender;
     use crate::permissions::{FilePermissionStorage, PermissionPolicyEngine};
     use crate::session::SessionManager;
+    use crate::tool_types::ToolCallStatus;
+    use crate::tools::ToolCallHandler;
+    use crate::ToolPermissions;
     use agent_client_protocol::{SessionId, SessionNotification, SessionUpdate};
     use serde_json::json;
-    use tokio::sync::broadcast;
     use std::sync::Arc;
+    use tokio::sync::broadcast;
 
     /// Helper to create a test tool call handler with notification sender
     async fn create_test_handler() -> (ToolCallHandler, broadcast::Receiver<SessionNotification>) {

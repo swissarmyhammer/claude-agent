@@ -48,9 +48,9 @@ pub enum PathValidationError {
 impl From<SizeValidationError> for PathValidationError {
     fn from(error: SizeValidationError) -> Self {
         match error {
-            SizeValidationError::SizeExceeded {
-                actual, limit, ..
-            } => PathValidationError::PathTooLong(actual, limit),
+            SizeValidationError::SizeExceeded { actual, limit, .. } => {
+                PathValidationError::PathTooLong(actual, limit)
+            }
         }
     }
 }

@@ -13,7 +13,8 @@ pub const VALID_WAV_BASE64: &str = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAAB
 
 /// PE executable header (base64 encoded) for malicious content detection testing
 /// This represents the "MZ" signature of Windows PE executables
-pub const MALICIOUS_PE_BASE64: &str = "TVqQAAMAAAAEAAAA//8AALgAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+pub const MALICIOUS_PE_BASE64: &str =
+    "TVqQAAMAAAAEAAAA//8AALgAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 /// ELF executable header (base64 encoded) for malicious content detection testing
 /// This represents the ELF magic number (0x7F 'E' 'L' 'F')
@@ -26,12 +27,10 @@ mod tests {
     #[test]
     fn test_png_base64_is_valid() {
         // Verify it's valid base64
-        let decoded = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            VALID_PNG_BASE64,
-        );
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, VALID_PNG_BASE64);
         assert!(decoded.is_ok());
-        
+
         // Verify it starts with PNG signature
         let bytes = decoded.unwrap();
         assert!(bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47])); // PNG signature
@@ -40,12 +39,10 @@ mod tests {
     #[test]
     fn test_wav_base64_is_valid() {
         // Verify it's valid base64
-        let decoded = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            VALID_WAV_BASE64,
-        );
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, VALID_WAV_BASE64);
         assert!(decoded.is_ok());
-        
+
         // Verify it starts with RIFF signature
         let bytes = decoded.unwrap();
         assert!(bytes.starts_with(b"RIFF")); // RIFF signature
@@ -59,7 +56,7 @@ mod tests {
             MALICIOUS_PE_BASE64,
         );
         assert!(decoded.is_ok());
-        
+
         // Verify it starts with MZ signature
         let bytes = decoded.unwrap();
         assert!(bytes.starts_with(b"MZ")); // PE signature
@@ -73,7 +70,7 @@ mod tests {
             MALICIOUS_ELF_BASE64,
         );
         assert!(decoded.is_ok());
-        
+
         // Verify it starts with ELF signature
         let bytes = decoded.unwrap();
         assert!(bytes.starts_with(&[0x7F, b'E', b'L', b'F'])); // ELF signature

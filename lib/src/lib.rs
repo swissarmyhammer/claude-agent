@@ -50,5 +50,3 @@ pub use error::{AgentError, Result};
 pub use plan::{AgentPlan, PlanEntry, PlanEntryStatus, PlanGenerator, PlanManager, Priority};
 pub use server::ClaudeAgentServer;
 pub use tools::{ToolCallHandler, ToolCallResult, ToolPermissions};
-
-

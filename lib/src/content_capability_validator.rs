@@ -239,8 +239,10 @@ mod tests {
 
     // Helper functions to create test content blocks
     mod content_blocks {
-        use agent_client_protocol::{AudioContent, ContentBlock, ImageContent, ResourceLink, TextContent};
-        
+        use agent_client_protocol::{
+            AudioContent, ContentBlock, ImageContent, ResourceLink, TextContent,
+        };
+
         pub fn text(content: &str) -> ContentBlock {
             ContentBlock::Text(TextContent {
                 text: content.to_string(),
@@ -248,7 +250,7 @@ mod tests {
                 meta: None,
             })
         }
-        
+
         pub fn image(mime_type: &str, data: &str) -> ContentBlock {
             ContentBlock::Image(ImageContent {
                 data: data.to_string(),
@@ -258,12 +260,12 @@ mod tests {
                 meta: None,
             })
         }
-        
+
         pub fn image_png() -> ContentBlock {
             const VALID_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
             image("image/png", VALID_PNG_BASE64)
         }
-        
+
         pub fn audio(mime_type: &str, data: &str) -> ContentBlock {
             ContentBlock::Audio(AudioContent {
                 data: data.to_string(),
@@ -272,12 +274,12 @@ mod tests {
                 meta: None,
             })
         }
-        
+
         pub fn audio_wav() -> ContentBlock {
-            const VALID_WAV_BASE64: &str = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAAA";
+            const VALID_WAV_BASE64: &str =
+                "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAAA";
             audio("audio/wav", VALID_WAV_BASE64)
         }
-        
 
         pub fn resource_link_full(
             uri: &str,
@@ -298,11 +300,7 @@ mod tests {
                 meta: None,
             })
         }
-        
-
     }
-
-
 
     #[test]
     fn test_text_content_always_allowed() {
@@ -471,9 +469,9 @@ mod tests {
         let validator = ContentCapabilityValidator::new(capabilities);
 
         let content_blocks = vec![
-            content_blocks::text("Test text content"),  // Should pass
-            content_blocks::image_png(), // Should fail
-            content_blocks::audio_wav(), // Should fail
+            content_blocks::text("Test text content"), // Should pass
+            content_blocks::image_png(),               // Should fail
+            content_blocks::audio_wav(),               // Should fail
         ];
 
         let result = validator.validate_content_blocks(&content_blocks);

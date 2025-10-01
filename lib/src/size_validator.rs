@@ -273,9 +273,7 @@ mod tests {
 
         // Valid content size
         assert!(validator.validate_content_size(1024).is_ok());
-        assert!(validator
-            .validate_content_size(50 * 1024 * 1024)
-            .is_ok());
+        assert!(validator.validate_content_size(50 * 1024 * 1024).is_ok());
 
         // Content exceeding limit
         let result = validator.validate_content_size(50 * 1024 * 1024 + 1);
