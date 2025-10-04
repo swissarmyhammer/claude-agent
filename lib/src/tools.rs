@@ -228,6 +228,8 @@ pub struct PermissionRequest {
     pub description: String,
     /// Original arguments for the tool request
     pub arguments: Value,
+    /// Available permission options for the user
+    pub options: Vec<PermissionOption>,
 }
 
 impl ToolCallHandler {
@@ -854,12 +856,12 @@ impl ToolCallHandler {
                     options,
                 };
 
-                // Convert to simple PermissionRequest for now (will be enhanced later)
                 let simple_request = PermissionRequest {
                     tool_request_id: permission_request.tool_request_id,
                     tool_name: permission_request.tool_name,
                     description: permission_request.description,
                     arguments: permission_request.arguments,
+                    options: permission_request.options,
                 };
 
                 return Ok(ToolCallResult::PermissionRequired(simple_request));
@@ -1663,11 +1665,14 @@ impl ToolCallHandler {
             _ => format!("Execute tool: {}", request.name),
         };
 
+        let options = self.generate_permission_options(request);
+
         Ok(PermissionRequest {
             tool_request_id: request.id.clone(),
             tool_name: request.name.clone(),
             description,
             arguments: request.arguments.clone(),
+            options,
         })
     }
 
@@ -2183,6 +2188,24 @@ mod tests {
             .description
             .contains("Write to file: /test/file.txt"));
         assert_eq!(perm_req.arguments, request.arguments);
+
+        // Validate options are populated
+        assert!(!perm_req.options.is_empty(), "Options should not be empty");
+        assert_eq!(perm_req.options.len(), 4, "Should have 4 permission options");
+
+        // Validate all option kinds are present
+        let option_kinds: Vec<_> = perm_req.options.iter().map(|o| &o.kind).collect();
+        assert!(option_kinds.contains(&&PermissionOptionKind::AllowOnce));
+        assert!(option_kinds.contains(&&PermissionOptionKind::AllowAlways));
+        assert!(option_kinds.contains(&&PermissionOptionKind::RejectOnce));
+        assert!(option_kinds.contains(&&PermissionOptionKind::RejectAlways));
+
+        // Validate moderate risk warning in text
+        let allow_always = perm_req.options.iter()
+            .find(|o| o.kind == PermissionOptionKind::AllowAlways)
+            .expect("Should have AllowAlways option");
+        assert!(allow_always.name.contains("use with caution"), 
+            "Moderate risk tools should warn about AllowAlways");
     }
 
     #[tokio::test]
