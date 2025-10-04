@@ -114,6 +114,24 @@ impl ClaudeAgentServer {
     }
 
     /// Start the server with custom streams for testing
+    ///
+    /// # Concurrency Model
+    /// This method handles requests and notifications concurrently using `tokio::join!`.
+    /// A broadcast channel coordinates shutdown: when the request handler completes
+    /// (connection closed), it signals the notification handler to stop gracefully.
+    ///
+    /// # Shutdown Flow
+    /// 1. Request handler processes incoming requests until reader closes
+    /// 2. Upon completion, request handler sends shutdown signal via broadcast channel
+    /// 3. Notification handler receives shutdown signal and stops gracefully
+    /// 4. Both handlers complete, and the method returns
+    ///
+    /// The broadcast channel is used (vs. oneshot) because it allows the notification
+    /// handler to continue processing notifications while monitoring for shutdown.
+    ///
+    /// # Arguments
+    /// * `reader` - Async reader for incoming JSON-RPC requests
+    /// * `writer` - Async writer for responses and notifications
     pub async fn start_with_streams<R, W>(&self, reader: R, writer: W) -> crate::Result<()>
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -125,28 +143,55 @@ impl ClaudeAgentServer {
         let writer = Arc::new(tokio::sync::Mutex::new(writer));
         let agent = Arc::clone(&self.agent);
 
+        // Create a shutdown channel to coordinate between handlers
+        // Capacity of 1 is sufficient since we only send a single shutdown signal
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
         // Handle requests directly without spawning (avoids Send issues)
         let mut notification_receiver = self.notification_receiver.resubscribe();
 
-        // For now, just handle requests sequentially
-        // In a production system, we'd need a more sophisticated approach
-        // to handle notifications and requests concurrently
-        tokio::select! {
-            result = Self::handle_requests(reader, Arc::clone(&writer), Arc::clone(&agent)) => {
-                if let Err(e) = result {
-                    error!("Request handler failed: {}", e);
-                }
-            }
-            _ = async {
-                while let Ok(notification) = notification_receiver.recv().await {
-                    if let Err(e) = Self::send_notification(Arc::clone(&writer), notification).await {
-                        error!("Failed to send notification: {}", e);
+        // Handle requests and signal shutdown when done
+        let request_handler = async {
+            let result =
+                Self::handle_requests(reader, Arc::clone(&writer), Arc::clone(&agent)).await;
+            info!("Request handler completed, signaling shutdown");
+            let _ = shutdown_tx.send(());
+            result
+        };
+
+        // Handle notifications until shutdown signal
+        let notification_handler = async {
+            loop {
+                tokio::select! {
+                    notification_result = notification_receiver.recv() => {
+                        match notification_result {
+                            Ok(notification) => {
+                                if let Err(e) = Self::send_notification(Arc::clone(&writer), notification).await {
+                                    error!("Failed to send notification: {} - shutting down notification handler", e);
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                warn!("Notification channel closed");
+                                break;
+                            }
+                        }
+                    }
+                    _ = shutdown_rx.recv() => {
+                        info!("Notification handler received shutdown signal");
                         break;
                     }
                 }
-            } => {
-                warn!("Notification handler completed");
             }
+        };
+
+        // Run both handlers concurrently
+        // Both will continue until request handler completes, then notification handler stops
+        let (request_result, _) = tokio::join!(request_handler, notification_handler);
+
+        if let Err(e) = request_result {
+            error!("Request handler failed: {}", e);
+            return Err(e);
         }
 
         Ok(())
@@ -162,9 +207,11 @@ impl ClaudeAgentServer {
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin + Send + 'static,
     {
+        info!("Request handler started, waiting for requests");
         let mut lines = BufReader::new(reader).lines();
 
         while let Some(line) = lines.next_line().await? {
+            info!("Received line: {}", line);
             if line.trim().is_empty() {
                 continue;
             }
@@ -177,6 +224,7 @@ impl ClaudeAgentServer {
             }
         }
 
+        info!("Request handler completed (connection closed)");
         Ok(())
     }
 
@@ -503,5 +551,91 @@ mod tests {
             "initialize"
         );
         assert_eq!(parsed.get("id").unwrap().as_i64().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_request_and_notification_handling() {
+        let server = create_test_server().await;
+
+        // Create two duplex channels - one for each direction
+        // This matches how the original test was structured but with correct pairing
+        let (mut client_writer, server_reader) = duplex(sizes::buffers::DUPLEX_STREAM_BUFFER);
+        let (server_writer, mut client_reader) = duplex(sizes::buffers::DUPLEX_STREAM_BUFFER);
+
+        // Run server and client concurrently
+        let server_task = async {
+            server
+                .start_with_streams(server_reader, server_writer)
+                .await
+        };
+
+        let client_task = async move {
+            // Give server time to start listening
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+            // Send an initialize request
+            let init_request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "client_capabilities": {
+                        "fs": {
+                            "read_text_file": true,
+                            "write_text_file": true
+                        },
+                        "terminal": true
+                    },
+                    "protocolVersion": "1.0.0"
+                }
+            });
+
+            let request_line = format!("{}\n", serde_json::to_string(&init_request).unwrap());
+            client_writer
+                .write_all(request_line.as_bytes())
+                .await
+                .unwrap();
+            client_writer.flush().await.unwrap();
+
+            // Read response - this should complete even if notifications are being sent
+            let mut reader = BufReader::new(&mut client_reader);
+            let mut response_line = String::new();
+
+            // Use a timeout to ensure we don't hang forever
+            let read_result = tokio::time::timeout(
+                tokio::time::Duration::from_secs(5),
+                reader.read_line(&mut response_line),
+            )
+            .await;
+
+            assert!(
+                read_result.is_ok(),
+                "Request handling should complete even with notification handler running"
+            );
+            assert!(!response_line.is_empty(), "Should receive a response");
+
+            let response: serde_json::Value = serde_json::from_str(&response_line).unwrap();
+            assert_eq!(response.get("id").unwrap().as_i64().unwrap(), 1);
+            assert!(
+                response.get("result").is_some(),
+                "Should have a result field"
+            );
+
+            // Close the streams to signal server to stop
+            drop(client_writer);
+            drop(reader);
+        };
+
+        // Spawn client task so it runs independently
+        let client_handle = tokio::spawn(client_task);
+
+        // Run server task
+        let server_result = server_task.await;
+
+        // Wait for client to complete
+        client_handle.await.unwrap();
+
+        // Server should complete successfully when streams close
+        server_result.expect("Server should complete successfully");
     }
 }
