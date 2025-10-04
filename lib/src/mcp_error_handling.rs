@@ -957,20 +957,24 @@ impl EnhancedMcpServerManager {
         if !response.status().is_success() {
             return Err(SessionSetupError::McpServerConnectionFailed {
                 server_name: sse_config.name.clone(),
-                error: format!("Initialize request failed with status: {}", response.status()),
+                error: format!(
+                    "Initialize request failed with status: {}",
+                    response.status()
+                ),
                 transport_type: "sse".to_string(),
             });
         }
 
         // Parse SSE response for initialize
-        let body = response
-            .text()
-            .await
-            .map_err(|e| SessionSetupError::McpServerConnectionFailed {
-                server_name: sse_config.name.clone(),
-                error: format!("Failed to read SSE response: {}", e),
-                transport_type: "sse".to_string(),
-            })?;
+        let body =
+            response
+                .text()
+                .await
+                .map_err(|e| SessionSetupError::McpServerConnectionFailed {
+                    server_name: sse_config.name.clone(),
+                    error: format!("Failed to read SSE response: {}", e),
+                    transport_type: "sse".to_string(),
+                })?;
 
         let initialize_response = Self::parse_sse_response_enhanced(&sse_config.name, &body)?;
 
@@ -1062,21 +1066,17 @@ impl EnhancedMcpServerManager {
             });
         }
 
-        let tools_body = tools_response
-            .text()
-            .await
-            .map_err(|e| SessionSetupError::McpServerConnectionFailed {
+        let tools_body = tools_response.text().await.map_err(|e| {
+            SessionSetupError::McpServerConnectionFailed {
                 server_name: sse_config.name.clone(),
                 error: format!("Failed to read tools SSE response: {}", e),
                 transport_type: "sse".to_string(),
-            })?;
+            }
+        })?;
 
-        let tools_response_json =
-            Self::parse_sse_response_enhanced(&sse_config.name, &tools_body)?;
-        let final_tools = self.extract_tools_from_list_response_enhanced(
-            &sse_config.name,
-            &tools_response_json,
-        )?;
+        let tools_response_json = Self::parse_sse_response_enhanced(&sse_config.name, &tools_body)?;
+        let final_tools =
+            self.extract_tools_from_list_response_enhanced(&sse_config.name, &tools_response_json)?;
 
         tracing::info!(
             "SSE MCP server {} provides {} tools: {:?}",
@@ -1090,9 +1090,13 @@ impl EnhancedMcpServerManager {
         let event_client = client.clone();
         let server_name = sse_config.name.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                Self::handle_sse_event_stream_enhanced(&server_name, event_client, &event_url, response_tx)
-                    .await
+            if let Err(e) = Self::handle_sse_event_stream_enhanced(
+                &server_name,
+                event_client,
+                &event_url,
+                response_tx,
+            )
+            .await
             {
                 tracing::error!("SSE event stream error for {}: {}", server_name, e);
             }
@@ -1158,7 +1162,10 @@ impl EnhancedMcpServerManager {
         const MAX_BUFFER_SIZE: usize = 1024 * 1024; // 1MB limit
 
         loop {
-            tracing::debug!("Establishing SSE event stream connection for {}", server_name);
+            tracing::debug!(
+                "Establishing SSE event stream connection for {}",
+                server_name
+            );
 
             let response = client
                 .get(url)
@@ -1186,7 +1193,7 @@ impl EnhancedMcpServerManager {
                 match chunk_result {
                     Ok(chunk) => {
                         let text = String::from_utf8_lossy(&chunk);
-                        
+
                         // Prevent unbounded buffer growth
                         if buffer.len() + text.len() > MAX_BUFFER_SIZE {
                             tracing::error!(
@@ -1196,7 +1203,7 @@ impl EnhancedMcpServerManager {
                             buffer.clear();
                             continue;
                         }
-                        
+
                         buffer.push_str(&text);
 
                         // Process complete lines from buffer
@@ -1206,7 +1213,10 @@ impl EnhancedMcpServerManager {
 
                             if let Some(data) = line.strip_prefix("data: ") {
                                 if response_tx.send(data.to_string()).is_err() {
-                                    tracing::warn!("SSE response channel closed for {}", server_name);
+                                    tracing::warn!(
+                                        "SSE response channel closed for {}",
+                                        server_name
+                                    );
                                     return Ok(());
                                 }
                             }
@@ -1220,7 +1230,10 @@ impl EnhancedMcpServerManager {
             }
 
             // Connection closed, wait before reconnecting
-            tracing::info!("SSE connection closed for {}, reconnecting in 5 seconds", server_name);
+            tracing::info!(
+                "SSE connection closed for {}, reconnecting in 5 seconds",
+                server_name
+            );
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         }
     }
@@ -1247,7 +1260,10 @@ impl EnhancedMcpServerManager {
 
         // If no tools found, log warning but don't fail
         if tools.is_empty() {
-            tracing::warn!("No tools found in MCP tools/list response for {}", server_name);
+            tracing::warn!(
+                "No tools found in MCP tools/list response for {}",
+                server_name
+            );
         }
 
         Ok(tools)
@@ -1332,8 +1348,7 @@ mod tests {
     #[test]
     fn test_parse_sse_response_valid() {
         let sse_body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n";
-        let result =
-            EnhancedMcpServerManager::parse_sse_response_enhanced("test_server", sse_body);
+        let result = EnhancedMcpServerManager::parse_sse_response_enhanced("test_server", sse_body);
         assert!(result.is_ok());
         let json = result.unwrap();
         assert_eq!(json.get("jsonrpc").and_then(|v| v.as_str()), Some("2.0"));
@@ -1343,8 +1358,7 @@ mod tests {
     #[test]
     fn test_parse_sse_response_multiple_data_lines() {
         let sse_body = "data: {\"jsonrpc\":\"2.0\",\"id\":1}\ndata: {\"other\":\"data\"}\n\n";
-        let result =
-            EnhancedMcpServerManager::parse_sse_response_enhanced("test_server", sse_body);
+        let result = EnhancedMcpServerManager::parse_sse_response_enhanced("test_server", sse_body);
         assert!(result.is_ok());
         let json = result.unwrap();
         // Should parse only the first data line
@@ -1355,8 +1369,7 @@ mod tests {
     #[test]
     fn test_parse_sse_response_no_data() {
         let sse_body = "event: message\n\n";
-        let result =
-            EnhancedMcpServerManager::parse_sse_response_enhanced("test_server", sse_body);
+        let result = EnhancedMcpServerManager::parse_sse_response_enhanced("test_server", sse_body);
         assert!(result.is_err());
         if let Err(SessionSetupError::McpServerConnectionFailed { error, .. }) = result {
             assert!(error.contains("No data in SSE response"));
@@ -1368,8 +1381,7 @@ mod tests {
     #[test]
     fn test_parse_sse_response_invalid_json() {
         let sse_body = "data: not valid json\n\n";
-        let result =
-            EnhancedMcpServerManager::parse_sse_response_enhanced("test_server", sse_body);
+        let result = EnhancedMcpServerManager::parse_sse_response_enhanced("test_server", sse_body);
         assert!(result.is_err());
         if let Err(SessionSetupError::McpServerConnectionFailed { error, .. }) = result {
             assert!(error.contains("Invalid JSON in SSE response"));

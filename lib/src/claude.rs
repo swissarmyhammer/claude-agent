@@ -542,14 +542,12 @@ mod tests {
             .query_with_context("New prompt", &context)
             .await
             .unwrap();
-        // For now this is a placeholder implementation, so just verify we get a response
+        // Verify we get a non-empty response from Claude SDK
         assert!(
             !response.is_empty(),
             "Expected non-empty response from query_with_context"
         );
-        // Since this is a placeholder implementation that sends to Claude SDK,
-        // it may not contain the session ID in the response content
-        // Just verify we get a meaningful response
+        // Verify we get a meaningful response
         assert!(response.len() > 10, "Response should be substantial");
     }
 

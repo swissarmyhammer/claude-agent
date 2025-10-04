@@ -3494,10 +3494,7 @@ impl ClaudeAgent {
                         crate::tools::PermissionOptionKind::AllowAlways => "allow-always",
                         crate::tools::PermissionOptionKind::RejectAlways => "reject-always",
                         _ => {
-                            tracing::warn!(
-                                "Unexpected stored permission kind: {:?}",
-                                stored_kind
-                            );
+                            tracing::warn!("Unexpected stored permission kind: {:?}", stored_kind);
                             "allow-once"
                         }
                     };

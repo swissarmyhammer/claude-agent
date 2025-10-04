@@ -920,14 +920,14 @@ impl McpServerManager {
                 match chunk_result {
                     Ok(chunk) => {
                         let text = String::from_utf8_lossy(&chunk);
-                        
+
                         // Prevent unbounded buffer growth
                         if buffer.len() + text.len() > MAX_BUFFER_SIZE {
                             tracing::error!("SSE buffer exceeded maximum size, resetting");
                             buffer.clear();
                             continue;
                         }
-                        
+
                         buffer.push_str(&text);
 
                         // Process complete lines from buffer

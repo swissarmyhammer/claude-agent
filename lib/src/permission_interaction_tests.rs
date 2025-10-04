@@ -79,7 +79,10 @@ mod tests {
             .await;
 
         let preference = storage.get_preference("my_tool").await;
-        assert!(matches!(preference, Some(PermissionOptionKind::AllowAlways)));
+        assert!(matches!(
+            preference,
+            Some(PermissionOptionKind::AllowAlways)
+        ));
     }
 
     #[tokio::test]
