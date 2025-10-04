@@ -957,11 +957,32 @@ impl McpServerManager {
     }
 
     /// Extract tools from initialize response
+    ///
+    /// The MCP initialize response may include server capabilities, but does not
+    /// directly list available tools. Tools are obtained via the separate tools/list
+    /// request. This function validates the response structure and extracts any
+    /// capability information for future use.
+    ///
+    /// According to the MCP specification, capabilities.tools is metadata about
+    /// tool support (like listChanged notification support), not the actual tool list.
     fn extract_tools_from_initialize_response(
         &self,
-        _response: &Value,
+        response: &Value,
     ) -> crate::Result<Vec<String>> {
-        // For now, return empty list as we'll get tools from tools/list call
+        // Validate response structure
+        if let Some(result) = response.get("result") {
+            if let Some(capabilities) = result.get("capabilities") {
+                if let Some(tools_capability) = capabilities.get("tools") {
+                    tracing::debug!(
+                        "Server supports tools capability: {}",
+                        serde_json::to_string(tools_capability).unwrap_or_default()
+                    );
+                }
+            }
+        }
+
+        // According to MCP specification, tools are obtained from tools/list request,
+        // not from the initialize response. Return empty list here.
         Ok(Vec::new())
     }
 
@@ -1161,6 +1182,7 @@ impl McpServerManager {
     /// Process MCP tool call response into string result
     fn process_tool_call_response(&self, response: &Value) -> crate::Result<String> {
         if let Some(result) = response.get("result") {
+            // Try to extract content array first (standard MCP format)
             if let Some(content) = result.get("content") {
                 if let Some(content_array) = content.as_array() {
                     let mut result_text = String::new();
@@ -1173,15 +1195,40 @@ impl McpServerManager {
                     return Ok(result_text.trim().to_string());
                 }
             }
-            // Fallback to string representation of result
-            return Ok(result.to_string());
-        }
 
-        if let Some(error) = response.get("error") {
-            return Err(McpError::ServerError(error.clone()).into());
+            // Fallback: handle different result types intelligently
+            match result {
+                Value::String(s) => {
+                    tracing::debug!("MCP response result is a simple string");
+                    Ok(s.clone())
+                }
+                Value::Number(n) => {
+                    tracing::debug!("MCP response result is a number");
+                    Ok(n.to_string())
+                }
+                Value::Bool(b) => {
+                    tracing::debug!("MCP response result is a boolean");
+                    Ok(b.to_string())
+                }
+                Value::Null => {
+                    tracing::debug!("MCP response result is null");
+                    Ok(String::new())
+                }
+                Value::Object(_) | Value::Array(_) => {
+                    tracing::debug!("MCP response result is a complex type, formatting as JSON");
+                    serde_json::to_string_pretty(result).map_err(|e| {
+                        crate::AgentError::ToolExecution(format!(
+                            "Failed to serialize MCP result to JSON: {}",
+                            e
+                        ))
+                    })
+                }
+            }
+        } else if let Some(error) = response.get("error") {
+            Err(McpError::ServerError(error.clone()).into())
+        } else {
+            Err(McpError::MissingResult.into())
         }
-
-        Err(McpError::MissingResult.into())
     }
 
     /// List all available tools from all connected MCP servers
@@ -1372,6 +1419,57 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_tools_from_initialize_response_with_tools() {
+        let manager = McpServerManager::new();
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {
+                        "listChanged": true
+                    }
+                },
+                "serverInfo": {
+                    "name": "test-server",
+                    "version": "1.0.0"
+                }
+            }
+        });
+
+        let tools = manager
+            .extract_tools_from_initialize_response(&response)
+            .unwrap();
+        // For now this should return empty as capabilities.tools is just metadata
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn test_extract_tools_from_initialize_response_empty() {
+        let manager = McpServerManager::new();
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "serverInfo": {
+                    "name": "test-server",
+                    "version": "1.0.0"
+                }
+            }
+        });
+
+        let tools = manager
+            .extract_tools_from_initialize_response(&response)
+            .unwrap();
+        assert!(tools.is_empty());
+    }
+
+    #[test]
     fn test_process_tool_call_response_success() {
         let manager = McpServerManager::new();
 
@@ -1435,6 +1533,70 @@ mod tests {
 
         let result = manager.process_tool_call_response(&response).unwrap();
         assert_eq!(result, "Line 1\nLine 2");
+    }
+
+    #[test]
+    fn test_process_tool_call_response_fallback_string() {
+        let manager = McpServerManager::new();
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": "test-123",
+            "result": "Simple string result"
+        });
+
+        let result = manager.process_tool_call_response(&response).unwrap();
+        assert_eq!(result, "Simple string result");
+    }
+
+    #[test]
+    fn test_process_tool_call_response_fallback_number() {
+        let manager = McpServerManager::new();
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": "test-123",
+            "result": 42
+        });
+
+        let result = manager.process_tool_call_response(&response).unwrap();
+        assert_eq!(result, "42");
+    }
+
+    #[test]
+    fn test_process_tool_call_response_fallback_bool() {
+        let manager = McpServerManager::new();
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": "test-123",
+            "result": true
+        });
+
+        let result = manager.process_tool_call_response(&response).unwrap();
+        assert_eq!(result, "true");
+    }
+
+    #[test]
+    fn test_process_tool_call_response_fallback_object() {
+        let manager = McpServerManager::new();
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": "test-123",
+            "result": {
+                "status": "success",
+                "data": {
+                    "value": 123
+                }
+            }
+        });
+
+        let result = manager.process_tool_call_response(&response).unwrap();
+        // Should return formatted JSON
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["status"], "success");
+        assert_eq!(parsed["data"]["value"], 123);
     }
 
     #[tokio::test]
