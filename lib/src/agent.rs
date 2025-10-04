@@ -2453,21 +2453,6 @@ impl Agent for ClaudeAgent {
             return Err(self.convert_session_setup_error_to_acp_error(validation_error));
         }
 
-        // Step 1: Validate loadSession capability before allowing session/load
-        if !self.capabilities.load_session {
-            tracing::warn!("Session load requested but loadSession capability not supported");
-            return Err(agent_client_protocol::Error {
-                code: -32601,
-                message: "Method not supported: agent does not support loadSession capability"
-                    .to_string(),
-                data: Some(serde_json::json!({
-                    "method": "session/load",
-                    "requiredCapability": "loadSession",
-                    "declared": false
-                })),
-            });
-        }
-
         let session_id = self.parse_session_id(&request.session_id)?;
 
         let session = self
