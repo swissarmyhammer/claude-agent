@@ -1402,8 +1402,9 @@ impl ClaudeAgent {
         // Check for refusal patterns in the complete streaming response
         if self.is_response_refusal(&full_response) {
             tracing::info!(
-                "Claude refused to respond in streaming for session: {}",
-                session_id
+                "Claude refused to respond in streaming for session: {}. Response: {}",
+                session_id,
+                full_response
             );
             return Ok(self.create_refusal_response(
                 &session_id.to_string(),
@@ -1589,7 +1590,7 @@ impl ClaudeAgent {
         // ACP requires specific stop reasons for all prompt turn completions:
         // Check for refusal patterns in Claude's response content
         if self.is_response_refusal(&response_content) {
-            tracing::info!("Claude refused to respond for session: {}", session_id);
+            tracing::info!("Claude refused to respond for session: {}. Response: {}", session_id, response_content);
             return Ok(self.create_refusal_response(&session_id.to_string(), false, None));
         }
 

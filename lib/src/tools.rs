@@ -2191,7 +2191,11 @@ mod tests {
 
         // Validate options are populated
         assert!(!perm_req.options.is_empty(), "Options should not be empty");
-        assert_eq!(perm_req.options.len(), 4, "Should have 4 permission options");
+        assert_eq!(
+            perm_req.options.len(),
+            4,
+            "Should have 4 permission options"
+        );
 
         // Validate all option kinds are present
         let option_kinds: Vec<_> = perm_req.options.iter().map(|o| &o.kind).collect();
@@ -2201,11 +2205,15 @@ mod tests {
         assert!(option_kinds.contains(&&PermissionOptionKind::RejectAlways));
 
         // Validate moderate risk warning in text
-        let allow_always = perm_req.options.iter()
+        let allow_always = perm_req
+            .options
+            .iter()
             .find(|o| o.kind == PermissionOptionKind::AllowAlways)
             .expect("Should have AllowAlways option");
-        assert!(allow_always.name.contains("use with caution"), 
-            "Moderate risk tools should warn about AllowAlways");
+        assert!(
+            allow_always.name.contains("use with caution"),
+            "Moderate risk tools should warn about AllowAlways"
+        );
     }
 
     #[tokio::test]

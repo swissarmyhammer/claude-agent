@@ -532,24 +532,128 @@ impl ContentBlockProcessor {
                     size_bytes: audio_content.data.len(),
                 })
             }
-            ContentBlock::Resource(_resource_content) => {
-                // Enhanced processing placeholder for embedded resources
+            ContentBlock::Resource(resource_content) => {
+                use agent_client_protocol::EmbeddedResourceResource;
+
                 let mut metadata = HashMap::new();
-                metadata.insert("content_type".to_string(), "embedded_resource".to_string());
 
-                let text_representation =
-                    "[Embedded Resource - enhanced processing available]".to_string();
+                match &resource_content.resource {
+                    EmbeddedResourceResource::TextResourceContents(text_resource) => {
+                        // Validate URI if present and validation is enabled
+                        if self.enable_uri_validation && !text_resource.uri.is_empty() {
+                            self.validate_uri(&text_resource.uri)?;
+                        }
 
-                Ok(ProcessedContent {
-                    content_type: ProcessedContentType::EmbeddedResource {
-                        uri: None,
-                        mime_type: None,
-                    },
-                    text_representation,
-                    binary_data: None,
-                    metadata,
-                    size_bytes: 0,
-                })
+                        // Extract metadata
+                        if !text_resource.uri.is_empty() {
+                            metadata.insert("uri".to_string(), text_resource.uri.clone());
+                        }
+                        if let Some(ref mime_type) = text_resource.mime_type {
+                            metadata.insert("mime_type".to_string(), mime_type.clone());
+                        }
+
+                        let size_bytes = text_resource.text.len();
+                        metadata.insert("resource_type".to_string(), "text".to_string());
+                        metadata.insert("data_size".to_string(), size_bytes.to_string());
+
+                        // Validate size
+                        self.size_validator.validate_content_size(size_bytes)?;
+
+                        // Create text representation
+                        let text_representation = format!(
+                            "[Text Resource{}{}: {} bytes]",
+                            if let Some(ref mime_type) = text_resource.mime_type {
+                                format!(": {}", mime_type)
+                            } else {
+                                String::new()
+                            },
+                            if !text_resource.uri.is_empty() {
+                                format!(" from {}", text_resource.uri)
+                            } else {
+                                " (embedded)".to_string()
+                            },
+                            size_bytes
+                        );
+
+                        Ok(ProcessedContent {
+                            content_type: ProcessedContentType::EmbeddedResource {
+                                uri: if text_resource.uri.is_empty() {
+                                    None
+                                } else {
+                                    Some(text_resource.uri.clone())
+                                },
+                                mime_type: text_resource.mime_type.clone(),
+                            },
+                            text_representation,
+                            binary_data: None,
+                            metadata,
+                            size_bytes,
+                        })
+                    }
+                    EmbeddedResourceResource::BlobResourceContents(blob_resource) => {
+                        // Validate URI if present and validation is enabled
+                        if self.enable_uri_validation && !blob_resource.uri.is_empty() {
+                            self.validate_uri(&blob_resource.uri)?;
+                        }
+
+                        // Decode blob data
+                        let decoded_data = if let Some(ref mime_type) = blob_resource.mime_type {
+                            // Decode with mime type validation
+                            self.base64_processor
+                                .decode_blob_data(&blob_resource.blob, mime_type)?
+                        } else {
+                            // Decode without mime type validation using generic approach
+                            // Use a permissive mime type for resources without explicit type
+                            self.base64_processor
+                                .decode_blob_data(&blob_resource.blob, "text/plain")?
+                        };
+
+                        // Validate size
+                        self.size_validator
+                            .validate_content_size(decoded_data.len())?;
+
+                        // Extract metadata
+                        if !blob_resource.uri.is_empty() {
+                            metadata.insert("uri".to_string(), blob_resource.uri.clone());
+                        }
+                        if let Some(ref mime_type) = blob_resource.mime_type {
+                            metadata.insert("mime_type".to_string(), mime_type.clone());
+                        }
+                        metadata.insert("resource_type".to_string(), "blob".to_string());
+                        metadata.insert("data_size".to_string(), decoded_data.len().to_string());
+
+                        // Create text representation
+                        let text_representation = format!(
+                            "[Blob Resource{}{}: {} bytes]",
+                            if let Some(ref mime_type) = blob_resource.mime_type {
+                                format!(": {}", mime_type)
+                            } else {
+                                String::new()
+                            },
+                            if !blob_resource.uri.is_empty() {
+                                format!(" from {}", blob_resource.uri)
+                            } else {
+                                " (embedded)".to_string()
+                            },
+                            decoded_data.len()
+                        );
+
+                        Ok(ProcessedContent {
+                            content_type: ProcessedContentType::EmbeddedResource {
+                                uri: if blob_resource.uri.is_empty() {
+                                    None
+                                } else {
+                                    Some(blob_resource.uri.clone())
+                                },
+                                mime_type: blob_resource.mime_type.clone(),
+                            },
+                            text_representation,
+                            binary_data: Some(decoded_data),
+                            metadata,
+                            size_bytes: blob_resource.blob.len(),
+                        })
+                    }
+                }
             }
             ContentBlock::ResourceLink(resource_link) => {
                 let mut metadata = HashMap::new();
@@ -1090,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_resource_content_placeholder() {
+    fn test_process_text_resource_with_uri_and_mime() {
         use agent_client_protocol::{EmbeddedResourceResource, TextResourceContents};
 
         let processor = create_test_processor();
@@ -1107,16 +1211,208 @@ mod tests {
             meta: None,
         };
 
-        // For now, we test with the placeholder implementation
         let content_block = ContentBlock::Resource(embedded_resource);
         let result = processor.process_content_block(&content_block);
         assert!(result.is_ok());
 
         let processed = result.unwrap();
-        assert!(processed.text_representation.contains("Embedded Resource"));
+        assert!(processed.text_representation.contains("Text Resource"));
+        assert!(processed.text_representation.contains("text/plain"));
+        assert!(processed.text_representation.contains("file:///test.txt"));
+        assert!(processed.text_representation.contains("12 bytes"));
         assert!(matches!(
             processed.content_type,
             ProcessedContentType::EmbeddedResource { .. }
+        ));
+        assert_eq!(processed.size_bytes, 12); // "Test content" length
+        assert_eq!(
+            processed.metadata.get("uri"),
+            Some(&"file:///test.txt".to_string())
+        );
+        assert_eq!(
+            processed.metadata.get("mime_type"),
+            Some(&"text/plain".to_string())
+        );
+        assert_eq!(
+            processed.metadata.get("resource_type"),
+            Some(&"text".to_string())
+        );
+        assert!(processed.binary_data.is_none()); // Text resources don't have binary data
+    }
+
+    #[test]
+    fn test_process_text_resource_without_uri() {
+        use agent_client_protocol::{EmbeddedResourceResource, TextResourceContents};
+
+        let processor = create_test_processor();
+
+        let text_resource = TextResourceContents {
+            uri: "".to_string(),
+            text: "Embedded text content".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            meta: None,
+        };
+        let embedded_resource = EmbeddedResource {
+            resource: EmbeddedResourceResource::TextResourceContents(text_resource),
+            annotations: None,
+            meta: None,
+        };
+
+        let content_block = ContentBlock::Resource(embedded_resource);
+        let result = processor.process_content_block(&content_block);
+        assert!(result.is_ok());
+
+        let processed = result.unwrap();
+        assert!(processed.text_representation.contains("Text Resource"));
+        assert!(processed.text_representation.contains("(embedded)"));
+        assert!(!processed.text_representation.contains("from"));
+        assert_eq!(processed.size_bytes, 21); // "Embedded text content" length
+        assert!(!processed.metadata.contains_key("uri"));
+        if let ProcessedContentType::EmbeddedResource { uri, .. } = processed.content_type {
+            assert!(uri.is_none());
+        } else {
+            panic!("Expected EmbeddedResource content type");
+        }
+    }
+
+    #[test]
+    fn test_process_text_resource_without_mime() {
+        use agent_client_protocol::{EmbeddedResourceResource, TextResourceContents};
+
+        let processor = create_test_processor();
+
+        let text_resource = TextResourceContents {
+            uri: "file:///test.txt".to_string(),
+            text: "Test".to_string(),
+            mime_type: None,
+            meta: None,
+        };
+        let embedded_resource = EmbeddedResource {
+            resource: EmbeddedResourceResource::TextResourceContents(text_resource),
+            annotations: None,
+            meta: None,
+        };
+
+        let content_block = ContentBlock::Resource(embedded_resource);
+        let result = processor.process_content_block(&content_block);
+        assert!(result.is_ok());
+
+        let processed = result.unwrap();
+        assert!(processed.text_representation.contains("Text Resource"));
+        assert!(!processed.metadata.contains_key("mime_type"));
+        if let ProcessedContentType::EmbeddedResource { mime_type, .. } = processed.content_type {
+            assert!(mime_type.is_none());
+        } else {
+            panic!("Expected EmbeddedResource content type");
+        }
+    }
+
+    #[test]
+    fn test_process_blob_resource_with_mime() {
+        use agent_client_protocol::{BlobResourceContents, EmbeddedResourceResource};
+
+        let processor = create_test_processor();
+
+        // Simple text encoded as base64
+        let blob_data = "SGVsbG8gV29ybGQ="; // "Hello World" in base64
+
+        // Use text/plain which is an allowed blob mime type in Base64Processor
+        let blob_resource = BlobResourceContents {
+            uri: "https://example.com/data.txt".to_string(),
+            blob: blob_data.to_string(),
+            mime_type: Some("text/plain".to_string()),
+            meta: None,
+        };
+        let embedded_resource = EmbeddedResource {
+            resource: EmbeddedResourceResource::BlobResourceContents(blob_resource),
+            annotations: None,
+            meta: None,
+        };
+
+        let content_block = ContentBlock::Resource(embedded_resource);
+        let result = processor.process_content_block(&content_block);
+        if let Err(ref e) = result {
+            eprintln!("Error processing blob resource: {:?}", e);
+        }
+        assert!(result.is_ok());
+
+        let processed = result.unwrap();
+        assert!(processed.text_representation.contains("Blob Resource"));
+        assert!(processed.text_representation.contains("text/plain"));
+        assert!(processed
+            .text_representation
+            .contains("https://example.com/data.txt"));
+        assert!(processed.binary_data.is_some());
+
+        let binary_data = processed.binary_data.unwrap();
+        assert_eq!(binary_data, b"Hello World");
+        assert_eq!(
+            processed.metadata.get("resource_type"),
+            Some(&"blob".to_string())
+        );
+        assert_eq!(
+            processed.metadata.get("uri"),
+            Some(&"https://example.com/data.txt".to_string())
+        );
+    }
+
+    #[test]
+    fn test_process_blob_resource_without_mime() {
+        use agent_client_protocol::{BlobResourceContents, EmbeddedResourceResource};
+
+        let processor = create_test_processor();
+
+        let blob_data = "SGVsbG8gV29ybGQ="; // "Hello World" in base64
+
+        let blob_resource = BlobResourceContents {
+            uri: "".to_string(),
+            blob: blob_data.to_string(),
+            mime_type: None,
+            meta: None,
+        };
+        let embedded_resource = EmbeddedResource {
+            resource: EmbeddedResourceResource::BlobResourceContents(blob_resource),
+            annotations: None,
+            meta: None,
+        };
+
+        let content_block = ContentBlock::Resource(embedded_resource);
+        let result = processor.process_content_block(&content_block);
+        assert!(result.is_ok());
+
+        let processed = result.unwrap();
+        assert!(processed.text_representation.contains("Blob Resource"));
+        assert!(processed.text_representation.contains("(embedded)"));
+        assert!(processed.binary_data.is_some());
+        assert!(!processed.metadata.contains_key("mime_type"));
+    }
+
+    #[test]
+    fn test_process_blob_resource_invalid_base64() {
+        use agent_client_protocol::{BlobResourceContents, EmbeddedResourceResource};
+
+        let processor = create_test_processor();
+
+        let blob_resource = BlobResourceContents {
+            uri: "".to_string(),
+            blob: "invalid-base64!@#$".to_string(),
+            mime_type: None,
+            meta: None,
+        };
+        let embedded_resource = EmbeddedResource {
+            resource: EmbeddedResourceResource::BlobResourceContents(blob_resource),
+            annotations: None,
+            meta: None,
+        };
+
+        let content_block = ContentBlock::Resource(embedded_resource);
+        let result = processor.process_content_block(&content_block);
+        assert!(result.is_err());
+
+        // Should be a base64 processing error
+        assert!(matches!(
+            result.unwrap_err(),
+            ContentBlockProcessorError::Base64Error(_)
         ));
     }
 
