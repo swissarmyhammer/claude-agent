@@ -6,7 +6,7 @@ use crate::url_validation;
 use agent_client_protocol::{ContentBlock, TextContent};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, error, warn};
 use url::Url;
@@ -16,7 +16,6 @@ use url::Url;
 pub struct EnhancedSecurityConfig {
     pub max_resource_size: usize,
     pub enable_uri_validation: bool,
-    pub processing_timeout: Duration,
     pub enable_capability_validation: bool,
     pub supported_capabilities: HashMap<String, bool>,
     pub enable_batch_recovery: bool,
@@ -41,8 +40,6 @@ pub enum ContentBlockProcessorError {
     ContentSizeExceeded { actual: usize, limit: usize },
     #[error("Invalid annotation: {0}")]
     InvalidAnnotation(String),
-    #[error("Processing timeout: operation exceeded {timeout}ms")]
-    ProcessingTimeout { timeout: u64 },
     #[error("Capability not supported: {capability}")]
     CapabilityNotSupported { capability: String },
     #[error("Content validation failed: {details}")]
@@ -76,8 +73,7 @@ impl ToJsonRpcError for ContentBlockProcessorError {
             | Self::ContentValidationFailed { .. }
             | Self::InvalidContentStructure { .. }
             | Self::ContentArrayValidationFailed { .. } => -32602, // Invalid params
-            Self::ProcessingTimeout { .. }
-            | Self::MemoryAllocationFailed
+            Self::MemoryAllocationFailed
             | Self::PartialBatchFailure { .. }
             | Self::ResourceLinkFetchFailed { .. }
             | Self::ContentSecurityValidationFailed(_) => -32603, // Internal error
@@ -123,11 +119,6 @@ impl ToJsonRpcError for ContentBlockProcessorError {
                 "error": "invalid_annotation",
                 "details": details,
                 "suggestion": "Check annotation format and structure"
-            }),
-            Self::ProcessingTimeout { timeout } => json!({
-                "error": "processing_timeout",
-                "timeoutMs": timeout,
-                "suggestion": "Reduce content size or complexity"
             }),
             Self::CapabilityNotSupported { capability } => json!({
                 "error": "capability_not_supported",
@@ -209,10 +200,14 @@ pub enum ProcessedContentType {
     },
 }
 
+// IMPORTANT: Do not add timeouts to content processing operations.
+// Content processing should be allowed to complete regardless of size or complexity.
+// Timeouts create artificial limitations and poor user experience by interrupting
+// legitimate processing of large or complex content. Users cannot predict when
+// operations will be artificially terminated, leading to frustration and unreliable behavior.
 pub struct ContentBlockProcessor {
     base64_processor: Base64Processor,
     enable_uri_validation: bool,
-    processing_timeout: Duration,
     enable_capability_validation: bool,
     supported_capabilities: HashMap<String, bool>,
     enable_batch_recovery: bool,
@@ -234,7 +229,6 @@ impl Default for ContentBlockProcessor {
         Self {
             base64_processor: Base64Processor::default(),
             enable_uri_validation: true,
-            processing_timeout: Duration::from_secs(30),
             enable_capability_validation: true,
             supported_capabilities,
             enable_batch_recovery: true,
@@ -267,7 +261,6 @@ impl ContentBlockProcessor {
         base64_processor: Base64Processor,
         max_resource_size: usize,
         enable_uri_validation: bool,
-        processing_timeout: Duration,
         enable_capability_validation: bool,
         supported_capabilities: HashMap<String, bool>,
         enable_batch_recovery: bool,
@@ -280,7 +273,6 @@ impl ContentBlockProcessor {
         Self {
             base64_processor,
             enable_uri_validation,
-            processing_timeout,
             enable_capability_validation,
             supported_capabilities,
             enable_batch_recovery,
@@ -321,7 +313,6 @@ impl ContentBlockProcessor {
         Self {
             base64_processor,
             enable_uri_validation: config.enable_uri_validation,
-            processing_timeout: config.processing_timeout,
             enable_capability_validation: config.enable_capability_validation,
             supported_capabilities: config.supported_capabilities,
             enable_batch_recovery: config.enable_batch_recovery,
@@ -345,24 +336,6 @@ impl ContentBlockProcessor {
                 capability: capability.to_string(),
             }),
         }
-    }
-
-    /// Perform processing with timeout
-    fn with_timeout<F, R>(&self, operation: F) -> Result<R, ContentBlockProcessorError>
-    where
-        F: FnOnce() -> R,
-    {
-        let start = Instant::now();
-        let result = operation();
-        let elapsed = start.elapsed();
-
-        if elapsed > self.processing_timeout {
-            return Err(ContentBlockProcessorError::ProcessingTimeout {
-                timeout: elapsed.as_millis() as u64,
-            });
-        }
-
-        Ok(result)
     }
 
     /// Validate content block structure
@@ -446,8 +419,8 @@ impl ContentBlockProcessor {
         // Validate content block structure
         self.validate_content_block_structure(content_block)?;
 
-        // Process with timeout
-        self.with_timeout(|| self.process_content_block_internal(content_block))?
+        // Process content block
+        self.process_content_block_internal(content_block)
     }
 
     fn process_content_block_internal(
@@ -1038,7 +1011,6 @@ mod tests {
             Base64Processor::default(),
             sizes::content::MAX_RESOURCE_MODERATE,
             true,
-            Duration::from_secs(30),
             true,
             supported_capabilities,
             true,

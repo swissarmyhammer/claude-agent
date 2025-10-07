@@ -7,7 +7,6 @@ use crate::size_validator::{SizeValidationError, SizeValidator};
 use base64::{engine::general_purpose, Engine as _};
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
 use thiserror::Error;
 
 #[derive(Debug, Error, Clone)]
@@ -24,8 +23,6 @@ pub enum Base64ProcessorError {
     FormatMismatch { expected: String, actual: String },
     #[error("MIME type not allowed: {0}")]
     MimeTypeNotAllowed(String),
-    #[error("Processing timeout: operation exceeded {timeout}ms")]
-    ProcessingTimeout { timeout: u64 },
     #[error("Memory allocation failed: insufficient memory for processing")]
     MemoryAllocationFailed,
     #[error("Capability not supported: {capability}")]
@@ -52,8 +49,7 @@ impl ToJsonRpcError for Base64ProcessorError {
             | Self::CapabilityNotSupported { .. }
             | Self::SecurityValidationFailed
             | Self::ContentValidationFailed { .. } => -32602, // Invalid params
-            Self::ProcessingTimeout { .. }
-            | Self::MemoryAllocationFailed
+            Self::MemoryAllocationFailed
             | Self::EnhancedSecurityValidationFailed(_)
             | Self::MimeTypeValidationFailed(_) => -32603, // Internal error
         }
@@ -95,11 +91,6 @@ impl ToJsonRpcError for Base64ProcessorError {
                 "mimeType": mime_type,
                 "suggestion": "Use an allowed MIME type"
             }),
-            Self::ProcessingTimeout { timeout } => json!({
-                "error": "processing_timeout",
-                "timeoutMs": timeout,
-                "suggestion": "Reduce content size or complexity"
-            }),
             Self::MemoryAllocationFailed => json!({
                 "error": "memory_allocation_failed",
                 "suggestion": "Reduce content size or retry later"
@@ -139,10 +130,14 @@ impl From<SizeValidationError> for Base64ProcessorError {
     }
 }
 
+// IMPORTANT: Do not add timeouts to content processing operations.
+// Content processing should be allowed to complete regardless of size or complexity.
+// Timeouts create artificial limitations and poor user experience by interrupting
+// legitimate processing of large or complex content. Users cannot predict when
+// operations will be artificially terminated, leading to frustration and unreliable behavior.
 #[derive(Clone)]
 pub struct Base64Processor {
     allowed_blob_mime_types: HashSet<String>,
-    processing_timeout: Duration,
     max_memory_usage: usize,
     enable_capability_validation: bool,
     enable_security_validation: bool,
@@ -179,7 +174,6 @@ impl Default for Base64Processor {
 
         Self {
             allowed_blob_mime_types,
-            processing_timeout: Duration::from_secs(30),
             max_memory_usage: sizes::memory::MAX_BASE64_MEMORY,
             enable_capability_validation: true,
             enable_security_validation: true,
@@ -206,7 +200,6 @@ impl Base64Processor {
 
     pub fn new_with_config(
         max_size: usize,
-        processing_timeout: Duration,
         max_memory_usage: usize,
         enable_capability_validation: bool,
         enable_security_validation: bool,
@@ -218,7 +211,6 @@ impl Base64Processor {
         });
 
         Self {
-            processing_timeout,
             max_memory_usage,
             enable_capability_validation,
             enable_security_validation,
@@ -249,7 +241,6 @@ impl Base64Processor {
 
     pub fn with_enhanced_security_config(
         max_size: usize,
-        processing_timeout: Duration,
         max_memory_usage: usize,
         enable_capability_validation: bool,
         enable_security_validation: bool,
@@ -262,7 +253,6 @@ impl Base64Processor {
         });
 
         Self {
-            processing_timeout,
             max_memory_usage,
             enable_capability_validation,
             enable_security_validation,
@@ -337,24 +327,6 @@ impl Base64Processor {
         false
     }
 
-    /// Perform processing with timeout
-    fn with_timeout<F, R>(&self, operation: F) -> Result<R, Base64ProcessorError>
-    where
-        F: FnOnce() -> R,
-    {
-        let start = Instant::now();
-        let result = operation();
-        let elapsed = start.elapsed();
-
-        if elapsed > self.processing_timeout {
-            return Err(Base64ProcessorError::ProcessingTimeout {
-                timeout: elapsed.as_millis() as u64,
-            });
-        }
-
-        Ok(result)
-    }
-
     pub fn decode_image_data(
         &self,
         data: &str,
@@ -374,12 +346,10 @@ impl Base64Processor {
         self.validate_base64_format(data)?;
         self.check_size_limits(data)?;
 
-        // Perform base64 decoding with timeout
-        let decoded = self.with_timeout(|| {
-            general_purpose::STANDARD
-                .decode(data)
-                .map_err(|e| Base64ProcessorError::InvalidBase64(e.to_string()))
-        })??;
+        // Perform base64 decoding
+        let decoded = general_purpose::STANDARD
+            .decode(data)
+            .map_err(|e| Base64ProcessorError::InvalidBase64(e.to_string()))?;
 
         // Use centralized MIME type validator with format validation
         self.mime_type_validator
@@ -410,12 +380,10 @@ impl Base64Processor {
         self.validate_base64_format(data)?;
         self.check_size_limits(data)?;
 
-        // Perform base64 decoding with timeout
-        let decoded = self.with_timeout(|| {
-            general_purpose::STANDARD
-                .decode(data)
-                .map_err(|e| Base64ProcessorError::InvalidBase64(e.to_string()))
-        })??;
+        // Perform base64 decoding
+        let decoded = general_purpose::STANDARD
+            .decode(data)
+            .map_err(|e| Base64ProcessorError::InvalidBase64(e.to_string()))?;
 
         // Use centralized MIME type validator with format validation
         self.mime_type_validator
@@ -454,12 +422,10 @@ impl Base64Processor {
         self.validate_base64_format(data)?;
         self.check_size_limits(data)?;
 
-        // Perform base64 decoding with timeout
-        let decoded = self.with_timeout(|| {
-            general_purpose::STANDARD
-                .decode(data)
-                .map_err(|e| Base64ProcessorError::InvalidBase64(e.to_string()))
-        })??;
+        // Perform base64 decoding
+        let decoded = general_purpose::STANDARD
+            .decode(data)
+            .map_err(|e| Base64ProcessorError::InvalidBase64(e.to_string()))?;
 
         // Security validation
         self.perform_security_validation(&decoded)?;

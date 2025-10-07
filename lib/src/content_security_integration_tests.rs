@@ -3,7 +3,6 @@ use crate::content_block_processor::ContentBlockProcessor;
 use crate::content_security_validator::ContentSecurityValidator;
 use agent_client_protocol::{ContentBlock, ImageContent, ResourceLink, TextContent};
 use std::collections::HashMap;
-use std::time::Duration;
 
 #[cfg(test)]
 mod tests {
@@ -57,7 +56,6 @@ mod tests {
         let config = crate::content_block_processor::EnhancedSecurityConfig {
             max_resource_size: 5 * 1024 * 1024, // 5MB resource limit
             enable_uri_validation: true,
-            processing_timeout: Duration::from_secs(10),
             enable_capability_validation: true,
             supported_capabilities,
             enable_batch_recovery: true,
@@ -85,7 +83,6 @@ mod tests {
         let config = crate::content_block_processor::EnhancedSecurityConfig {
             max_resource_size: 50 * 1024 * 1024, // 50MB resource limit
             enable_uri_validation: true,
-            processing_timeout: Duration::from_secs(30),
             enable_capability_validation: true,
             supported_capabilities,
             enable_batch_recovery: true,
@@ -113,7 +110,6 @@ mod tests {
         let config = crate::content_block_processor::EnhancedSecurityConfig {
             max_resource_size: 500 * 1024 * 1024, // 500MB resource limit
             enable_uri_validation: false,         // disable URI validation for permissive mode
-            processing_timeout: Duration::from_secs(120),
             enable_capability_validation: true,
             supported_capabilities,
             enable_batch_recovery: true,

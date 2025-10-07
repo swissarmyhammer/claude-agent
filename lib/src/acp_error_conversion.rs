@@ -44,9 +44,6 @@ pub enum ContentProcessingError {
     #[error("Security validation failed: {reason}")]
     SecurityViolation { reason: String },
 
-    #[error("Processing timeout: content processing exceeded {timeout}s")]
-    ProcessingTimeout { timeout: u64 },
-
     #[error("Memory pressure: insufficient memory for content processing")]
     MemoryPressure,
 
@@ -80,9 +77,7 @@ impl ToJsonRpcError for ContentProcessingError {
             | Self::MissingRequiredField { .. }
             | Self::ContentValidationFailed { .. }
             | Self::FormatDetectionFailed { .. } => -32602, // Invalid params
-            Self::ProcessingTimeout { .. } | Self::MemoryPressure | Self::ResourceContention => {
-                -32603
-            } // Internal error
+            Self::MemoryPressure | Self::ResourceContention => -32603, // Internal error
         }
     }
 
@@ -127,11 +122,6 @@ impl ToJsonRpcError for ContentProcessingError {
             Self::SecurityViolation { .. } => json!({
                 "error": "security_violation",
                 "suggestion": "Content failed security validation checks"
-            }),
-            Self::ProcessingTimeout { timeout } => json!({
-                "error": "processing_timeout",
-                "timeoutSeconds": timeout,
-                "suggestion": "Reduce content size or complexity"
             }),
             Self::MemoryPressure => json!({
                 "error": "memory_pressure",
@@ -321,17 +311,6 @@ fn convert_content_security_error_to_acp_legacy(
                 "stage": ctx.processing_stage
             })),
         },
-        ContentSecurityError::ProcessingTimeout { timeout } => JsonRpcError {
-            code: -32000,
-            message: "Processing timeout".to_string(),
-            data: Some(json!({
-                "error": "processing_timeout",
-                "timeoutMs": timeout,
-                "suggestion": "Reduce content complexity or increase timeout limits",
-                "correlationId": ctx.correlation_id,
-                "stage": ctx.processing_stage
-            })),
-        },
         ContentSecurityError::MemoryLimitExceeded { actual, limit } => JsonRpcError {
             code: -32602,
             message: "Memory limit exceeded".to_string(),
@@ -499,17 +478,6 @@ fn convert_base64_error_to_acp_legacy(
                 "format": format,
                 "supportedFormats": ["wav", "mp3", "mpeg", "ogg", "aac"],
                 "suggestion": "Convert audio to a supported format",
-                "correlationId": ctx.correlation_id,
-                "stage": ctx.processing_stage
-            })),
-        },
-        Base64ProcessorError::ProcessingTimeout { timeout } => JsonRpcError {
-            code: -32603,
-            message: "Processing timeout exceeded".to_string(),
-            data: Some(json!({
-                "error": "processing_timeout",
-                "timeoutMs": timeout,
-                "suggestion": "Reduce content size or complexity",
                 "correlationId": ctx.correlation_id,
                 "stage": ctx.processing_stage
             })),
@@ -791,17 +759,6 @@ fn convert_content_block_error_to_acp_legacy(
                 "stage": ctx.processing_stage
             })),
         },
-        ContentBlockProcessorError::ProcessingTimeout { timeout } => JsonRpcError {
-            code: -32603,
-            message: "Processing timeout exceeded".to_string(),
-            data: Some(json!({
-                "error": "processing_timeout",
-                "timeoutMs": timeout,
-                "suggestion": "Reduce content size or complexity",
-                "correlationId": ctx.correlation_id,
-                "stage": ctx.processing_stage
-            })),
-        },
         ContentBlockProcessorError::CapabilityNotSupported { capability } => JsonRpcError {
             code: -32602,
             message: format!("Capability not supported: {}", capability),
@@ -1004,17 +961,6 @@ fn convert_content_processing_error_to_acp_legacy(
                 "correlationId": ctx.correlation_id,
                 "stage": ctx.processing_stage
                 // Note: Not including 'reason' to avoid information disclosure
-            })),
-        },
-        ContentProcessingError::ProcessingTimeout { timeout } => JsonRpcError {
-            code: -32603,
-            message: "Processing timeout exceeded".to_string(),
-            data: Some(json!({
-                "error": "processing_timeout",
-                "timeoutSeconds": timeout,
-                "suggestion": "Reduce content size or complexity",
-                "correlationId": ctx.correlation_id,
-                "stage": ctx.processing_stage
             })),
         },
         ContentProcessingError::MemoryPressure => JsonRpcError {

@@ -9,7 +9,7 @@ use base64;
 use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use thiserror::Error;
 use tracing::{debug, warn};
 use url::Url;
@@ -41,8 +41,6 @@ pub enum ContentSecurityError {
     ContentSanitizationFailed { reason: String },
     #[error("SSRF protection triggered: {target} - {reason}")]
     SsrfProtectionTriggered { target: String, reason: String },
-    #[error("Processing timeout: operation exceeded {timeout}ms")]
-    ProcessingTimeout { timeout: u64 },
     #[error("Memory limit exceeded: {actual} > {limit} bytes")]
     MemoryLimitExceeded { actual: usize, limit: usize },
     #[error("Rate limit exceeded: {operation}")]
@@ -70,7 +68,7 @@ impl ToJsonRpcError for ContentSecurityError {
             | Self::ContentArrayTooLarge { .. }
             | Self::InvalidContentEncoding { .. }
             | Self::MaliciousPatternDetected { .. } => -32602, // Invalid params
-            Self::ProcessingTimeout { .. } | Self::RateLimitExceeded { .. } => -32000, // Server error
+            Self::RateLimitExceeded { .. } => -32000, // Server error
         }
     }
 
@@ -131,11 +129,6 @@ impl ToJsonRpcError for ContentSecurityError {
                 "details": reason,
                 "suggestion": "Avoid accessing private networks or sensitive endpoints"
             }),
-            Self::ProcessingTimeout { timeout } => json!({
-                "error": "processing_timeout",
-                "timeoutMs": timeout,
-                "suggestion": "Reduce content complexity or increase timeout limits"
-            }),
             Self::MemoryLimitExceeded { actual, limit } => json!({
                 "error": "memory_limit_exceeded",
                 "actualBytes": actual,
@@ -190,14 +183,17 @@ pub enum SecurityLevel {
     Permissive,
 }
 
+// IMPORTANT: Do not add timeouts to content processing operations.
+// Content processing should be allowed to complete regardless of size or complexity.
+// Timeouts create artificial limitations and poor user experience by interrupting
+// legitimate processing of large or complex content. Users cannot predict when
+// operations will be artificially terminated, leading to frustration and unreliable behavior.
 #[derive(Debug, Clone)]
 pub struct SecurityPolicy {
     pub level: SecurityLevel,
     pub max_base64_size: usize,
     pub max_total_content_size: usize,
     pub max_content_array_length: usize,
-    pub base64_decode_timeout: Duration,
-    pub processing_timeout: Duration,
     pub allowed_uri_schemes: HashSet<String>,
     pub enable_ssrf_protection: bool,
     pub enable_content_sniffing: bool,
@@ -221,8 +217,6 @@ impl SecurityPolicy {
             max_base64_size: sizes::content::MAX_CONTENT_STRICT,
             max_total_content_size: sizes::content::MAX_RESOURCE_STRICT,
             max_content_array_length: 10,
-            base64_decode_timeout: Duration::from_secs(5),
-            processing_timeout: Duration::from_secs(10),
             allowed_uri_schemes: allowed_schemes,
             enable_ssrf_protection: true,
             enable_content_sniffing: true,
@@ -260,8 +254,6 @@ impl SecurityPolicy {
             max_base64_size: sizes::content::MAX_CONTENT_MODERATE,
             max_total_content_size: sizes::content::MAX_RESOURCE_MODERATE,
             max_content_array_length: 50,
-            base64_decode_timeout: Duration::from_secs(15),
-            processing_timeout: Duration::from_secs(30),
             allowed_uri_schemes: allowed_schemes,
             enable_ssrf_protection: true,
             enable_content_sniffing: true,
@@ -289,8 +281,6 @@ impl SecurityPolicy {
             max_base64_size: sizes::content::MAX_CONTENT_PERMISSIVE,
             max_total_content_size: sizes::content::MAX_RESOURCE_PERMISSIVE,
             max_content_array_length: sizes::messages::MAX_CONTENT_ARRAY_LENGTH,
-            base64_decode_timeout: Duration::from_secs(60),
-            processing_timeout: Duration::from_secs(120),
             allowed_uri_schemes: allowed_schemes,
             enable_ssrf_protection: false,
             enable_content_sniffing: false,
@@ -390,19 +380,7 @@ impl ContentSecurityValidator {
             std::mem::discriminant(content)
         );
 
-        let start_time = Instant::now();
-
-        // Apply timeout to entire validation process
-        let result = self.validate_content_internal(content);
-
-        let elapsed = start_time.elapsed();
-        if elapsed > self.policy.processing_timeout {
-            return Err(ContentSecurityError::ProcessingTimeout {
-                timeout: elapsed.as_millis() as u64,
-            });
-        }
-
-        result
+        self.validate_content_internal(content)
     }
 
     fn validate_content_internal(
@@ -1022,23 +1000,6 @@ mod tests {
         assert!(validator
             .validate_uri_security("https://google.com")
             .is_ok());
-    }
-
-    #[test]
-    fn test_processing_timeout() {
-        let mut policy = SecurityPolicy::moderate();
-        policy.processing_timeout = Duration::from_millis(1); // Very short timeout
-        let validator = ContentSecurityValidator::new(policy).unwrap();
-
-        let content = ContentBlock::Text(TextContent {
-            text: "Test content".to_string(),
-            annotations: None,
-            meta: None,
-        });
-
-        // This might pass or fail depending on system performance
-        // The test mainly checks that timeout handling is implemented
-        let _result = validator.validate_content_security(&content);
     }
 
     #[test]
