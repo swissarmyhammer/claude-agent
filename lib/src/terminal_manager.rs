@@ -26,8 +26,6 @@ pub enum TerminalState {
     Running,
     /// Process completed with exit status
     Finished,
-    /// Process terminated due to timeout
-    TimedOut,
     /// Process killed by signal
     Killed,
     /// Resources released, terminal ID invalidated
@@ -65,26 +63,16 @@ impl Default for GracefulShutdownTimeout {
 
 /// Configuration for terminal timeout behavior
 ///
-/// Controls how terminal sessions handle execution timeouts, including default
-/// durations, per-command overrides, and escalation strategies.
+/// Controls graceful shutdown timeout for SIGKILL escalation during terminal cleanup.
+///
+/// IMPORTANT: Do not add execution timeouts for commands.
+/// Commands should be allowed to run until completion or explicit user termination.
+/// Only graceful shutdown timeout is appropriate for cleanup scenarios.
+/// Execution timeouts create poor developer experience for legitimate long-running operations.
 #[derive(Debug, Clone, Default)]
 pub struct TimeoutConfig {
-    /// Default timeout for command execution (None means no timeout)
-    pub default_execution_timeout: Option<Duration>,
     /// Graceful shutdown timeout before escalating to SIGKILL
     pub graceful_shutdown_timeout: GracefulShutdownTimeout,
-    /// Per-command timeout overrides (command name -> timeout duration)
-    pub command_timeouts: HashMap<String, Duration>,
-}
-
-impl TimeoutConfig {
-    /// Get the timeout for a specific command, falling back to default if not specified
-    pub fn get_timeout_for_command(&self, command: &str) -> Option<Duration> {
-        self.command_timeouts
-            .get(command)
-            .copied()
-            .or(self.default_execution_timeout)
-    }
 }
 
 /// Represents a terminal session with working directory and environment
@@ -612,80 +600,6 @@ impl TerminalManager {
         Ok(())
     }
 
-    /// Execute with timeout pattern (concurrent wait and timeout)
-    ///
-    /// ACP terminal timeout and process control implementation:
-    /// 1. Concurrent timeout and exit waiting using tokio::select!
-    /// 2. Automatic process kill when timeout exceeded
-    /// 3. Final output retrieval for timeout scenarios
-    /// 4. Platform-specific signal handling (SIGTERM/SIGKILL on Unix)
-    /// 5. Process group management for child process cleanup
-    ///
-    /// Timeout pattern prevents hanging operations and provides resource control.
-    ///
-    /// ACP timeout pattern implementation:
-    /// 1. Start timer for desired timeout duration
-    /// 2. Concurrently wait for either timer to expire or wait_for_exit to return
-    /// 3. If timer expires first, kill the process and retrieve final output
-    pub async fn execute_with_timeout(
-        &self,
-        session_manager: &crate::session::SessionManager,
-        params: TerminalOutputParams,
-        timeout: Duration,
-    ) -> crate::Result<TerminalTimeoutResult> {
-        // 1. Validate session ID
-        self.validate_session_id(session_manager, &params.session_id)
-            .await?;
-
-        // 2. Get terminal session
-        let terminals = self.terminals.read().await;
-        let session = terminals.get(&params.terminal_id).ok_or_else(|| {
-            crate::AgentError::Protocol(format!("Terminal not found: {}", params.terminal_id))
-        })?;
-
-        // 3. Concurrent wait for exit or timeout using tokio::select!
-        tokio::select! {
-            // Wait for natural completion
-            exit_result = session.wait_for_exit() => {
-                match exit_result {
-                    Ok(status) => Ok(TerminalTimeoutResult::Completed(status)),
-                    Err(e) => Err(e),
-                }
-            }
-
-            // Handle timeout
-            _ = tokio::time::sleep(timeout) => {
-                tracing::warn!("Terminal {} timed out after {:?}", params.terminal_id, timeout);
-
-                // Kill the process
-                session.kill_process().await?;
-
-                // Get final output
-                let output = session.get_output_string().await;
-                let truncated = session.is_output_truncated().await;
-
-                Ok(TerminalTimeoutResult::TimedOut {
-                    output,
-                    truncated,
-                })
-            }
-        }
-    }
-}
-
-/// Result of timeout pattern execution
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
-pub enum TerminalTimeoutResult {
-    /// Process completed before timeout
-    Completed(ExitStatus),
-    /// Process timed out and was killed
-    TimedOut {
-        /// Final output captured before kill
-        output: String,
-        /// Whether output was truncated
-        truncated: bool,
-    },
 }
 
 impl Default for TerminalManager {
@@ -1276,143 +1190,8 @@ mod tests {
         *session.state.write().await = TerminalState::Killed;
         assert_eq!(session.get_state().await, TerminalState::Killed);
 
-        *session.state.write().await = TerminalState::TimedOut;
-        assert_eq!(session.get_state().await, TerminalState::TimedOut);
-
         *session.state.write().await = TerminalState::Released;
         assert!(session.is_released().await);
-    }
-
-    #[tokio::test]
-    async fn test_timeout_triggers_kill() {
-        let manager = TerminalManager::new();
-        let session_manager = create_test_session_manager().await;
-
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let session_id = session_manager.create_session(cwd).unwrap();
-
-        let params = TerminalCreateParams {
-            session_id: session_id.to_string(),
-            command: "sleep".to_string(),
-            args: Some(vec!["10".to_string()]),
-            env: None,
-            cwd: None,
-            output_byte_limit: None,
-        };
-
-        let terminal_id = manager
-            .create_terminal_with_command(&session_manager, params)
-            .await
-            .unwrap();
-
-        // Start the process by spawning it
-        {
-            let mut terminals = manager.terminals.write().await;
-            let session = terminals.get_mut(&terminal_id).unwrap();
-
-            let mut cmd = Command::new("sleep");
-            cmd.arg("10")
-                .current_dir(&session.working_dir)
-                .envs(&session.environment)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-
-            let child = cmd.spawn().unwrap();
-            session.process = Some(Arc::new(RwLock::new(child)));
-            *session.state.write().await = TerminalState::Running;
-        }
-
-        // Execute with short timeout (should timeout)
-        let output_params = TerminalOutputParams {
-            session_id: session_id.to_string(),
-            terminal_id: terminal_id.clone(),
-        };
-
-        let result = manager
-            .execute_with_timeout(&session_manager, output_params, Duration::from_millis(100))
-            .await
-            .expect("execute_with_timeout should succeed");
-
-        match result {
-            TerminalTimeoutResult::TimedOut { .. } => {
-                // Expected - timeout triggered kill
-            }
-            TerminalTimeoutResult::Completed(_) => {
-                panic!("Expected timeout, but process completed normally");
-            }
-        }
-
-        // Verify terminal state is killed
-        let terminals = manager.terminals.read().await;
-        let session = terminals.get(&terminal_id).unwrap();
-        let state = session.get_state().await;
-        assert_eq!(state, TerminalState::Killed);
-    }
-
-    #[tokio::test]
-    async fn test_concurrent_wait_and_timeout() {
-        let manager = TerminalManager::new();
-        let session_manager = create_test_session_manager().await;
-
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let session_id = session_manager.create_session(cwd).unwrap();
-
-        let params = TerminalCreateParams {
-            session_id: session_id.to_string(),
-            command: "echo".to_string(),
-            args: Some(vec!["quick".to_string()]),
-            env: None,
-            cwd: None,
-            output_byte_limit: None,
-        };
-
-        let terminal_id = manager
-            .create_terminal_with_command(&session_manager, params)
-            .await
-            .unwrap();
-
-        // Start a quick process
-        {
-            let mut terminals = manager.terminals.write().await;
-            let session = terminals.get_mut(&terminal_id).unwrap();
-
-            let mut cmd = Command::new("echo");
-            cmd.arg("quick")
-                .current_dir(&session.working_dir)
-                .envs(&session.environment)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-
-            let child = cmd.spawn().unwrap();
-            session.process = Some(Arc::new(RwLock::new(child)));
-            *session.state.write().await = TerminalState::Running;
-        }
-
-        // Execute with long timeout (should complete before timeout)
-        let output_params = TerminalOutputParams {
-            session_id: session_id.to_string(),
-            terminal_id: terminal_id.clone(),
-        };
-
-        let result = manager
-            .execute_with_timeout(&session_manager, output_params, Duration::from_secs(10))
-            .await;
-
-        assert!(result.is_ok());
-        match result.unwrap() {
-            TerminalTimeoutResult::Completed(status) => {
-                assert_eq!(status.exit_code, Some(0));
-            }
-            TerminalTimeoutResult::TimedOut { .. } => {
-                panic!("Expected completion, but process timed out");
-            }
-        }
-
-        // Verify terminal state is finished
-        let terminals = manager.terminals.read().await;
-        let session = terminals.get(&terminal_id).unwrap();
-        let state = session.get_state().await;
-        assert_eq!(state, TerminalState::Finished);
     }
 
     #[tokio::test]
