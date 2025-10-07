@@ -599,7 +599,6 @@ impl TerminalManager {
 
         Ok(())
     }
-
 }
 
 impl Default for TerminalManager {
