@@ -1784,4 +1784,302 @@ mod tests {
         let state = session.get_state().await;
         assert_eq!(state, TerminalState::Killed);
     }
+
+    // UTF-8 Processing Tests
+
+    fn create_test_terminal_session() -> TerminalSession {
+        TerminalSession {
+            process: None,
+            working_dir: std::path::PathBuf::from("/tmp"),
+            environment: HashMap::new(),
+            command: Some("test".to_string()),
+            args: vec![],
+            session_id: Some("test_session".to_string()),
+            output_byte_limit: 100, // Small limit for testing truncation
+            output_buffer: Arc::new(RwLock::new(Vec::new())),
+            buffer_truncated: Arc::new(RwLock::new(false)),
+            exit_status: Arc::new(RwLock::new(None)),
+            state: Arc::new(RwLock::new(TerminalState::Created)),
+            output_task: None,
+            timeout_config: TimeoutConfig::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_utf8_1_byte_ascii_characters() {
+        let session = create_test_terminal_session();
+        let text = "Hello World!";
+        session.add_output(text.as_bytes()).await;
+
+        let output = session.get_output_string().await;
+        assert_eq!(output, text);
+        assert!(!session.is_output_truncated().await);
+    }
+
+    #[tokio::test]
+    async fn test_utf8_2_byte_characters() {
+        let session = create_test_terminal_session();
+        // Latin Extended, Cyrillic, etc.
+        let text = "Привет мир"; // Russian "Hello World"
+        session.add_output(text.as_bytes()).await;
+
+        let output = session.get_output_string().await;
+        assert_eq!(output, text);
+        assert!(!session.is_output_truncated().await);
+    }
+
+    #[tokio::test]
+    async fn test_utf8_3_byte_characters() {
+        let session = create_test_terminal_session();
+        // CJK characters
+        let text = "你好世界"; // Chinese "Hello World"
+        session.add_output(text.as_bytes()).await;
+
+        let output = session.get_output_string().await;
+        assert_eq!(output, text);
+        assert!(!session.is_output_truncated().await);
+    }
+
+    #[tokio::test]
+    async fn test_utf8_4_byte_characters() {
+        let session = create_test_terminal_session();
+        // Emoji and other 4-byte characters
+        let text = "Hello 👋 World 🌍!";
+        session.add_output(text.as_bytes()).await;
+
+        let output = session.get_output_string().await;
+        assert_eq!(output, text);
+        assert!(!session.is_output_truncated().await);
+    }
+
+    #[tokio::test]
+    async fn test_utf8_mixed_width_characters() {
+        let session = create_test_terminal_session();
+        // Mix of 1, 2, 3, and 4 byte characters
+        let text = "ASCII Привет 你好 👋";
+        session.add_output(text.as_bytes()).await;
+
+        let output = session.get_output_string().await;
+        assert_eq!(output, text);
+        assert!(!session.is_output_truncated().await);
+    }
+
+    #[tokio::test]
+    async fn test_utf8_truncation_at_ascii_boundary() {
+        let session = create_test_terminal_session();
+        // Add more than 100 bytes of ASCII text
+        let text = "a".repeat(150);
+        session.add_output(text.as_bytes()).await;
+
+        let output = session.get_output_string().await;
+        assert!(session.is_output_truncated().await);
+        assert!(output.len() <= 100);
+        // Verify output is valid UTF-8
+        assert!(std::str::from_utf8(output.as_bytes()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_utf8_truncation_preserves_multibyte_characters() {
+        let session = create_test_terminal_session();
+        // Create text with 3-byte characters that will exceed limit
+        let text = "你".repeat(40); // Each character is 3 bytes = 120 bytes total
+        session.add_output(text.as_bytes()).await;
+
+        let output = session.get_output_string().await;
+        assert!(session.is_output_truncated().await);
+        // Output should be valid UTF-8 with complete characters only
+        assert!(std::str::from_utf8(output.as_bytes()).is_ok());
+        // Each character is 3 bytes, so we should have at most 33 complete characters
+        // (99 bytes = 33 * 3, staying under 100 byte limit)
+        assert!(output.chars().count() <= 34);
+    }
+
+    #[tokio::test]
+    async fn test_utf8_truncation_at_emoji_boundary() {
+        let session = create_test_terminal_session();
+        // Create text with 4-byte emoji that will exceed limit
+        let text = "👋".repeat(30); // Each emoji is 4 bytes = 120 bytes total
+        session.add_output(text.as_bytes()).await;
+
+        let output = session.get_output_string().await;
+        assert!(session.is_output_truncated().await);
+        // Output should be valid UTF-8 with complete emoji only
+        assert!(std::str::from_utf8(output.as_bytes()).is_ok());
+        // Each emoji is 4 bytes, so we should have at most 25 complete emoji
+        // (100 bytes = 25 * 4)
+        assert!(output.chars().count() <= 25);
+    }
+
+    #[tokio::test]
+    async fn test_utf8_boundary_detection_continuation_byte() {
+        let session = create_test_terminal_session();
+        // Test truncation happens at a safe boundary, not mid-character
+        let text = "a".repeat(98) + "你"; // 98 ASCII + 1 3-byte char = 101 bytes
+        session.add_output(text.as_bytes()).await;
+
+        let output = session.get_output_string().await;
+        assert!(session.is_output_truncated().await);
+        // The 3-byte character should be preserved or removed entirely, not split
+        assert!(std::str::from_utf8(output.as_bytes()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_utf8_incremental_output_with_truncation() {
+        let session = create_test_terminal_session();
+        // Add output in multiple chunks
+        session.add_output("Hello ".as_bytes()).await;
+        session.add_output("World ".as_bytes()).await;
+        session.add_output("你好 ".as_bytes()).await;
+        session.add_output("👋".as_bytes()).await;
+
+        let output = session.get_output_string().await;
+        assert!(!session.is_output_truncated().await);
+        assert!(std::str::from_utf8(output.as_bytes()).is_ok());
+        assert!(output.contains("Hello"));
+        assert!(output.contains("👋"));
+    }
+
+    #[tokio::test]
+    async fn test_utf8_incremental_output_exceeding_limit() {
+        let session = create_test_terminal_session();
+        // Add output that incrementally exceeds the limit
+        for _ in 0..10 {
+            session.add_output("Hello World! ".as_bytes()).await;
+        }
+
+        let output = session.get_output_string().await;
+        assert!(session.is_output_truncated().await);
+        assert!(output.len() <= 100);
+        assert!(std::str::from_utf8(output.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_find_utf8_boundary_at_ascii() {
+        let data = b"Hello World";
+        let boundary = TerminalSession::find_utf8_boundary(data, 5);
+        assert_eq!(boundary, 5);
+    }
+
+    #[test]
+    fn test_find_utf8_boundary_at_2_byte_start() {
+        // Cyrillic 'П' = 0xD0 0x9F
+        let data = b"Hello\xD0\x9F\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82";
+        let boundary = TerminalSession::find_utf8_boundary(data, 5);
+        assert_eq!(boundary, 5); // Should be at start of 'П'
+    }
+
+    #[test]
+    fn test_find_utf8_boundary_at_continuation_byte() {
+        // Cyrillic 'П' = 0xD0 0x9F, test position at continuation byte
+        let data = b"Hello\xD0\x9F\xD1\x80";
+        let boundary = TerminalSession::find_utf8_boundary(data, 6);
+        // Position 6 is the continuation byte of 'П', should move to 7 (next char)
+        assert_eq!(boundary, 7);
+    }
+
+    #[test]
+    fn test_find_utf8_boundary_at_3_byte_character() {
+        // Chinese '你' = 0xE4 0xBD 0xA0
+        let data = b"Hi\xE4\xBD\xA0";
+        let boundary = TerminalSession::find_utf8_boundary(data, 2);
+        assert_eq!(boundary, 2); // Should be at start of '你'
+    }
+
+    #[test]
+    fn test_find_utf8_boundary_mid_3_byte_character() {
+        // Chinese '你' = 0xE4 0xBD 0xA0
+        let data = b"Hi\xE4\xBD\xA0\xE5\xA5\xBD"; // "Hi你好"
+        let boundary = TerminalSession::find_utf8_boundary(data, 3);
+        // Position 3 is continuation byte, should move to 5 (next char)
+        assert_eq!(boundary, 5);
+    }
+
+    #[test]
+    fn test_find_utf8_boundary_at_4_byte_emoji() {
+        // Waving hand emoji '👋' = 0xF0 0x9F 0x91 0x8B
+        let data = b"Hi\xF0\x9F\x91\x8B";
+        let boundary = TerminalSession::find_utf8_boundary(data, 2);
+        assert_eq!(boundary, 2); // Should be at start of emoji
+    }
+
+    #[test]
+    fn test_find_utf8_boundary_mid_4_byte_emoji() {
+        // Waving hand emoji '👋' = 0xF0 0x9F 0x91 0x8B
+        let data = b"Hi\xF0\x9F\x91\x8B!";
+        let boundary = TerminalSession::find_utf8_boundary(data, 3);
+        // Position 3 is continuation byte, should move to 6 (after emoji)
+        assert_eq!(boundary, 6);
+    }
+
+    #[test]
+    fn test_find_utf8_boundary_at_end_of_data() {
+        let data = b"Hello";
+        let boundary = TerminalSession::find_utf8_boundary(data, 10);
+        assert_eq!(boundary, 5); // Should return data length
+    }
+
+    #[tokio::test]
+    async fn test_utf8_clear_output_resets_truncation_flag() {
+        let session = create_test_terminal_session();
+        // Add enough data to trigger truncation
+        session.add_output("a".repeat(150).as_bytes()).await;
+        assert!(session.is_output_truncated().await);
+
+        // Clear output
+        session.clear_output().await;
+
+        // Add new data under limit
+        session.add_output(b"Hello").await;
+        assert!(!session.is_output_truncated().await);
+        assert_eq!(session.get_output_string().await, "Hello");
+    }
+
+    #[tokio::test]
+    async fn test_utf8_output_with_null_bytes() {
+        let session = create_test_terminal_session();
+        // Add data with null bytes
+        let data = b"Hello\x00World";
+        session.add_output(data).await;
+
+        let output = session.get_output_string().await;
+        // from_utf8_lossy should handle this
+        assert!(!output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_utf8_large_buffer_size_tracking() {
+        let session = create_test_terminal_session();
+        let text1 = "Hello";
+        let text2 = " World";
+
+        session.add_output(text1.as_bytes()).await;
+        assert_eq!(session.get_buffer_size().await, text1.len());
+
+        session.add_output(text2.as_bytes()).await;
+        assert_eq!(session.get_buffer_size().await, text1.len() + text2.len());
+    }
+
+    #[tokio::test]
+    async fn test_utf8_truncation_with_boundary_exactly_at_limit() {
+        let session = create_test_terminal_session();
+        // Create exactly 100 bytes of valid UTF-8
+        let text = "a".repeat(100);
+        session.add_output(text.as_bytes()).await;
+
+        let output = session.get_output_string().await;
+        assert!(!session.is_output_truncated().await);
+        assert_eq!(output.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_utf8_truncation_one_byte_over_limit() {
+        let session = create_test_terminal_session();
+        // Create 101 bytes
+        let text = "a".repeat(101);
+        session.add_output(text.as_bytes()).await;
+
+        let output = session.get_output_string().await;
+        assert!(session.is_output_truncated().await);
+        assert!(output.len() <= 100);
+    }
 }
