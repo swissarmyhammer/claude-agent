@@ -31,6 +31,10 @@ impl CapabilityValidator {
         known_agent_capabilities.insert("http".to_string());
         known_agent_capabilities.insert("sse".to_string());
 
+        // Known client capabilities include both top-level fields and meta capabilities:
+        // - "terminal": top-level boolean field in ClientCapabilities
+        // - "notifications", "progress": meta capabilities (validated as booleans)
+        // - "cancellation": reserved for future use in meta
         let mut known_client_capabilities = HashSet::new();
         known_client_capabilities.insert("notifications".to_string());
         known_client_capabilities.insert("progress".to_string());
@@ -116,16 +120,116 @@ impl CapabilityValidator {
     }
 
     /// Validate client capabilities for compatibility
+    /// Validate client capabilities for session setup compatibility
+    ///
+    /// Performs validation in three stages:
+    /// 1. Meta capabilities (optional) - structural and type validation
+    /// 2. Filesystem capabilities - structural validation of meta field
+    /// 3. Terminal capability - boolean field, validated separately via validate_terminal_capability if needed
+    ///
+    /// All validations use a lenient approach: unknown capabilities are logged but don't fail validation.
+    /// This supports forward compatibility when clients declare newer capabilities.
     pub fn validate_client_capabilities(
         &self,
         capabilities: Option<&ClientCapabilities>,
     ) -> SessionSetupResult<()> {
-        if let Some(_client_caps) = capabilities {
-            // Validate client capability format and content
-            // For now, we accept any client capabilities as they're optional
-            // Future versions might validate specific client capability requirements
+        if let Some(client_caps) = capabilities {
+            // Validate meta capabilities if present
+            if let Some(meta) = &client_caps.meta {
+                self.validate_client_meta_capabilities(meta)?;
+            }
+
+            // Validate filesystem capabilities structure
+            self.validate_client_filesystem_capabilities(&client_caps.fs)?;
+
+            // Terminal capability is a boolean, no additional validation needed
+            // Specific terminal requirements can be checked with validate_terminal_capability
         }
 
+        Ok(())
+    }
+
+    /// Validate client meta capabilities format and values
+    ///
+    /// # Arguments
+    /// * `meta` - The meta capabilities JSON object to validate
+    ///
+    /// # Returns
+    /// * `Ok(())` if validation passes
+    /// * `Err(SessionSetupError::CapabilityFormatError)` if validation fails
+    ///
+    /// # Errors
+    /// Returns `CapabilityFormatError` if:
+    /// - Meta is not a JSON object
+    /// - Known meta capabilities (`streaming`, `notifications`, `progress`) have wrong types (must be boolean)
+    ///
+    /// Unknown meta capabilities are logged but don't fail validation (lenient approach for forward compatibility).
+    fn validate_client_meta_capabilities(&self, meta: &Value) -> SessionSetupResult<()> {
+        if !meta.is_object() {
+            return Err(SessionSetupError::CapabilityFormatError {
+                capability_name: "meta".to_string(),
+                expected_format: "object".to_string(),
+                actual_value: meta.clone(),
+            });
+        }
+
+        // Validate that meta values have appropriate types
+        if let Some(meta_obj) = meta.as_object() {
+            for (key, value) in meta_obj {
+                // Common meta capabilities should be booleans
+                match key.as_str() {
+                    "streaming" | "notifications" | "progress" => {
+                        if !value.is_boolean() {
+                            return Err(SessionSetupError::CapabilityFormatError {
+                                capability_name: format!("meta.{}", key),
+                                expected_format: "boolean".to_string(),
+                                actual_value: value.clone(),
+                            });
+                        }
+                    }
+                    _ => {
+                        // Unknown meta capabilities are logged as warnings but don't fail validation
+                        tracing::debug!("Unknown client meta capability: {}", key);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate client filesystem capabilities structure
+    ///
+    /// # Arguments
+    /// * `fs_caps` - The filesystem capabilities to validate
+    ///
+    /// # Returns
+    /// * `Ok(())` if validation passes
+    /// * `Err(SessionSetupError::CapabilityFormatError)` if validation fails
+    ///
+    /// # Errors
+    /// Returns `CapabilityFormatError` if:
+    /// - fs.meta field (if present) is not a JSON object
+    ///
+    /// The boolean fields (`read_text_file`, `write_text_file`) are always valid.
+    /// Unknown fs.meta capabilities are logged but don't fail validation.
+    fn validate_client_filesystem_capabilities(
+        &self,
+        fs_caps: &agent_client_protocol::FileSystemCapability,
+    ) -> SessionSetupResult<()> {
+        // Validate meta field if present
+        if let Some(fs_meta) = &fs_caps.meta {
+            if !fs_meta.is_object() {
+                return Err(SessionSetupError::CapabilityFormatError {
+                    capability_name: "fs.meta".to_string(),
+                    expected_format: "object".to_string(),
+                    actual_value: fs_meta.clone(),
+                });
+            }
+        }
+
+        // read_text_file and write_text_file are boolean fields that are always valid
+        // No additional validation needed for these primitive boolean fields
         Ok(())
     }
 
@@ -679,5 +783,284 @@ mod tests {
 
         let result = validator.validate_capability_names(None, Some(&client_caps_with_terminal));
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_client_capabilities_with_minimal_required_fields() {
+        let validator = CapabilityValidator::new();
+        let capabilities = create_test_client_capabilities_with_terminal(true);
+
+        let result = validator.validate_client_capabilities(Some(&capabilities));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_client_capabilities_none() {
+        let validator = CapabilityValidator::new();
+
+        let result = validator.validate_client_capabilities(None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_client_capabilities_with_valid_meta() {
+        use agent_client_protocol::{ClientCapabilities, FileSystemCapability};
+
+        let validator = CapabilityValidator::new();
+        let capabilities = ClientCapabilities {
+            fs: FileSystemCapability {
+                read_text_file: true,
+                write_text_file: false,
+                meta: None,
+            },
+            terminal: true,
+            meta: Some(serde_json::json!({
+                "streaming": true,
+                "notifications": false,
+                "progress": true
+            })),
+        };
+
+        let result = validator.validate_client_capabilities(Some(&capabilities));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_client_capabilities_with_invalid_meta_type() {
+        use agent_client_protocol::{ClientCapabilities, FileSystemCapability};
+
+        let validator = CapabilityValidator::new();
+        let capabilities = ClientCapabilities {
+            fs: FileSystemCapability {
+                read_text_file: true,
+                write_text_file: true,
+                meta: None,
+            },
+            terminal: true,
+            meta: Some(serde_json::json!("not_an_object")),
+        };
+
+        let result = validator.validate_client_capabilities(Some(&capabilities));
+        assert!(result.is_err());
+
+        match result {
+            Err(SessionSetupError::CapabilityFormatError {
+                capability_name,
+                expected_format,
+                ..
+            }) => {
+                assert_eq!(capability_name, "meta");
+                assert_eq!(expected_format, "object");
+            }
+            _ => panic!("Expected CapabilityFormatError for invalid meta type"),
+        }
+    }
+
+    #[test]
+    fn test_validate_client_capabilities_with_invalid_meta_value() {
+        use agent_client_protocol::{ClientCapabilities, FileSystemCapability};
+
+        let validator = CapabilityValidator::new();
+        let capabilities = ClientCapabilities {
+            fs: FileSystemCapability {
+                read_text_file: true,
+                write_text_file: true,
+                meta: None,
+            },
+            terminal: false,
+            meta: Some(serde_json::json!({
+                "streaming": "not_a_boolean"
+            })),
+        };
+
+        let result = validator.validate_client_capabilities(Some(&capabilities));
+        assert!(result.is_err());
+
+        match result {
+            Err(SessionSetupError::CapabilityFormatError {
+                capability_name,
+                expected_format,
+                ..
+            }) => {
+                assert_eq!(capability_name, "meta.streaming");
+                assert_eq!(expected_format, "boolean");
+            }
+            _ => panic!("Expected CapabilityFormatError for invalid meta value type"),
+        }
+    }
+
+    #[test]
+    fn test_validate_client_capabilities_with_unknown_meta_capability() {
+        use agent_client_protocol::{ClientCapabilities, FileSystemCapability};
+
+        let validator = CapabilityValidator::new();
+        let capabilities = ClientCapabilities {
+            fs: FileSystemCapability {
+                read_text_file: true,
+                write_text_file: true,
+                meta: None,
+            },
+            terminal: true,
+            meta: Some(serde_json::json!({
+                "unknown_capability": true
+            })),
+        };
+
+        // Unknown meta capabilities should not fail validation, just log debug
+        let result = validator.validate_client_capabilities(Some(&capabilities));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_client_capabilities_with_fs_meta() {
+        use agent_client_protocol::{ClientCapabilities, FileSystemCapability};
+
+        let validator = CapabilityValidator::new();
+        let capabilities = ClientCapabilities {
+            fs: FileSystemCapability {
+                read_text_file: true,
+                write_text_file: true,
+                meta: Some(serde_json::json!({
+                    "encoding": "utf-8"
+                })),
+            },
+            terminal: true,
+            meta: None,
+        };
+
+        let result = validator.validate_client_capabilities(Some(&capabilities));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_client_capabilities_with_invalid_fs_meta() {
+        use agent_client_protocol::{ClientCapabilities, FileSystemCapability};
+
+        let validator = CapabilityValidator::new();
+        let capabilities = ClientCapabilities {
+            fs: FileSystemCapability {
+                read_text_file: true,
+                write_text_file: false,
+                meta: Some(serde_json::json!("not_an_object")),
+            },
+            terminal: false,
+            meta: None,
+        };
+
+        let result = validator.validate_client_capabilities(Some(&capabilities));
+        assert!(result.is_err());
+
+        match result {
+            Err(SessionSetupError::CapabilityFormatError {
+                capability_name,
+                expected_format,
+                ..
+            }) => {
+                assert_eq!(capability_name, "fs.meta");
+                assert_eq!(expected_format, "object");
+            }
+            _ => panic!("Expected CapabilityFormatError for invalid fs.meta type"),
+        }
+    }
+
+    #[test]
+    fn test_validate_client_capabilities_with_all_optional_fields_populated() {
+        use agent_client_protocol::{ClientCapabilities, FileSystemCapability};
+
+        let validator = CapabilityValidator::new();
+        let capabilities = ClientCapabilities {
+            fs: FileSystemCapability {
+                read_text_file: true,
+                write_text_file: false,
+                meta: Some(serde_json::json!({
+                    "encoding": "utf-8",
+                    "permissions": true
+                })),
+            },
+            terminal: true,
+            meta: Some(serde_json::json!({
+                "streaming": false,
+                "notifications": true,
+                "progress": false
+            })),
+        };
+
+        let result = validator.validate_client_capabilities(Some(&capabilities));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_client_capabilities_empty_meta() {
+        use agent_client_protocol::{ClientCapabilities, FileSystemCapability};
+
+        let validator = CapabilityValidator::new();
+
+        let capabilities = ClientCapabilities {
+            fs: FileSystemCapability {
+                read_text_file: true,
+                write_text_file: true,
+                meta: None,
+            },
+            terminal: true,
+            meta: Some(serde_json::json!({})),
+        };
+
+        let result = validator.validate_client_capabilities(Some(&capabilities));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_client_capabilities_empty_fs_meta() {
+        use agent_client_protocol::{ClientCapabilities, FileSystemCapability};
+
+        let validator = CapabilityValidator::new();
+
+        let capabilities = ClientCapabilities {
+            fs: FileSystemCapability {
+                read_text_file: true,
+                write_text_file: true,
+                meta: Some(serde_json::json!({})),
+            },
+            terminal: true,
+            meta: None,
+        };
+
+        let result = validator.validate_client_capabilities(Some(&capabilities));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_client_capabilities_mixed_valid_invalid_meta() {
+        use agent_client_protocol::{ClientCapabilities, FileSystemCapability};
+
+        let validator = CapabilityValidator::new();
+
+        let capabilities = ClientCapabilities {
+            fs: FileSystemCapability {
+                read_text_file: true,
+                write_text_file: true,
+                meta: None,
+            },
+            terminal: true,
+            meta: Some(serde_json::json!({
+                "streaming": true,
+                "notifications": "invalid_string_value"
+            })),
+        };
+
+        let result = validator.validate_client_capabilities(Some(&capabilities));
+        assert!(result.is_err());
+
+        match result {
+            Err(SessionSetupError::CapabilityFormatError {
+                capability_name,
+                expected_format,
+                ..
+            }) => {
+                assert_eq!(capability_name, "meta.notifications");
+                assert_eq!(expected_format, "boolean");
+            }
+            _ => panic!("Expected CapabilityFormatError"),
+        }
     }
 }

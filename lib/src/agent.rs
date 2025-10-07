@@ -760,54 +760,41 @@ impl ClaudeAgent {
     }
 
     /// Validate meta capabilities with detailed error reporting
+    ///
+    /// Validates the structure and types of client meta capabilities.
+    /// Uses lenient validation: unknown capabilities are logged but don't fail validation,
+    /// supporting forward compatibility with newer client versions.
     fn validate_meta_capabilities(
         &self,
         meta: &serde_json::Value,
     ) -> Result<(), agent_client_protocol::Error> {
-        let supported_meta_keys = ["streaming", "notifications", "progress"];
-        let unknown_capabilities = [
-            "customExtension",
-            "experimentalFeature",
-            "unsupportedOption",
-        ];
-
         if let Some(meta_obj) = meta.as_object() {
             for (key, value) in meta_obj {
-                // Check for specifically known unsupported capabilities
-                if unknown_capabilities.contains(&key.as_str()) {
-                    return Err(agent_client_protocol::Error {
-                        code: -32602, // Invalid params
-                        message: format!(
-                            "Invalid client capabilities: unknown capability '{}'. This capability is not supported by this agent.",
-                            key
-                        ),
-                        data: Some(serde_json::json!({
-                            "errorType": "unsupported_capability",
-                            "invalidCapability": key,
-                            "supportedCapabilities": supported_meta_keys,
-                            "recoverySuggestion": format!("Remove '{}' from client capabilities or use a compatible agent version", key),
-                            "documentationUrl": "https://agentclientprotocol.com/protocol/initialization"
-                        })),
-                    });
-                }
-
-                // Validate capability value types
-                if key == "streaming" && !value.is_boolean() {
-                    return Err(agent_client_protocol::Error {
-                        code: -32602, // Invalid params
-                        message: format!(
-                            "Invalid client capabilities: '{}' must be a boolean value, received {}",
-                            key, value
-                        ),
-                        data: Some(serde_json::json!({
-                            "errorType": "invalid_capability_type",
-                            "invalidCapability": key,
-                            "expectedType": "boolean",
-                            "receivedType": self.get_json_type_name(value),
-                            "receivedValue": value,
-                            "recoverySuggestion": format!("Set '{}' to true or false", key)
-                        })),
-                    });
+                // Validate known capability value types
+                match key.as_str() {
+                    "streaming" | "notifications" | "progress" => {
+                        if !value.is_boolean() {
+                            return Err(agent_client_protocol::Error {
+                                code: -32602, // Invalid params
+                                message: format!(
+                                    "Invalid client capabilities: '{}' must be a boolean value, received {}",
+                                    key, value
+                                ),
+                                data: Some(serde_json::json!({
+                                    "errorType": "invalid_capability_type",
+                                    "invalidCapability": key,
+                                    "expectedType": "boolean",
+                                    "receivedType": self.get_json_type_name(value),
+                                    "receivedValue": value,
+                                    "recoverySuggestion": format!("Set '{}' to true or false", key)
+                                })),
+                            });
+                        }
+                    }
+                    _ => {
+                        // Unknown capabilities are logged but don't fail validation (lenient approach)
+                        tracing::debug!("Unknown client meta capability: {}", key);
+                    }
                 }
             }
         } else {
@@ -828,53 +815,42 @@ impl ClaudeAgent {
     }
 
     /// Validate file system capabilities with comprehensive error checking
+    ///
+    /// Validates the structure of filesystem meta capabilities.
+    /// Uses lenient validation: unknown fs.meta capabilities are logged but don't fail validation.
     fn validate_filesystem_capabilities(
         &self,
         fs_capabilities: &agent_client_protocol::FileSystemCapability,
     ) -> Result<(), agent_client_protocol::Error> {
         // Validate meta field if present
         if let Some(fs_meta) = &fs_capabilities.meta {
-            let supported_fs_features = ["encoding", "permissions", "symbolic_links"];
-            let unsupported_fs_features =
-                ["unknown_feature", "experimental_access", "direct_memory"];
-
             if let Some(meta_obj) = fs_meta.as_object() {
                 for (key, value) in meta_obj {
-                    if unsupported_fs_features.contains(&key.as_str()) {
-                        return Err(agent_client_protocol::Error {
-                            code: -32602, // Invalid params
-                            message: format!(
-                                "Invalid client capabilities: unknown file system feature '{}'. This feature is not supported.",
-                                key
-                            ),
-                            data: Some(serde_json::json!({
-                                "errorType": "unsupported_filesystem_feature",
-                                "invalidCapability": key,
-                                "supportedCapabilities": supported_fs_features,
-                                "capabilityCategory": "filesystem",
-                                "recoverySuggestion": format!("Remove '{}' from filesystem capabilities or upgrade to a compatible agent version", key),
-                                "severity": "error"
-                            })),
-                        });
-                    }
-
-                    // Validate feature value types
-                    if key == "encoding" && !value.is_string() {
-                        return Err(agent_client_protocol::Error {
-                            code: -32602, // Invalid params
-                            message: format!(
-                                "Invalid filesystem capability: '{}' must be a string value",
-                                key
-                            ),
-                            data: Some(serde_json::json!({
-                                "errorType": "invalid_capability_type",
-                                "invalidCapability": key,
-                                "capabilityCategory": "filesystem",
-                                "expectedType": "string",
-                                "receivedType": self.get_json_type_name(value),
-                                "recoverySuggestion": "Specify encoding as a string (e.g., 'utf-8', 'latin1')"
-                            })),
-                        });
+                    // Validate known feature value types
+                    match key.as_str() {
+                        "encoding" => {
+                            if !value.is_string() {
+                                return Err(agent_client_protocol::Error {
+                                    code: -32602, // Invalid params
+                                    message: format!(
+                                        "Invalid filesystem capability: '{}' must be a string value",
+                                        key
+                                    ),
+                                    data: Some(serde_json::json!({
+                                        "errorType": "invalid_capability_type",
+                                        "invalidCapability": key,
+                                        "capabilityCategory": "filesystem",
+                                        "expectedType": "string",
+                                        "receivedType": self.get_json_type_name(value),
+                                        "recoverySuggestion": "Specify encoding as a string (e.g., 'utf-8', 'latin1')"
+                                    })),
+                                });
+                            }
+                        }
+                        _ => {
+                            // Unknown fs.meta capabilities are logged but don't fail validation
+                            tracing::debug!("Unknown filesystem meta capability: {}", key);
+                        }
                     }
                 }
             }
@@ -1551,7 +1527,7 @@ impl ClaudeAgent {
                 ContentBlock::ResourceLink(resource_link) => {
                     // Add descriptive text for the resource link
                     prompt_text.push_str(&format!("\n[Resource Link: {}]", resource_link.uri));
-                    has_binary_content = true;
+                    // ResourceLink is just a URI reference, not binary content
                 }
             }
         }
@@ -1590,7 +1566,11 @@ impl ClaudeAgent {
         // ACP requires specific stop reasons for all prompt turn completions:
         // Check for refusal patterns in Claude's response content
         if self.is_response_refusal(&response_content) {
-            tracing::info!("Claude refused to respond for session: {}. Response: {}", session_id, response_content);
+            tracing::info!(
+                "Claude refused to respond for session: {}. Response: {}",
+                session_id,
+                response_content
+            );
             return Ok(self.create_refusal_response(&session_id.to_string(), false, None));
         }
 
@@ -2720,7 +2700,7 @@ impl Agent for ClaudeAgent {
                 ContentBlock::ResourceLink(resource_link) => {
                     // Add descriptive text for the resource link
                     prompt_text.push_str(&format!("\n[Resource Link: {}]", resource_link.uri));
-                    has_binary_content = true;
+                    // ResourceLink is just a URI reference, not binary content
                 }
             }
         }
@@ -5080,7 +5060,7 @@ mod tests {
             session_id: session_response.session_id.clone(),
             prompt: vec![
                 ContentBlock::Text(TextContent {
-                    text: "Here is a resource to review:".to_string(),
+                    text: "I'm providing a resource link for reference. Please confirm you received it.".to_string(),
                     annotations: None,
                     meta: None,
                 }),
@@ -5274,6 +5254,7 @@ mod tests {
         let agent = create_test_agent().await;
 
         // Test with unknown capability in meta
+        // Unknown capabilities should be accepted (lenient validation for forward compatibility)
         let request = InitializeRequest {
             client_capabilities: agent_client_protocol::ClientCapabilities {
                 fs: agent_client_protocol::FileSystemCapability {
@@ -5292,12 +5273,10 @@ mod tests {
         };
 
         let result = agent.initialize(request).await;
-        assert!(result.is_err(), "Unknown capabilities should be rejected");
-
-        let error = result.unwrap_err();
-        assert_eq!(error.code, -32602);
-        assert!(error.message.contains("Invalid client capabilities"));
-        assert!(error.message.contains("unknown capability"));
+        assert!(
+            result.is_ok(),
+            "Unknown capabilities should be accepted for forward compatibility"
+        );
     }
 
     #[tokio::test]
@@ -5343,7 +5322,7 @@ mod tests {
     async fn test_invalid_client_capabilities() {
         let agent = create_test_agent().await;
 
-        // Test with unknown capability in meta
+        // Test with known capability having wrong type (should be rejected)
         let request = InitializeRequest {
             client_capabilities: agent_client_protocol::ClientCapabilities {
                 fs: agent_client_protocol::FileSystemCapability {
@@ -5353,7 +5332,7 @@ mod tests {
                 },
                 terminal: true,
                 meta: Some(serde_json::json!({
-                    "customExtension": "value"  // This should trigger validation error
+                    "streaming": "invalid_string_value"  // streaming must be boolean
                 })),
             },
             protocol_version: Default::default(),
@@ -5361,19 +5340,21 @@ mod tests {
         };
 
         let result = agent.initialize(request).await;
-        assert!(result.is_err(), "Unknown capability should be rejected");
+        assert!(
+            result.is_err(),
+            "Invalid type for known capability should be rejected"
+        );
 
         let error = result.unwrap_err();
         assert_eq!(error.code, -32602, "Should be Invalid params error");
-        assert!(error
-            .message
-            .contains("unknown capability 'customExtension'"));
+        assert!(error.message.contains("streaming"));
+        assert!(error.message.contains("boolean"));
 
         // Verify structured error data
         assert!(error.data.is_some());
         let data = error.data.unwrap();
-        assert_eq!(data["invalidCapability"], "customExtension");
-        assert!(data["supportedCapabilities"].is_array());
+        assert_eq!(data["invalidCapability"], "streaming");
+        assert_eq!(data["expectedType"], "boolean");
     }
 
     #[tokio::test]
@@ -5381,13 +5362,14 @@ mod tests {
         let agent = create_test_agent().await;
 
         // Test with unknown file system capability
+        // Unknown fs.meta capabilities should be accepted (lenient validation)
         let request = InitializeRequest {
             client_capabilities: agent_client_protocol::ClientCapabilities {
                 fs: agent_client_protocol::FileSystemCapability {
                     read_text_file: true,
                     write_text_file: true,
                     meta: Some(serde_json::json!({
-                        "unknown_feature": true  // This should trigger validation error
+                        "unknown_feature": true
                     })),
                 },
                 terminal: true,
@@ -5399,19 +5381,9 @@ mod tests {
 
         let result = agent.initialize(request).await;
         assert!(
-            result.is_err(),
-            "Unknown filesystem capability should be rejected"
+            result.is_ok(),
+            "Unknown filesystem capability should be accepted for forward compatibility"
         );
-
-        let error = result.unwrap_err();
-        assert_eq!(error.code, -32602, "Should be Invalid params error");
-        assert!(error.message.contains("unknown file system feature"));
-
-        // Verify structured error data
-        assert!(error.data.is_some());
-        let data = error.data.unwrap();
-        assert_eq!(data["invalidCapability"], "unknown_feature");
-        assert!(data["supportedCapabilities"].is_array());
     }
 
     #[tokio::test]
