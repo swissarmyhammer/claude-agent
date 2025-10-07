@@ -275,7 +275,18 @@ impl ClaudeAgentServer {
             .cloned()
             .unwrap_or(serde_json::Value::Null);
 
-        info!("Handling request: method={}, id={:?}", method, id);
+        let is_notification = id.is_none();
+
+        info!(
+            "Handling {}: method={}, id={:?}",
+            if is_notification {
+                "notification"
+            } else {
+                "request"
+            },
+            method,
+            id
+        );
 
         // Route to appropriate agent method
         let response_result = match method {
@@ -321,6 +332,13 @@ impl ClaudeAgentServer {
                     .await
                     .map(|r| serde_json::to_value(r).unwrap())
             }
+            "session/cancel" => {
+                let req = serde_json::from_value(params)?;
+                agent
+                    .cancel(req)
+                    .await
+                    .map(|_| serde_json::Value::Null)
+            }
             // Handle extension methods through ext_method
             _ => {
                 let params_raw = agent_client_protocol::RawValue::from_string(params.to_string())
@@ -348,7 +366,22 @@ impl ClaudeAgentServer {
             }
         };
 
-        // Send response
+        // Only send response for requests (not notifications)
+        // Per JSON-RPC 2.0 spec: "The Server MUST NOT reply to a Notification"
+        if is_notification {
+            // For notifications, log the result but do not send a response
+            match response_result {
+                Ok(_) => {
+                    info!("Notification {} processed successfully", method);
+                }
+                Err(e) => {
+                    error!("Notification {} failed: {}", method, e);
+                }
+            }
+            return Ok(());
+        }
+
+        // Send response for requests
         let response = match response_result {
             Ok(result) => {
                 serde_json::json!({
@@ -778,5 +811,204 @@ mod tests {
         // Verify meta value is correct
         let meta = params.get("_meta").unwrap().as_object().unwrap();
         assert!(meta.get("test").unwrap().as_bool().unwrap());
+    }
+
+    /// Test that notifications (requests without an id field) do not receive responses.
+    /// Per JSON-RPC 2.0 spec: "The Server MUST NOT reply to a Notification."
+    #[tokio::test]
+    async fn test_notifications_do_not_receive_responses() {
+        let server = create_test_server().await;
+
+        let (mut client_writer, server_reader) = duplex(sizes::buffers::DUPLEX_STREAM_BUFFER);
+        let (server_writer, mut client_reader) = duplex(sizes::buffers::DUPLEX_STREAM_BUFFER);
+
+        let server_task = async {
+            server
+                .start_with_streams(server_reader, server_writer)
+                .await
+        };
+
+        let client_task = async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+            // Send a notification (no id field) - using session/cancel as an example
+            let notification = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": {
+                    "sessionId": "test-session-123"
+                }
+            });
+
+            let notification_line = format!("{}\n", serde_json::to_string(&notification).unwrap());
+            client_writer
+                .write_all(notification_line.as_bytes())
+                .await
+                .unwrap();
+            client_writer.flush().await.unwrap();
+
+            // Send a valid request afterwards to ensure server is still responsive
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "initialize",
+                "params": {
+                    "client_capabilities": {
+                        "fs": {
+                            "read_text_file": true,
+                            "write_text_file": true
+                        },
+                        "terminal": true
+                    },
+                    "protocolVersion": "1.0.0"
+                }
+            });
+
+            let request_line = format!("{}\n", serde_json::to_string(&request).unwrap());
+            client_writer
+                .write_all(request_line.as_bytes())
+                .await
+                .unwrap();
+            client_writer.flush().await.unwrap();
+
+            // Read ALL responses to see what the server actually sends
+            let mut reader = BufReader::new(&mut client_reader);
+            let mut responses = Vec::new();
+
+            // Read up to 2 lines with a timeout
+            for i in 0..2 {
+                let mut line = String::new();
+                let read_result = tokio::time::timeout(
+                    tokio::time::Duration::from_millis(500),
+                    reader.read_line(&mut line),
+                )
+                .await;
+
+                if read_result.is_ok() && !line.trim().is_empty() {
+                    println!("Response {}: {}", i, line);
+                    responses.push(line);
+                } else {
+                    break;
+                }
+            }
+
+            // We should receive EXACTLY 1 response (for the request with id=99)
+            assert_eq!(
+                responses.len(),
+                1,
+                "Should receive exactly 1 response (for id=99), but got {}. Responses: {:?}",
+                responses.len(),
+                responses
+            );
+
+            let response: serde_json::Value = serde_json::from_str(&responses[0]).unwrap();
+            assert_eq!(
+                response.get("id").and_then(|v| v.as_i64()),
+                Some(99),
+                "The single response should be for id=99. Got: {:?}",
+                response
+            );
+
+            // Verify no id:null response was sent
+            for resp_str in &responses {
+                let resp: serde_json::Value = serde_json::from_str(resp_str).unwrap();
+                assert!(
+                    !resp.get("id").map(|v| v.is_null()).unwrap_or(false),
+                    "Should not receive a response with id:null (would be notification response). Got: {:?}",
+                    resp
+                );
+            }
+
+            // Close the streams
+            drop(client_writer);
+            drop(reader);
+        };
+
+        let client_handle = tokio::spawn(client_task);
+
+        // Run server directly without spawning
+        let (server_result, _) = tokio::join!(server_task, client_handle);
+
+        server_result.expect("Server should complete successfully");
+    }
+
+    /// Test that requests (with an id field) still receive responses.
+    /// This ensures we don't break normal request/response behavior.
+    #[tokio::test]
+    async fn test_requests_receive_responses() {
+        let server = create_test_server().await;
+
+        let (mut client_writer, server_reader) = duplex(sizes::buffers::DUPLEX_STREAM_BUFFER);
+        let (server_writer, mut client_reader) = duplex(sizes::buffers::DUPLEX_STREAM_BUFFER);
+
+        let server_task = async {
+            server
+                .start_with_streams(server_reader, server_writer)
+                .await
+        };
+
+        let client_task = async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+            // Send a request (with id field)
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "initialize",
+                "params": {
+                    "client_capabilities": {
+                        "fs": {
+                            "read_text_file": true,
+                            "write_text_file": true
+                        },
+                        "terminal": true
+                    },
+                    "protocolVersion": "1.0.0"
+                }
+            });
+
+            let request_line = format!("{}\n", serde_json::to_string(&request).unwrap());
+            client_writer
+                .write_all(request_line.as_bytes())
+                .await
+                .unwrap();
+            client_writer.flush().await.unwrap();
+
+            // Should receive a response
+            let mut reader = BufReader::new(&mut client_reader);
+            let mut response_line = String::new();
+
+            let read_result = tokio::time::timeout(
+                tokio::time::Duration::from_secs(5),
+                reader.read_line(&mut response_line),
+            )
+            .await;
+
+            assert!(
+                read_result.is_ok(),
+                "Request should receive a response"
+            );
+            assert!(
+                !response_line.is_empty(),
+                "Response should not be empty"
+            );
+
+            let response: serde_json::Value = serde_json::from_str(&response_line).unwrap();
+            assert_eq!(
+                response.get("id").unwrap().as_i64().unwrap(),
+                42,
+                "Response id should match request id"
+            );
+
+            drop(client_writer);
+            drop(reader);
+        };
+
+        let client_handle = tokio::spawn(client_task);
+
+        // Run both concurrently
+        let (server_result, _) = tokio::join!(server_task, client_handle);
+
+        server_result.expect("Server should complete successfully");
     }
 }

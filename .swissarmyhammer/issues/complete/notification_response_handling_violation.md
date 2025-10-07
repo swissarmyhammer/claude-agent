@@ -151,3 +151,82 @@ Add tests for:
 - [JSON-RPC 2.0 Specification - Notification](https://www.jsonrpc.org/specification#notification)
 - [ACP Protocol Overview - Notifications](https://agentclientprotocol.com/protocol/overview#notifications)
 - [ACP Cancellation](https://agentclientprotocol.com/protocol/prompt-turn#cancellation)
+
+
+## Proposed Solution
+
+After analyzing the server.rs code at lib/src/server.rs:248-349, I've identified the exact problem and solution:
+
+### Root Cause
+The `handle_single_request` function extracts the `id` field (line 248) but then ALWAYS sends a response (line 349), regardless of whether `id` is `None` (notification) or `Some(value)` (request). This violates both JSON-RPC 2.0 and ACP specifications.
+
+### Implementation Strategy
+
+1. **Add notification detection**: After extracting `id`, check if it's `None` to determine if this is a notification
+2. **Skip response for notifications**: Only call `send_response` when `id.is_some()`
+3. **Add explicit session/cancel handler**: Currently not in the match statement, needs to be added as a notification handler
+4. **Maintain backward compatibility**: All existing request handling remains unchanged
+
+### Code Changes Required
+
+In `handle_single_request` (lines 232-352):
+- Add `let is_notification = id.is_none();` after line 248
+- Add `"session/cancel"` case in the match statement (around line 257)
+- Wrap the response sending (lines 327-351) in `if !is_notification { ... }`
+- Return early from notification handlers without sending responses
+
+### Test Strategy (TDD)
+
+1. Test that notifications (id=None) execute methods but don't send responses
+2. Test that session/cancel is handled properly
+3. Test that requests (id=Some) continue to receive responses
+4. Test that extension notifications work correctly
+
+### Files to Modify
+- `lib/src/server.rs` - Main implementation changes
+- Add tests to the existing test module at bottom of server.rs
+
+### Notes
+- The agent trait methods will still be called for notifications (to perform their actions)
+- Only the response sending step is skipped for notifications
+- This aligns with the JSON-RPC 2.0 spec requirement: "The Server MUST NOT reply to a Notification"
+
+
+
+## Implementation Notes
+
+### Changes Made
+
+1. **Added notification detection** (lib/src/server.rs:280):
+   - Added `let is_notification = id.is_none();` after extracting the id field
+   - This clearly identifies whether we're handling a notification or a request
+
+2. **Added explicit session/cancel handler** (lib/src/server.rs:326-331):
+   - Added explicit match case for "session/cancel" method
+   - Calls `agent.cancel(req).await` and returns null result
+   - Now properly routed instead of falling through to extension method handler
+
+3. **Skip response for notifications** (lib/src/server.rs:362-375):
+   - Added check: `if is_notification { return Ok(()); }`
+   - Notifications are executed but no response is sent back
+   - Logs success/failure for debugging but doesn't construct JSON-RPC response
+   - Only requests (with id field) proceed to response construction and sending
+
+### Test Coverage
+
+Added two comprehensive tests:
+- `test_notifications_do_not_receive_responses`: Verifies that notifications don't generate responses
+- `test_requests_receive_responses`: Ensures normal request/response flow still works
+
+### Verification
+
+All 685 tests pass, including:
+- Existing integration tests
+- New notification handling tests
+- All server communication tests
+
+### Compliance
+
+The implementation now fully complies with:
+- **JSON-RPC 2.0 Specification**: "The Server MUST NOT reply to a Notification"
+- **ACP Specification**: session/cancel is properly handled as a notification without response
