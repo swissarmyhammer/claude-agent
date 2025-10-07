@@ -608,13 +608,42 @@ impl ConversationManager {
                     status: ToolExecutionStatus::Error,
                     output: error,
                 },
-                Ok(ToolCallResult::PermissionRequired(_)) => {
-                    // For now, treat permission required as an error
-                    // Full permission handling would require user interaction
+                Ok(ToolCallResult::PermissionRequired(permission_request)) => {
+                    // Permission handling in multi-turn conversations:
+                    // The ToolCallHandler has determined this tool requires user permission.
+                    // In the context of multi-turn LM conversations, we convert this to
+                    // an informative error that the LM can understand and respond to.
+                    // This maintains conversation flow while respecting security boundaries.
+                    //
+                    // The permission request contains:
+                    // - tool_name: What tool was requested
+                    // - description: Human-readable explanation
+                    // - options: Available permission choices
+                    //
+                    // We format this information so the LM understands the tool cannot
+                    // execute without explicit user permission.
+                    let permission_message = format!(
+                        "Permission required: {} - {}. Available options: {}",
+                        permission_request.tool_name,
+                        permission_request.description,
+                        permission_request
+                            .options
+                            .iter()
+                            .map(|opt| format!("{} ({})", opt.name, opt.option_id))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+
+                    tracing::info!(
+                        tool_call_id = %tool_call.id,
+                        tool_name = %permission_request.tool_name,
+                        "Tool execution blocked pending permission"
+                    );
+
                     ToolExecutionResult {
                         tool_call_id: tool_call.id.clone(),
                         status: ToolExecutionStatus::PermissionRequired,
-                        output: "Tool requires permission".to_string(),
+                        output: permission_message,
                     }
                 }
                 Err(e) => ToolExecutionResult {
@@ -634,6 +663,7 @@ impl ConversationManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::{PermissionOption, PermissionOptionKind};
 
     #[test]
     fn test_token_usage_estimation() {
@@ -647,5 +677,153 @@ mod tests {
     fn test_tool_execution_status() {
         assert_eq!(ToolExecutionStatus::Success, ToolExecutionStatus::Success);
         assert_ne!(ToolExecutionStatus::Success, ToolExecutionStatus::Error);
+    }
+
+    #[test]
+    fn test_tool_execution_status_permission_required() {
+        // Verify PermissionRequired is a distinct status
+        assert_ne!(
+            ToolExecutionStatus::PermissionRequired,
+            ToolExecutionStatus::Success
+        );
+        assert_ne!(
+            ToolExecutionStatus::PermissionRequired,
+            ToolExecutionStatus::Error
+        );
+        assert_eq!(
+            ToolExecutionStatus::PermissionRequired,
+            ToolExecutionStatus::PermissionRequired
+        );
+    }
+
+    #[test]
+    fn test_permission_request_formatting() {
+        // Test that permission request details are properly formatted
+        let permission_request = crate::tools::PermissionRequest {
+            tool_request_id: "test_tool_call_123".to_string(),
+            tool_name: "fs_write".to_string(),
+            description: "Write to file /etc/hosts".to_string(),
+            arguments: serde_json::json!({"path": "/etc/hosts", "content": "test"}),
+            options: vec![
+                PermissionOption {
+                    option_id: "allow_once".to_string(),
+                    name: "Allow Once".to_string(),
+                    kind: PermissionOptionKind::AllowOnce,
+                },
+                PermissionOption {
+                    option_id: "allow_always".to_string(),
+                    name: "Allow Always".to_string(),
+                    kind: PermissionOptionKind::AllowAlways,
+                },
+                PermissionOption {
+                    option_id: "reject_once".to_string(),
+                    name: "Reject Once".to_string(),
+                    kind: PermissionOptionKind::RejectOnce,
+                },
+            ],
+        };
+
+        // Format the permission message as done in execute_tools
+        let permission_message = format!(
+            "Permission required: {} - {}. Available options: {}",
+            permission_request.tool_name,
+            permission_request.description,
+            permission_request
+                .options
+                .iter()
+                .map(|opt| format!("{} ({})", opt.name, opt.option_id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        // Verify the message contains all critical information
+        assert!(permission_message.contains("Permission required"));
+        assert!(permission_message.contains("fs_write"));
+        assert!(permission_message.contains("/etc/hosts"));
+        assert!(permission_message.contains("Allow Once"));
+        assert!(permission_message.contains("allow_once"));
+        assert!(permission_message.contains("Allow Always"));
+        assert!(permission_message.contains("allow_always"));
+        assert!(permission_message.contains("Reject Once"));
+        assert!(permission_message.contains("reject_once"));
+    }
+
+    #[test]
+    fn test_tool_call_request_structure() {
+        // Verify ToolCallRequest has the expected structure for tool execution
+        let tool_call = ToolCallRequest {
+            id: "call_123".to_string(),
+            name: "fs_read".to_string(),
+            arguments: serde_json::json!({"path": "/tmp/test.txt"}),
+        };
+
+        assert_eq!(tool_call.id, "call_123");
+        assert_eq!(tool_call.name, "fs_read");
+        assert_eq!(
+            tool_call.arguments,
+            serde_json::json!({"path": "/tmp/test.txt"})
+        );
+    }
+
+    #[test]
+    fn test_tool_execution_result_permission_required() {
+        // Test that ToolExecutionResult can properly represent permission required status
+        let result = ToolExecutionResult {
+            tool_call_id: "call_456".to_string(),
+            status: ToolExecutionStatus::PermissionRequired,
+            output: "Permission required: fs_write - Write to protected file".to_string(),
+        };
+
+        assert_eq!(result.tool_call_id, "call_456");
+        assert_eq!(result.status, ToolExecutionStatus::PermissionRequired);
+        assert!(result.output.contains("Permission required"));
+        assert!(result.output.contains("fs_write"));
+    }
+
+    #[test]
+    fn test_lm_message_types() {
+        // Verify all message types can be created and matched
+        let user_msg = LmMessage::User {
+            content: "Hello".to_string(),
+        };
+        let assistant_msg = LmMessage::Assistant {
+            content: "Hi there".to_string(),
+        };
+        let tool_call_msg = LmMessage::ToolCall {
+            id: "call_1".to_string(),
+            name: "test_tool".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let tool_result_msg = LmMessage::ToolResult {
+            tool_call_id: "call_1".to_string(),
+            output: "Success".to_string(),
+        };
+
+        // Verify pattern matching works
+        match user_msg {
+            LmMessage::User { content } => assert_eq!(content, "Hello"),
+            _ => panic!("Wrong message type"),
+        }
+        match assistant_msg {
+            LmMessage::Assistant { content } => assert_eq!(content, "Hi there"),
+            _ => panic!("Wrong message type"),
+        }
+        match tool_call_msg {
+            LmMessage::ToolCall { id, name, .. } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "test_tool");
+            }
+            _ => panic!("Wrong message type"),
+        }
+        match tool_result_msg {
+            LmMessage::ToolResult {
+                tool_call_id,
+                output,
+            } => {
+                assert_eq!(tool_call_id, "call_1");
+                assert_eq!(output, "Success");
+            }
+            _ => panic!("Wrong message type"),
+        }
     }
 }

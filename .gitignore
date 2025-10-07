@@ -5,6 +5,7 @@ mcp.log
 .swissarmyhammer/semantic.db
 .swissarmyhammer/todo/
 .swissarmyhammer/workflow-runs/
+TEST_FAILURES.md
 
 # Rust
 /target/
