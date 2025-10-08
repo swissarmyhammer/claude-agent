@@ -97,8 +97,9 @@
 use crate::session::SessionId;
 use crate::{AgentError, Result};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -329,14 +330,17 @@ impl ClaudeProcess {
     pub async fn write_line(&mut self, line: &str) -> Result<()> {
         self.stdin
             .write_all(line.as_bytes())
+            .await
             .map_err(|e| AgentError::Internal(format!("Failed to write to claude stdin: {}", e)))?;
 
         self.stdin
             .write_all(b"\n")
+            .await
             .map_err(|e| AgentError::Internal(format!("Failed to write newline: {}", e)))?;
 
         self.stdin
             .flush()
+            .await
             .map_err(|e| AgentError::Internal(format!("Failed to flush claude stdin: {}", e)))?;
 
         tracing::trace!("Wrote line to session {}: {}", self.session_id, line);
@@ -351,7 +355,7 @@ impl ClaudeProcess {
     /// Returns error if read fails (but not on EOF)
     pub async fn read_line(&mut self) -> Result<Option<String>> {
         let mut line = String::new();
-        let bytes_read = self.stdout.read_line(&mut line).map_err(|e| {
+        let bytes_read = self.stdout.read_line(&mut line).await.map_err(|e| {
             AgentError::Internal(format!("Failed to read from claude stdout: {}", e))
         })?;
 
@@ -374,7 +378,7 @@ impl ClaudeProcess {
     /// Returns error if read fails (but not on EOF)
     pub async fn read_stderr_line(&mut self) -> Result<Option<String>> {
         let mut line = String::new();
-        let bytes_read = self.stderr.read_line(&mut line).map_err(|e| {
+        let bytes_read = self.stderr.read_line(&mut line).await.map_err(|e| {
             AgentError::Internal(format!("Failed to read from claude stderr: {}", e))
         })?;
 
