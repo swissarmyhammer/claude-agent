@@ -215,7 +215,7 @@ pub enum AgentError {
 impl ToJsonRpcError for AgentError {
     fn to_json_rpc_code(&self) -> i32 {
         match self {
-            AgentError::Process(_) => -32000,        // Server error
+            AgentError::Process(_) => -32000, // Server error
             AgentError::Mcp(mcp_error) => mcp_error.to_json_rpc_code(),
             AgentError::PathValidation(_) => -32602, // Invalid params
             AgentError::Protocol(_) => -32600,       // Invalid Request

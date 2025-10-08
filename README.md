@@ -10,7 +10,7 @@ Claude Agent provides a bridge between the Agent Client Protocol and Claude Code
 
 - **Library (`claude-agent-lib`)**: Core ACP server implementation
 - **CLI (`claude-agent-cli`)**: Simple command-line interface to start the server
-- **Integration Layer**: Bridge between ACP and Claude Code via claude-sdk-rs
+- **Integration Layer**: Direct integration with Claude Code CLI via process management and protocol translation
 
 ## Building
 

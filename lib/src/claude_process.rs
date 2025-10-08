@@ -59,7 +59,7 @@
 //!
 //! // Get the process and interact with it
 //! let process = manager.get_process(&session_id).await?;
-//! let mut proc = process.lock().unwrap();
+//! let mut proc = process.lock().await;
 //!
 //! // Write a JSON-RPC message
 //! proc.write_line(r#"{"jsonrpc":"2.0","method":"initialize","params":{},"id":1}"#).await?;
@@ -99,8 +99,9 @@ use crate::{AgentError, Result};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 /// Claude CLI command-line arguments for stream-json communication
 const CLAUDE_CLI_ARGS: &[&str] = &[
@@ -155,7 +156,7 @@ impl ClaudeProcessManager {
         let mut processes = self.processes.write().map_err(|_| {
             AgentError::Internal("Failed to acquire write lock on processes".to_string())
         })?;
-        
+
         if processes.contains_key(&session_id) {
             // Process already exists, this is fine - just return success
             tracing::debug!("Process already exists for session {}", session_id);
@@ -164,7 +165,11 @@ impl ClaudeProcessManager {
 
         // Spawn new process
         let process = ClaudeProcess::spawn(session_id).map_err(|e| {
-            tracing::error!("Failed to spawn claude process for session {}: {}", session_id, e);
+            tracing::error!(
+                "Failed to spawn claude process for session {}: {}",
+                session_id,
+                e
+            );
             e
         })?;
 
@@ -191,7 +196,10 @@ impl ClaudeProcessManager {
         }
 
         // Process doesn't exist, spawn one
-        tracing::info!("No process found for session {}, spawning new one", session_id);
+        tracing::info!(
+            "No process found for session {}, spawning new one",
+            session_id
+        );
         self.spawn_for_session(*session_id).await?;
 
         // Get the newly spawned process
@@ -199,10 +207,9 @@ impl ClaudeProcessManager {
             AgentError::Internal("Failed to acquire read lock on processes".to_string())
         })?;
 
-        processes
-            .get(session_id)
-            .cloned()
-            .ok_or_else(|| AgentError::Internal("Process spawn succeeded but not found in map".to_string()))
+        processes.get(session_id).cloned().ok_or_else(|| {
+            AgentError::Internal("Process spawn succeeded but not found in map".to_string())
+        })
     }
 
     /// Terminate a session's process
@@ -223,9 +230,7 @@ impl ClaudeProcessManager {
             let process = Arc::try_unwrap(process_arc).map_err(|_| {
                 AgentError::Internal("Process still has multiple references".to_string())
             })?;
-            let process = process
-                .into_inner()
-                .map_err(|_| AgentError::Internal("Failed to acquire process mutex".to_string()))?;
+            let process = process.into_inner();
 
             process.shutdown().await?;
             tracing::info!("Terminated claude process for session {}", session_id);
@@ -567,11 +572,14 @@ mod tests {
 
         // get_process now auto-spawns processes if they don't exist
         let result = manager.get_process(&session_id).await;
-        assert!(result.is_ok(), "get_process should auto-spawn if process doesn't exist");
+        assert!(
+            result.is_ok(),
+            "get_process should auto-spawn if process doesn't exist"
+        );
 
         // Verify the process was spawned by checking session_id matches
         let process = result.unwrap();
-        assert_eq!(process.lock().unwrap().session_id(), session_id);
+        assert_eq!(process.lock().await.session_id(), session_id);
 
         // Cleanup
         let _ = manager.terminate_session(&session_id).await;
@@ -798,7 +806,7 @@ mod tests {
                 // Note: is_alive() is async but we can't hold MutexGuard across await
                 // So we just verify the process exists and is accessible
                 {
-                    let proc = process_arc.lock().unwrap();
+                    let proc = process_arc.lock().await;
                     let _session = proc.session_id();
                 } // Drop lock immediately
 

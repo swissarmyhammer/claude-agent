@@ -17,7 +17,6 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Agent protocol
 agent-client-protocol = "0.4.3"
-claude-sdk-rs = { version = "1.0.1", features = ["full"] }
 async-trait = "0.1"
 ulid = { version = "1.1", features = ["serde"] }
 

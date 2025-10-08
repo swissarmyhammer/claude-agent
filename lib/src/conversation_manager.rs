@@ -450,8 +450,8 @@ impl ConversationManager {
 
     /// Send a request to the language model in non-streaming mode
     ///
-    /// Note: Non-streaming mode cannot extract tool calls because claude-sdk-rs
-    /// wraps the Claude Code CLI which only returns text in non-streaming mode.
+    /// Note: Non-streaming mode cannot extract tool calls because the
+    /// Claude Code CLI only returns text in non-streaming mode.
     /// For multi-turn conversations with tool calls, use streaming mode.
     async fn send_to_lm_non_streaming(
         &self,
@@ -509,9 +509,8 @@ impl ConversationManager {
     ///
     /// # Note
     ///
-    /// This returns a text string because claude-sdk-rs wraps the Claude Code CLI,
-    /// which accepts text prompts. The claude-sdk-rs `Message` enum is only for
-    /// parsing streaming responses, not for sending structured requests.
+    /// This returns a text string because the Claude Code CLI accepts text prompts.
+    /// The structured `LmMessage` types are converted to text format for the CLI.
     fn build_prompt_from_messages(&self, messages: &[LmMessage]) -> String {
         let mut prompt = String::new();
 

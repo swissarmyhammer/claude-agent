@@ -2,10 +2,10 @@
 
 use agent_client_protocol::{ContentBlock, SessionUpdate, TextContent};
 use futures::stream::Stream;
-use std::sync::{Arc, Mutex};
 use std::pin::Pin;
-
+use std::sync::Arc;
 use std::time::SystemTime;
+use tokio::sync::Mutex;
 
 use crate::{
     claude_process::{ClaudeProcess, ClaudeProcessManager},
@@ -137,7 +137,7 @@ impl ClaudeClient {
         })];
         let stream_json = ProtocolTranslator::acp_to_stream_json(content)?;
 
-        let mut proc = process.lock().unwrap();
+        let mut proc = process.lock().await;
         proc.write_line(&stream_json).await?;
         Ok(())
     }
@@ -165,15 +165,14 @@ impl ClaudeClient {
         let process = self.process_manager.get_process(session_id).await?;
 
         // Send prompt to process
-        self.send_prompt_to_process(process.clone(), prompt)
-            .await?;
+        self.send_prompt_to_process(process.clone(), prompt).await?;
 
         // Read response lines until we get a result
         let mut response_text = String::new();
         let acp_session_id = Self::to_acp_session_id(session_id);
         loop {
             let line = {
-                let mut proc = process.lock().unwrap();
+                let mut proc = process.lock().await;
                 proc.read_line().await?
             };
 
@@ -182,10 +181,11 @@ impl ClaudeClient {
                     if let Ok(Some(notification)) =
                         ProtocolTranslator::stream_json_to_acp(&line, &acp_session_id)
                     {
-                        if let SessionUpdate::AgentMessageChunk { content } = notification.update {
-                            if let ContentBlock::Text(text) = content {
-                                response_text.push_str(&text.text);
-                            }
+                        if let SessionUpdate::AgentMessageChunk {
+                            content: ContentBlock::Text(text),
+                        } = notification.update
+                        {
+                            response_text.push_str(&text.text);
                         }
                     }
                     // Check if this is a result message (indicates end)
@@ -216,21 +216,19 @@ impl ClaudeClient {
         let process = self.process_manager.get_process(session_id).await?;
 
         // Send prompt to process
-        self.send_prompt_to_process(process.clone(), prompt)
-            .await?;
+        self.send_prompt_to_process(process.clone(), prompt).await?;
 
         // Create a channel-based stream to avoid holding mutex across await
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let process_clone = process.clone();
         let acp_session_id = Self::to_acp_session_id(session_id);
 
-        // Spawn a blocking task to read from the process and send chunks
-        tokio::task::spawn_blocking(move || {
-            let runtime = tokio::runtime::Handle::current();
+        // Spawn an async task to read from the process and send chunks
+        tokio::task::spawn(async move {
             loop {
                 let line = {
-                    let mut proc = process_clone.lock().unwrap();
-                    match runtime.block_on(proc.read_line()) {
+                    let mut proc = process_clone.lock().await;
+                    match proc.read_line().await {
                         Ok(Some(line)) => line,
                         Ok(None) => break,
                         Err(_) => break,
@@ -291,9 +289,9 @@ impl ClaudeClient {
             "Sending request to Claude process (prompt length: {} chars)",
             full_conversation.len()
         );
-        
+
         let response = self.query(&full_conversation, &context.session_id).await?;
-        
+
         tracing::info!(
             "Received response from Claude process (content length: {} chars)",
             response.len()
@@ -331,7 +329,6 @@ impl ClaudeClient {
         self.query_stream(&full_conversation, &context.session_id)
             .await
     }
-
 }
 
 impl SessionContext {

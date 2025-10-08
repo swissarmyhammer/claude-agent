@@ -10,13 +10,13 @@ Create a Rust library and CLI tool to implement an Agent Client Protocol (ACP) s
 
 1. **Library (`claude-agent-lib`)**: Core ACP server implementation
 2. **CLI (`claude-agent-cli`)**: Simple command-line interface to start the server
-3. **Integration Layer**: Bridge between ACP and Claude Code via claude-sdk-rs
+3. **Integration Layer**: Direct integration with Claude Code CLI via process management and protocol translation
 
 ### Technology Stack
 
 - **Language**: Rust (for performance, safety, and ecosystem alignment)
 - **ACP Protocol**: `agent-client-protocol` crate (v0.4.3)
-- **Claude Integration**: `claude-sdk-rs` crate (v1.0.1) 
+- **Claude Integration**: Direct CLI process management with JSON-RPC protocol translation
 - **Transport**: JSON-RPC over stdio (standard ACP pattern)
 - **Logging**: `tracing` and `tracing-subscriber`
 - **Async Runtime**: `tokio`
@@ -56,7 +56,6 @@ claude-agent/
 ```toml
 [dependencies]
 agent-client-protocol = "0.4.3"
-claude-sdk-rs = { version = "1.0.1", features = ["full"] }
 tokio = { version = "1.40", features = ["macros", "rt", "io-std", "process"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 log = "0.4"
@@ -207,12 +206,12 @@ impl acp::Agent for ClaudeAgent {
 
 #### 2.2 Claude Integration Layer (`lib/src/claude.rs`)
 
-Wrapper around `claude-sdk-rs` to provide:
+Direct integration with Claude Code CLI:
 
 ```rust
 pub struct ClaudeClient {
-    client: claude_sdk_rs::Client,
-    config: claude_sdk_rs::Config,
+    process_manager: ClaudeProcessManager,
+    protocol_translator: ProtocolTranslator,
 }
 
 impl ClaudeClient {
@@ -224,9 +223,9 @@ impl ClaudeClient {
 ```
 
 **Configuration:**
-- Use JSON streaming mode for real-time updates
+- Use JSON streaming mode via CLI for real-time updates
 - Session persistence for conversation context
-- Tool call integration
+- Tool call integration via protocol translation
 - Error handling and retry logic
 
 #### 2.3 Session Management (`lib/src/session.rs`)
