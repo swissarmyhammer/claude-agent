@@ -2411,9 +2411,14 @@ impl Agent for ClaudeAgent {
             return Err(self.convert_session_setup_error_to_acp_error(validation_error));
         }
 
+        let client_caps = {
+            let guard = self.client_capabilities.read().await;
+            guard.clone()
+        };
+
         let session_id = self
             .session_manager
-            .create_session(request.cwd.clone())
+            .create_session(request.cwd.clone(), client_caps)
             .map_err(|_e| agent_client_protocol::Error::internal_error())?;
 
         // Store MCP servers in the session if provided

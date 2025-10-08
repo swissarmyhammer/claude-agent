@@ -1919,7 +1919,7 @@ mod tests {
     ) -> (ToolCallHandler, SessionId) {
         // Create a session in the session manager
         let internal_session_id = session_manager
-            .create_session(session_dir.to_path_buf())
+            .create_session(session_dir.to_path_buf(), None)
             .unwrap();
 
         // Create ACP-compliant session ID
@@ -3041,7 +3041,7 @@ mod tests {
 
         // Create test session
         let session_id = session_manager
-            .create_session(temp_dir.path().to_path_buf())
+            .create_session(temp_dir.path().to_path_buf(), None)
             .unwrap();
 
         // Test terminal creation with all parameters
@@ -3100,7 +3100,7 @@ mod tests {
 
         // Create test session
         let session_id = session_manager
-            .create_session(temp_dir.path().to_path_buf())
+            .create_session(temp_dir.path().to_path_buf(), None)
             .unwrap();
 
         // Test terminal creation with minimal parameters
@@ -3267,7 +3267,7 @@ mod tests {
 
         // Create test session with specific working directory
         let session_id = session_manager
-            .create_session(temp_dir.path().to_path_buf())
+            .create_session(temp_dir.path().to_path_buf(), None)
             .unwrap();
 
         // Test using session's working directory (no cwd parameter)
@@ -3313,7 +3313,7 @@ mod tests {
 
         // Create test session
         let session_id = session_manager
-            .create_session(temp_dir.path().to_path_buf())
+            .create_session(temp_dir.path().to_path_buf(), None)
             .unwrap();
 
         // Test ACP terminal/create handler
@@ -3970,7 +3970,7 @@ mod tests {
 
         // Create a valid session
         let session_id = session_manager
-            .create_session(temp_dir.path().to_path_buf())
+            .create_session(temp_dir.path().to_path_buf(), None)
             .unwrap();
 
         // Create tool request for file read
@@ -4045,7 +4045,7 @@ mod tests {
 
         // Create session with session_dir as working directory
         let session_id = session_manager
-            .create_session(session_dir.path().to_path_buf())
+            .create_session(session_dir.path().to_path_buf(), None)
             .unwrap();
 
         let acp_session_id = agent_client_protocol::SessionId(session_id.to_string().into());
@@ -4124,10 +4124,10 @@ mod tests {
 
         // Create two sessions
         let session_id1 = session_manager
-            .create_session(temp_dir.path().to_path_buf())
+            .create_session(temp_dir.path().to_path_buf(), None)
             .unwrap();
         let session_id2 = session_manager
-            .create_session(temp_dir.path().to_path_buf())
+            .create_session(temp_dir.path().to_path_buf(), None)
             .unwrap();
 
         let acp_session_id1 = agent_client_protocol::SessionId(session_id1.to_string().into());

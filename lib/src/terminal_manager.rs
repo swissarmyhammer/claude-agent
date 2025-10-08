@@ -973,7 +973,7 @@ mod tests {
         session_manager: &crate::session::SessionManager,
     ) -> crate::Result<(String, String)> {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let session_id = session_manager.create_session(cwd)?;
+        let session_id = session_manager.create_session(cwd, None)?;
         let session_id_str = session_id.to_string();
 
         let params = TerminalCreateParams {
@@ -1046,7 +1046,7 @@ mod tests {
         let session_manager = create_test_session_manager().await;
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let session_id = session_manager.create_session(cwd).unwrap();
+        let session_id = session_manager.create_session(cwd, None).unwrap();
 
         let params = TerminalReleaseParams {
             session_id: session_id.to_string(),
@@ -1200,7 +1200,7 @@ mod tests {
         let session_manager = create_test_session_manager().await;
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let session_id = session_manager.create_session(cwd).unwrap();
+        let session_id = session_manager.create_session(cwd, None).unwrap();
 
         let params = TerminalCreateParams {
             session_id: session_id.to_string(),
@@ -1332,7 +1332,7 @@ mod tests {
         let session_manager = create_test_session_manager().await;
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let session_id = session_manager.create_session(cwd).unwrap();
+        let session_id = session_manager.create_session(cwd, None).unwrap();
 
         let params = TerminalCreateParams {
             session_id: session_id.to_string(),
@@ -1390,7 +1390,7 @@ mod tests {
         let session_manager = Arc::new(create_test_session_manager().await);
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let session_id = session_manager.create_session(cwd).unwrap();
+        let session_id = session_manager.create_session(cwd, None).unwrap();
 
         let params = TerminalCreateParams {
             session_id: session_id.to_string(),
@@ -1501,7 +1501,7 @@ mod tests {
         let session_manager = create_test_session_manager().await;
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let session_id = session_manager.create_session(cwd).unwrap();
+        let session_id = session_manager.create_session(cwd, None).unwrap();
 
         let params = TerminalCreateParams {
             session_id: session_id.to_string(),

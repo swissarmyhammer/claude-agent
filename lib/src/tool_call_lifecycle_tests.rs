@@ -560,7 +560,7 @@ mod tests {
         // Create a session first (required for terminal creation)
         let session_manager = handler.get_session_manager();
         let internal_session_id = session_manager
-            .create_session(std::path::PathBuf::from("/tmp"))
+            .create_session(std::path::PathBuf::from("/tmp"), None)
             .expect("Should create session");
 
         // Internal session ID already has proper ACP format

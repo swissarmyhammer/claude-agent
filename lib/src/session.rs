@@ -386,14 +386,15 @@ impl SessionManager {
     /// Returns error if:
     /// - Working directory validation fails
     /// - Session storage write lock cannot be acquired
-    pub fn create_session(&self, cwd: PathBuf) -> crate::Result<SessionId> {
+    pub fn create_session(&self, cwd: PathBuf, client_capabilities: Option<agent_client_protocol::ClientCapabilities>) -> crate::Result<SessionId> {
         // Validate working directory before creating session
         crate::session_validation::validate_working_directory(&cwd).map_err(|e| {
             crate::AgentError::Session(format!("Working directory validation failed: {}", e))
         })?;
 
         let session_id = SessionId::new();
-        let session = Session::new(session_id, cwd);
+        let mut session = Session::new(session_id, cwd);
+        session.client_capabilities = client_capabilities;
 
         let mut sessions = self
             .sessions
@@ -747,7 +748,7 @@ mod tests {
         let manager = SessionManager::new();
         let cwd = std::env::current_dir().unwrap();
 
-        let session_id = manager.create_session(cwd.clone()).unwrap();
+        let session_id = manager.create_session(cwd.clone(), None).unwrap();
         let session = manager.get_session(&session_id).unwrap();
 
         assert!(session.is_some());
@@ -769,7 +770,7 @@ mod tests {
     fn test_update_session() {
         let manager = SessionManager::new();
         let cwd = std::env::current_dir().unwrap();
-        let session_id = manager.create_session(cwd).unwrap();
+        let session_id = manager.create_session(cwd, None).unwrap();
 
         let message = Message::new(MessageRole::User, "Hello".to_string());
 
@@ -801,7 +802,7 @@ mod tests {
     fn test_remove_session() {
         let manager = SessionManager::new();
         let cwd = std::env::current_dir().unwrap();
-        let session_id = manager.create_session(cwd).unwrap();
+        let session_id = manager.create_session(cwd, None).unwrap();
 
         // Verify session exists
         assert!(manager.get_session(&session_id).unwrap().is_some());
@@ -834,8 +835,8 @@ mod tests {
         assert_eq!(sessions.len(), 0);
 
         // Create some sessions
-        let id1 = manager.create_session(cwd.clone()).unwrap();
-        let id2 = manager.create_session(cwd).unwrap();
+        let id1 = manager.create_session(cwd.clone(), None).unwrap();
+        let id2 = manager.create_session(cwd, None).unwrap();
 
         let sessions = manager.list_sessions().unwrap();
         assert_eq!(sessions.len(), 2);
@@ -850,10 +851,10 @@ mod tests {
 
         assert_eq!(manager.session_count().unwrap(), 0);
 
-        manager.create_session(cwd.clone()).unwrap();
+        manager.create_session(cwd.clone(), None).unwrap();
         assert_eq!(manager.session_count().unwrap(), 1);
 
-        manager.create_session(cwd).unwrap();
+        manager.create_session(cwd, None).unwrap();
         assert_eq!(manager.session_count().unwrap(), 2);
     }
 
@@ -867,7 +868,7 @@ mod tests {
 
         // Create a session
         let cwd = std::env::current_dir().unwrap();
-        let session_id = manager.create_session(cwd).unwrap();
+        let session_id = manager.create_session(cwd, None).unwrap();
         assert_eq!(manager.session_count().unwrap(), 1);
 
         // Wait for session to expire
@@ -905,7 +906,7 @@ mod tests {
         let manager = SessionManager::new();
         let invalid_path = PathBuf::from("/nonexistent/directory");
 
-        let result = manager.create_session(invalid_path);
+        let result = manager.create_session(invalid_path, None);
         assert!(result.is_err());
 
         if let Err(crate::AgentError::Session(msg)) = result {
@@ -920,7 +921,7 @@ mod tests {
         let manager = SessionManager::new();
         let cwd = std::env::current_dir().unwrap();
 
-        let session_id = manager.create_session(cwd.clone()).unwrap();
+        let session_id = manager.create_session(cwd.clone(), None).unwrap();
         let session = manager.get_session(&session_id).unwrap().unwrap();
 
         assert_eq!(session.cwd, cwd);
@@ -931,7 +932,7 @@ mod tests {
         let manager = SessionManager::new();
         let non_absolute_path = PathBuf::from("relative/path");
 
-        let result = manager.create_session(non_absolute_path);
+        let result = manager.create_session(non_absolute_path, None);
         assert!(result.is_err());
 
         if let Err(crate::AgentError::Session(msg)) = result {
@@ -947,7 +948,7 @@ mod tests {
         let manager = SessionManager::new();
         let cwd = std::env::current_dir().unwrap();
 
-        let session_id = manager.create_session(cwd.clone()).unwrap();
+        let session_id = manager.create_session(cwd.clone(), None).unwrap();
 
         // Add a message to the session
         manager
@@ -968,8 +969,8 @@ mod tests {
         let cwd1 = std::env::current_dir().unwrap();
         let cwd2 = std::env::temp_dir();
 
-        let session_id1 = manager.create_session(cwd1.clone()).unwrap();
-        let session_id2 = manager.create_session(cwd2.clone()).unwrap();
+        let session_id1 = manager.create_session(cwd1.clone(), None).unwrap();
+        let session_id2 = manager.create_session(cwd2.clone(), None).unwrap();
 
         let session1 = manager.get_session(&session_id1).unwrap().unwrap();
         let session2 = manager.get_session(&session_id2).unwrap().unwrap();
@@ -1001,7 +1002,7 @@ mod tests {
         let manager = SessionManager::new();
         let unix_absolute = PathBuf::from("/tmp");
 
-        let result = manager.create_session(unix_absolute.clone());
+        let result = manager.create_session(unix_absolute.clone(), None);
         assert!(result.is_ok());
 
         let session_id = result.unwrap();
@@ -1018,7 +1019,7 @@ mod tests {
         // This test assumes C:\temp exists on Windows systems
         // In real scenarios, we'd use a guaranteed existing path
         if windows_absolute.exists() {
-            let result = manager.create_session(windows_absolute.clone());
+            let result = manager.create_session(windows_absolute.clone(), None);
             assert!(result.is_ok());
 
             let session_id = result.unwrap();
@@ -1032,7 +1033,7 @@ mod tests {
         let manager = SessionManager::new();
         let non_existent = PathBuf::from("/this/path/definitely/does/not/exist/nowhere");
 
-        let result = manager.create_session(non_existent);
+        let result = manager.create_session(non_existent, None);
         assert!(result.is_err());
 
         if let Err(crate::AgentError::Session(msg)) = result {
@@ -1111,7 +1112,7 @@ mod tests {
     fn test_session_manager_send_available_commands_update() {
         let manager = SessionManager::new();
         let cwd = std::env::current_dir().unwrap();
-        let session_id = manager.create_session(cwd).unwrap();
+        let session_id = manager.create_session(cwd, None).unwrap();
 
         let commands = vec![agent_client_protocol::AvailableCommand {
             name: "create_plan".to_string(),
