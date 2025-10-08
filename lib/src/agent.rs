@@ -1292,6 +1292,37 @@ impl ClaudeAgent {
             );
         }
 
+        // ACP Compliance: Check turn request limit before making LM request
+        // This mirrors the non-streaming path check (see handle_prompt around line 2833).
+        // Currently each prompt() call is a new turn with only one LM request, but
+        // when tool call loops are implemented, this will prevent infinite loops.
+        let mut updated_session = session.clone();
+        let current_requests = updated_session.increment_turn_requests();
+        if current_requests > self.config.max_turn_requests {
+            tracing::info!(
+                "Turn request limit exceeded ({} > {}) for session: {} (streaming path)",
+                current_requests,
+                self.config.max_turn_requests,
+                session_id
+            );
+            return Ok(PromptResponse {
+                stop_reason: StopReason::MaxTurnRequests,
+                meta: Some(serde_json::json!({
+                    "turn_requests": current_requests,
+                    "max_turn_requests": self.config.max_turn_requests,
+                    "session_id": session_id.to_string(),
+                    "streaming": true
+                })),
+            });
+        }
+
+        // Update session with incremented turn request counter
+        self.session_manager
+            .update_session(session_id, |s| {
+                s.turn_request_count = updated_session.turn_request_count;
+            })
+            .map_err(|_| agent_client_protocol::Error::internal_error())?;
+
         let context: crate::claude::SessionContext = session.into();
         let mut stream = self
             .claude_client
@@ -2803,6 +2834,15 @@ impl Agent for ClaudeAgent {
             .get_session(&session_id)
             .map_err(|_| agent_client_protocol::Error::internal_error())?
             .ok_or_else(agent_client_protocol::Error::invalid_params)?;
+
+        // Reset turn counters at the start of each new turn.
+        // ACP defines a turn as: a single user prompt and all subsequent LM requests
+        // until the final response. This prevents unbounded counter growth across turns.
+        self.session_manager
+            .update_session(&session_id, |session| {
+                session.reset_turn_counters();
+            })
+            .map_err(|_| agent_client_protocol::Error::internal_error())?;
 
         // Add user message to session
         let user_message = crate::session::Message {
@@ -8030,5 +8070,127 @@ mod tests {
             "// New unsaved content in editor",
             "Tool should see editor buffer content, not disk content"
         );
+    }
+
+    #[tokio::test]
+    async fn test_turn_counter_resets_between_prompts() {
+        // This test verifies that turn_request_count resets to 0 at the start of each new prompt turn
+        // according to ACP specification
+
+        let agent = create_test_agent().await;
+
+        // Create a session
+        let new_session_request = NewSessionRequest {
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![],
+            meta: None,
+        };
+        let session_response = agent.new_session(new_session_request).await.unwrap();
+        let session_id: crate::session::SessionId = session_response.session_id.0.as_ref().parse().unwrap();
+
+        // First prompt - should start with turn_request_count = 0, then increment to 1
+        let prompt_request_1 = PromptRequest {
+            session_id: session_response.session_id.clone(),
+            prompt: vec![ContentBlock::Text(TextContent {
+                text: "First prompt".to_string(),
+                annotations: None,
+                meta: None,
+            })],
+            meta: None,
+        };
+
+        let response_1 = agent.prompt(prompt_request_1).await.unwrap();
+        assert_eq!(response_1.stop_reason, StopReason::EndTurn);
+
+        // Check that turn_request_count is now 1
+        let session_1 = agent.session_manager.get_session(&session_id).unwrap().unwrap();
+        assert_eq!(session_1.get_turn_request_count(), 1, "First prompt should increment counter to 1");
+
+        // Second prompt - should RESET to 0 then increment to 1
+        let prompt_request_2 = PromptRequest {
+            session_id: session_response.session_id.clone(),
+            prompt: vec![ContentBlock::Text(TextContent {
+                text: "Second prompt".to_string(),
+                annotations: None,
+                meta: None,
+            })],
+            meta: None,
+        };
+
+        let response_2 = agent.prompt(prompt_request_2).await.unwrap();
+        assert_eq!(response_2.stop_reason, StopReason::EndTurn);
+
+        // Check that turn_request_count reset and is now 1 (not 2)
+        let session_2 = agent.session_manager.get_session(&session_id).unwrap().unwrap();
+        assert_eq!(
+            session_2.get_turn_request_count(),
+            1,
+            "Second prompt should reset counter to 0 then increment to 1, not accumulate from previous turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_prompt_enforces_turn_request_limit() {
+        // This test verifies that the streaming path has turn request limit enforcement
+        // by setting limit to 0 to force immediate failure, proving the check exists.
+        //
+        // TODO: When tool call loops are implemented, enhance this test to:
+        // - Set a realistic limit (e.g., 3)
+        // - Mock multiple tool calls in a single turn
+        // - Verify limit is enforced after N tool call iterations
+        //
+        // Note: In current implementation, each prompt() call is a new turn (resets counters)
+        // and only makes one LM request, so the limit won't be exceeded naturally.
+
+        let mut agent = create_test_agent().await;
+
+        // Set limit to 0 to force immediate failure (any request exceeds limit)
+        agent.config.max_turn_requests = 0;
+
+        // Create a session with streaming capability
+        let new_session_request = NewSessionRequest {
+            cwd: std::path::PathBuf::from("/tmp"),
+            mcp_servers: vec![],
+            meta: Some(serde_json::json!({"streaming": true})),
+        };
+        let session_response = agent.new_session(new_session_request).await.unwrap();
+        let session_id: crate::session::SessionId = session_response.session_id.0.as_ref().parse().unwrap();
+
+        // Update session to enable streaming
+        agent.session_manager.update_session(&session_id, |session| {
+            session.client_capabilities = Some(agent_client_protocol::ClientCapabilities {
+                fs: agent_client_protocol::FileSystemCapability {
+                    read_text_file: true,
+                    write_text_file: true,
+                    meta: None,
+                },
+                terminal: true,
+                meta: Some(serde_json::json!({"streaming": true})),
+            });
+        }).unwrap();
+
+        // Prompt should be blocked immediately by streaming path check
+        // Counter resets to 0, increments to 1, and 1 > 0 triggers limit
+        let prompt_request = PromptRequest {
+            session_id: session_response.session_id.clone(),
+            prompt: vec![ContentBlock::Text(TextContent {
+                text: "This should be blocked by turn request limit".to_string(),
+                annotations: None,
+                meta: None,
+            })],
+            meta: None,
+        };
+
+        let response = agent.prompt(prompt_request).await.unwrap();
+        assert_eq!(
+            response.stop_reason,
+            StopReason::MaxTurnRequests,
+            "Streaming path should enforce turn request limit"
+        );
+
+        // Verify metadata contains turn request info
+        let meta = response.meta.unwrap();
+        assert_eq!(meta["turn_requests"], 1, "Should have reset to 0 then incremented to 1");
+        assert_eq!(meta["max_turn_requests"], 0);
     }
 }
