@@ -1557,11 +1557,20 @@ impl ClaudeAgent {
             });
         }
 
+        tracing::info!("Calling Claude API for session: {}", session_id);
         let response_content = self
             .claude_client
             .query_with_context(&prompt_text, &context)
             .await
-            .map_err(|_| agent_client_protocol::Error::internal_error())?;
+            .map_err(|e| {
+                tracing::error!("Claude API error: {:?}", e);
+                agent_client_protocol::Error::internal_error()
+            })?;
+        tracing::info!(
+            "Received Claude API response ({} bytes) for session: {}",
+            response_content.len(),
+            session_id
+        );
 
         // ACP requires specific stop reasons for all prompt turn completions:
         // Check for refusal patterns in Claude's response content

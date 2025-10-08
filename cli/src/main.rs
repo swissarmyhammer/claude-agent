@@ -105,13 +105,19 @@ async fn run() -> Result<()> {
 fn init_logging(log_level: &str, json_format: bool) -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
 
+    // Write logs to /tmp/claude-agent.log
+    let log_file =
+        std::fs::File::create("/tmp/claude-agent.log").expect("Failed to create log file");
+
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
         .with_thread_ids(false)
         .with_file(false)
         .with_line_number(false)
-        .with_span_events(FmtSpan::CLOSE);
+        .with_span_events(FmtSpan::CLOSE)
+        .with_writer(std::sync::Arc::new(log_file))
+        .with_ansi(false);
 
     if json_format {
         subscriber.json().init();

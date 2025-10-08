@@ -10,6 +10,7 @@ pub mod base64_processor;
 pub mod base64_validation;
 pub mod capability_validation;
 pub mod claude;
+pub mod claude_process;
 pub mod config;
 pub mod constants;
 pub mod content_block_processor;

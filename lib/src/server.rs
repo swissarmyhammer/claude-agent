@@ -334,10 +334,7 @@ impl ClaudeAgentServer {
             }
             "session/cancel" => {
                 let req = serde_json::from_value(params)?;
-                agent
-                    .cancel(req)
-                    .await
-                    .map(|_| serde_json::Value::Null)
+                agent.cancel(req).await.map(|_| serde_json::Value::Null)
             }
             // Handle extension methods through ext_method
             _ => {
@@ -984,14 +981,8 @@ mod tests {
             )
             .await;
 
-            assert!(
-                read_result.is_ok(),
-                "Request should receive a response"
-            );
-            assert!(
-                !response_line.is_empty(),
-                "Response should not be empty"
-            );
+            assert!(read_result.is_ok(), "Request should receive a response");
+            assert!(!response_line.is_empty(), "Response should not be empty");
 
             let response: serde_json::Value = serde_json::from_str(&response_line).unwrap();
             assert_eq!(

@@ -78,7 +78,9 @@ pub enum ChunkType {
 impl ClaudeClient {
     /// Create a new Claude client with default configuration
     pub fn new() -> Result<Self> {
-        let config = Config::default();
+        let config = Config::builder()
+            .timeout_secs(300) // 5 minute timeout for Claude API calls
+            .build()?;
         let client = Client::new(config);
 
         Ok(Self { client })
@@ -86,7 +88,14 @@ impl ClaudeClient {
 
     /// Create a new Claude client with custom configuration
     pub fn new_with_config(_claude_config: &ClaudeConfig) -> Result<Self> {
-        let config = Config::default();
+        let config = Config::builder()
+            .timeout_secs(300) // 5 minute timeout for Claude API calls
+            .build()?;
+
+        tracing::info!(
+            "Created ClaudeClient with timeout_secs: {:?}",
+            config.timeout_secs
+        );
 
         // Map claude config to SDK config
         // The claude-sdk-rs Config doesn't appear to have model configuration in the constructor
@@ -239,11 +248,22 @@ impl ClaudeClient {
             }
 
             // Use the full conversation including context
+            tracing::info!(
+                "Sending request to Claude SDK (prompt length: {} chars)",
+                full_conversation.len()
+            );
             let response = self
                 .client
                 .send_full(&full_conversation)
                 .await
-                .map_err(crate::error::AgentError::Claude)?;
+                .map_err(|e| {
+                    tracing::error!("Claude SDK error: {:?}", e);
+                    crate::error::AgentError::Claude(e)
+                })?;
+            tracing::info!(
+                "Received response from Claude SDK (content length: {} chars)",
+                response.content.len()
+            );
 
             Ok(response.content)
         })
@@ -518,6 +538,8 @@ mod tests {
         assert_eq!(context.messages[0].content, "Hello");
     }
 
+    // NOTE: This test makes a real API call to Claude and costs money.
+    // This is intentional - we want to verify actual SDK integration works.
     #[tokio::test]
     async fn test_basic_query() {
         let client = ClaudeClient::new().unwrap();
@@ -531,6 +553,8 @@ mod tests {
         );
     }
 
+    // NOTE: This test makes a real API call to Claude and costs money.
+    // This is intentional - we want to verify actual SDK integration works.
     #[tokio::test]
     async fn test_query_with_context() {
         let client = ClaudeClient::new().unwrap();
