@@ -32,6 +32,7 @@ mod permission_interaction_tests;
 pub mod permission_storage;
 pub mod permissions;
 pub mod plan;
+pub mod protocol_translator;
 pub mod request_validation;
 pub mod server;
 pub mod session;

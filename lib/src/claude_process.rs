@@ -100,8 +100,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime};
-use tokio::time::timeout;
+use std::time::Duration;
 
 /// Claude CLI command-line arguments for stream-json communication
 const CLAUDE_CLI_ARGS: &[&str] = &[
@@ -250,7 +249,6 @@ pub struct ClaudeProcess {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     stderr: BufReader<ChildStderr>,
-    created_at: SystemTime,
 }
 
 impl ClaudeProcess {
@@ -303,7 +301,6 @@ impl ClaudeProcess {
             stdin,
             stdout: BufReader::new(stdout),
             stderr: BufReader::new(stderr),
-            created_at: SystemTime::now(),
         })
     }
 
@@ -415,49 +412,64 @@ impl ClaudeProcess {
         // Drop stdin to signal EOF to the process
         drop(self.stdin);
 
-        // Wait for graceful exit with timeout
-        let wait_result = timeout(Duration::from_secs(5), async {
-            tokio::task::spawn_blocking(move || self.child.wait()).await
-        })
-        .await;
+        // Try to wait for graceful exit with timeout
+        // Use try_wait in a loop to avoid blocking and retain access to child
+        let start = std::time::Instant::now();
+        let timeout_duration = Duration::from_secs(5);
 
-        match wait_result {
-            Ok(Ok(Ok(status))) => {
-                tracing::info!(
-                    "Claude process for session {} exited gracefully with status: {}",
-                    self.session_id,
-                    status
-                );
-                Ok(())
-            }
-            Ok(Ok(Err(e))) => {
-                tracing::error!(
-                    "Error waiting for claude process for session {}: {}",
-                    self.session_id,
-                    e
-                );
-                Err(AgentError::Internal(format!(
-                    "Failed to wait for process: {}",
-                    e
-                )))
-            }
-            Ok(Err(e)) => {
-                tracing::error!(
-                    "Tokio join error waiting for claude process for session {}: {}",
-                    self.session_id,
-                    e
-                );
-                Err(AgentError::Internal(format!("Tokio join error: {}", e)))
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "Claude process for session {} did not exit gracefully, force killing",
-                    self.session_id
-                );
-                // Timeout - force kill
-                // Note: self.child was moved, so we can't kill it here
-                // In production, we'd need to handle this differently
-                Ok(())
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    tracing::info!(
+                        "Claude process for session {} exited gracefully with status: {}",
+                        self.session_id,
+                        status
+                    );
+                    return Ok(());
+                }
+                Ok(None) => {
+                    // Still running, check timeout
+                    if start.elapsed() >= timeout_duration {
+                        tracing::warn!(
+                            "Claude process for session {} did not exit gracefully, force killing",
+                            self.session_id
+                        );
+                        // Force kill the process
+                        if let Err(e) = self.child.kill() {
+                            tracing::error!(
+                                "Failed to force kill claude process for session {}: {}",
+                                self.session_id,
+                                e
+                            );
+                            return Err(AgentError::Internal(format!(
+                                "Failed to force kill process: {}",
+                                e
+                            )));
+                        }
+                        // Wait for the killed process to clean up
+                        if let Err(e) = self.child.wait() {
+                            tracing::error!(
+                                "Failed to wait after killing claude process for session {}: {}",
+                                self.session_id,
+                                e
+                            );
+                        }
+                        return Ok(());
+                    }
+                    // Sleep briefly before checking again
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Error checking claude process status for session {}: {}",
+                        self.session_id,
+                        e
+                    );
+                    return Err(AgentError::Internal(format!(
+                        "Failed to check process status: {}",
+                        e
+                    )));
+                }
             }
         }
     }
@@ -465,11 +477,6 @@ impl ClaudeProcess {
     /// Get the session ID for this process
     pub fn session_id(&self) -> SessionId {
         self.session_id
-    }
-
-    /// Get the creation time
-    pub fn created_at(&self) -> SystemTime {
-        self.created_at
     }
 }
 
@@ -775,7 +782,7 @@ mod tests {
                 let process = manager_clone.get_process(&session_id).await;
                 assert!(process.is_ok());
                 let process_arc = process.unwrap();
-                
+
                 // Verify we can lock and access the process
                 // Note: is_alive() is async but we can't hold MutexGuard across await
                 // So we just verify the process exists and is accessible
