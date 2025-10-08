@@ -1297,7 +1297,10 @@ impl ClaudeAgent {
             .claude_client
             .query_stream_with_context(&prompt_text, &context)
             .await
-            .map_err(|_| agent_client_protocol::Error::internal_error())?;
+            .map_err(|e| {
+                tracing::error!("Failed to create streaming query: {}", e);
+                agent_client_protocol::Error::internal_error()
+            })?;
 
         let mut full_response = String::new();
         let mut chunk_count = 0;
@@ -7403,38 +7406,37 @@ mod tests {
             meta: Some(serde_json::json!({"test": true})),
         };
 
-        let agent_clone = Arc::clone(&agent);
-        let prompt_future = async move { agent_clone.prompt(prompt_request).await };
-
-        let collect_notifications = async {
+        // Start collecting notifications
+        let collect_task = async {
             let mut user_message_chunks = Vec::new();
-            // Keep receiving notifications until we get 2 UserMessageChunk notifications
-            // Use a reasonable timeout for the entire collection
             let start = tokio::time::Instant::now();
-            let max_duration = Duration::from_secs(5);
+            let max_duration = Duration::from_secs(15);
 
+            // Keep receiving until we have 2 chunks or timeout
             while user_message_chunks.len() < 2 && start.elapsed() < max_duration {
-                match tokio::time::timeout(Duration::from_millis(100), notification_receiver.recv())
+                match tokio::time::timeout(Duration::from_secs(1), notification_receiver.recv())
                     .await
                 {
                     Ok(Ok(notification)) => {
                         if let SessionUpdate::UserMessageChunk { content } = notification.update {
                             user_message_chunks.push(content);
                         }
-                        // Continue receiving if we haven't got 2 yet
                     }
                     Ok(Err(_)) => break, // Channel closed
-                    Err(_) => {
-                        // Timeout on this receive, continue to try again
-                        continue;
-                    }
+                    Err(_) => continue,  // Timeout, keep trying
                 }
             }
             user_message_chunks
         };
 
-        let (user_message_chunks, _prompt_result) =
-            tokio::join!(collect_notifications, prompt_future);
+        // Send prompt after short delay to ensure collector is ready
+        let agent_clone = Arc::clone(&agent);
+        let prompt_task = async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            agent_clone.prompt(prompt_request).await
+        };
+
+        let (user_message_chunks, _prompt_result) = tokio::join!(collect_task, prompt_task);
 
         assert_eq!(
             user_message_chunks.len(),

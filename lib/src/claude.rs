@@ -1,20 +1,23 @@
-//! Claude SDK wrapper providing session-aware interactions
+//! Claude process wrapper providing session-aware interactions
 
-use claude_sdk_rs::{Client, Config, Message, MessageMeta};
-use tokio::time::{sleep, Duration};
-use tokio_stream::{Stream, StreamExt};
+use agent_client_protocol::{ContentBlock, SessionUpdate, TextContent};
+use futures::stream::Stream;
+use std::sync::{Arc, Mutex};
+use std::pin::Pin;
 
 use std::time::SystemTime;
 
 use crate::{
+    claude_process::{ClaudeProcess, ClaudeProcessManager},
     config::ClaudeConfig,
     error::Result,
+    protocol_translator::ProtocolTranslator,
     session::{MessageRole, SessionId},
 };
 
 /// Claude client wrapper with session management
 pub struct ClaudeClient {
-    client: Client,
+    process_manager: Arc<ClaudeProcessManager>,
 }
 
 /// Session context for managing conversation history
@@ -36,8 +39,6 @@ pub struct ClaudeMessage {
     pub role: MessageRole,
     pub content: String,
     pub timestamp: SystemTime,
-    /// Optional metadata from Claude SDK including cost, tokens, and duration
-    pub meta: Option<MessageMeta>,
 }
 
 /// Streaming message chunk
@@ -49,8 +50,6 @@ pub struct MessageChunk {
     pub tool_call: Option<ToolCallInfo>,
     /// Token usage information (only present in Result messages)
     pub token_usage: Option<TokenUsageInfo>,
-    /// Optional metadata from SDK Message including cost, tokens, and duration
-    pub meta: Option<MessageMeta>,
 }
 
 /// Tool call information extracted from Message::Tool
@@ -78,31 +77,17 @@ pub enum ChunkType {
 impl ClaudeClient {
     /// Create a new Claude client with default configuration
     pub fn new() -> Result<Self> {
-        let config = Config::builder()
-            .timeout_secs(300) // 5 minute timeout for Claude API calls
-            .build()?;
-        let client = Client::new(config);
-
-        Ok(Self { client })
+        Ok(Self {
+            process_manager: Arc::new(ClaudeProcessManager::new()),
+        })
     }
 
     /// Create a new Claude client with custom configuration
     pub fn new_with_config(_claude_config: &ClaudeConfig) -> Result<Self> {
-        let config = Config::builder()
-            .timeout_secs(300) // 5 minute timeout for Claude API calls
-            .build()?;
-
-        tracing::info!(
-            "Created ClaudeClient with timeout_secs: {:?}",
-            config.timeout_secs
-        );
-
-        // Map claude config to SDK config
-        // The claude-sdk-rs Config doesn't appear to have model configuration in the constructor
-        // The model is typically specified when making requests
-
-        let client = Client::new(config);
-        Ok(Self { client })
+        tracing::info!("Created ClaudeClient with process manager");
+        Ok(Self {
+            process_manager: Arc::new(ClaudeProcessManager::new()),
+        })
     }
 
     /// Check if the client supports streaming
@@ -110,114 +95,170 @@ impl ClaudeClient {
         true
     }
 
-    /// Execute a simple query without session context
-    pub async fn query(&self, prompt: &str, _session_id: &SessionId) -> Result<String> {
-        self.execute_with_retry(|| async {
-            if prompt.is_empty() {
-                return Err(crate::error::AgentError::Claude(
-                    claude_sdk_rs::Error::ConfigError("Empty prompt".to_string()),
-                ));
+    /// Get the process manager (for session lifecycle integration)
+    pub fn process_manager(&self) -> &Arc<ClaudeProcessManager> {
+        &self.process_manager
+    }
+
+    /// Convert session::SessionId to agent_client_protocol::SessionId
+    fn to_acp_session_id(session_id: &SessionId) -> agent_client_protocol::SessionId {
+        agent_client_protocol::SessionId(Arc::from(session_id.to_string().as_str()))
+    }
+
+    /// Convert ContentBlock to MessageChunk
+    fn content_block_to_message_chunk(content: ContentBlock) -> MessageChunk {
+        match content {
+            ContentBlock::Text(text) => MessageChunk {
+                content: text.text,
+                chunk_type: ChunkType::Text,
+                tool_call: None,
+                token_usage: None,
+            },
+            // Handle other ContentBlock variants if they exist
+            _ => MessageChunk {
+                content: String::new(),
+                chunk_type: ChunkType::Text,
+                tool_call: None,
+                token_usage: None,
+            },
+        }
+    }
+
+    /// Helper method to send prompt to process
+    async fn send_prompt_to_process(
+        &self,
+        process: Arc<Mutex<ClaudeProcess>>,
+        prompt: &str,
+    ) -> Result<()> {
+        let content = vec![ContentBlock::Text(TextContent {
+            text: prompt.to_string(),
+            annotations: None,
+            meta: None,
+        })];
+        let stream_json = ProtocolTranslator::acp_to_stream_json(content)?;
+
+        let mut proc = process.lock().unwrap();
+        proc.write_line(&stream_json).await?;
+        Ok(())
+    }
+
+    /// Helper method to check if a line indicates end of stream
+    fn is_end_of_stream(line: &str) -> bool {
+        // Parse JSON and check type field properly
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(msg_type) = json.get("type").and_then(|t| t.as_str()) {
+                return msg_type == "result";
             }
+        }
+        false
+    }
 
-            let response = self
-                .client
-                .send_full(prompt)
-                .await
-                .map_err(crate::error::AgentError::Claude)?;
+    /// Execute a simple query without session context
+    pub async fn query(&self, prompt: &str, session_id: &SessionId) -> Result<String> {
+        if prompt.is_empty() {
+            return Err(crate::error::AgentError::Process(
+                "Empty prompt".to_string(),
+            ));
+        }
 
-            Ok(response.content)
-        })
-        .await
+        // Get the process for this session
+        let process = self.process_manager.get_process(session_id).await?;
+
+        // Send prompt to process
+        self.send_prompt_to_process(process.clone(), prompt)
+            .await?;
+
+        // Read response lines until we get a result
+        let mut response_text = String::new();
+        let acp_session_id = Self::to_acp_session_id(session_id);
+        loop {
+            let line = {
+                let mut proc = process.lock().unwrap();
+                proc.read_line().await?
+            };
+
+            match line {
+                Some(line) => {
+                    if let Ok(Some(notification)) =
+                        ProtocolTranslator::stream_json_to_acp(&line, &acp_session_id)
+                    {
+                        if let SessionUpdate::AgentMessageChunk { content } = notification.update {
+                            if let ContentBlock::Text(text) = content {
+                                response_text.push_str(&text.text);
+                            }
+                        }
+                    }
+                    // Check if this is a result message (indicates end)
+                    if Self::is_end_of_stream(&line) {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+
+        Ok(response_text)
     }
 
     /// Execute a streaming query without session context
     pub async fn query_stream(
         &self,
         prompt: &str,
-        _session_id: &SessionId,
-    ) -> Result<impl Stream<Item = MessageChunk>> {
+        session_id: &SessionId,
+    ) -> Result<Pin<Box<dyn Stream<Item = MessageChunk> + Send>>> {
         if prompt.is_empty() {
-            return Err(crate::error::AgentError::Claude(
-                claude_sdk_rs::Error::ConfigError("Empty prompt".to_string()),
+            return Err(crate::error::AgentError::Process(
+                "Empty prompt".to_string(),
             ));
         }
 
-        let message_stream = self
-            .client
-            .query(prompt)
-            .stream()
-            .await
-            .map_err(crate::error::AgentError::Claude)?;
+        // Get the process for this session
+        let process = self.process_manager.get_process(session_id).await?;
 
-        // Convert the MessageStream to our MessageChunk stream
-        let chunk_stream = message_stream.map(|result| {
-            match result {
-                Ok(Message::Assistant { content, meta }) => MessageChunk {
-                    content,
-                    chunk_type: ChunkType::Text,
-                    tool_call: None,
-                    token_usage: None,
-                    meta: Some(meta),
-                },
-                Ok(Message::Tool {
-                    name,
-                    parameters,
-                    meta,
-                }) => MessageChunk {
-                    content: String::new(), // Tool calls don't have direct content
-                    chunk_type: ChunkType::ToolCall,
-                    tool_call: Some(ToolCallInfo { name, parameters }),
-                    token_usage: None,
-                    meta: Some(meta),
-                },
-                Ok(Message::ToolResult { meta, .. }) => MessageChunk {
-                    content: String::new(), // Tool results handled separately
-                    chunk_type: ChunkType::ToolResult,
-                    tool_call: None,
-                    token_usage: None,
-                    meta: Some(meta),
-                },
-                Ok(Message::Result { meta, .. }) => {
-                    // Extract token usage from metadata for backward compatibility
-                    let token_usage = meta.tokens_used.as_ref().map(|tokens| TokenUsageInfo {
-                        input_tokens: tokens.input,
-                        output_tokens: tokens.output,
-                    });
-                    MessageChunk {
-                        content: String::new(),
-                        chunk_type: ChunkType::Text,
-                        tool_call: None,
-                        token_usage,
-                        meta: Some(meta),
+        // Send prompt to process
+        self.send_prompt_to_process(process.clone(), prompt)
+            .await?;
+
+        // Create a channel-based stream to avoid holding mutex across await
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let process_clone = process.clone();
+        let acp_session_id = Self::to_acp_session_id(session_id);
+
+        // Spawn a blocking task to read from the process and send chunks
+        tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Handle::current();
+            loop {
+                let line = {
+                    let mut proc = process_clone.lock().unwrap();
+                    match runtime.block_on(proc.read_line()) {
+                        Ok(Some(line)) => line,
+                        Ok(None) => break,
+                        Err(_) => break,
+                    }
+                };
+
+                // Check if this is a result message (indicates end)
+                if Self::is_end_of_stream(&line) {
+                    break;
+                }
+
+                // Translate to ACP notification
+                if let Ok(Some(notification)) =
+                    ProtocolTranslator::stream_json_to_acp(&line, &acp_session_id)
+                {
+                    if let SessionUpdate::AgentMessageChunk { content } = notification.update {
+                        let chunk = Self::content_block_to_message_chunk(content);
+                        if tx.send(chunk).is_err() {
+                            break;
+                        }
                     }
                 }
-                Ok(msg) => {
-                    // Other message types (Init, User, System) - extract meta if available
-                    let meta = match msg {
-                        Message::Init { meta } => Some(meta),
-                        Message::User { meta, .. } => Some(meta),
-                        Message::System { meta, .. } => Some(meta),
-                        _ => None,
-                    };
-                    MessageChunk {
-                        content: String::new(),
-                        chunk_type: ChunkType::Text,
-                        tool_call: None,
-                        token_usage: None,
-                        meta,
-                    }
-                }
-                Err(_) => MessageChunk {
-                    content: String::new(), // Error handling - could be improved
-                    chunk_type: ChunkType::Text,
-                    tool_call: None,
-                    token_usage: None,
-                    meta: None,
-                },
             }
         });
 
-        Ok(chunk_stream)
+        // Convert receiver to stream
+        let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+        Ok(Box::pin(stream))
     }
 
     /// Execute a query with full session context
@@ -226,59 +267,9 @@ impl ClaudeClient {
         prompt: &str,
         context: &SessionContext,
     ) -> Result<String> {
-        // Build conversation history from context
-        let mut full_conversation = String::new();
-
-        for message in &context.messages {
-            let role_str = match message.role {
-                MessageRole::User => "User",
-                MessageRole::Assistant => "Assistant",
-                MessageRole::System => "System",
-            };
-            full_conversation.push_str(&format!("{}: {}\n", role_str, message.content));
-        }
-        full_conversation.push_str(&format!("User: {}", prompt));
-
-        // Use retry logic with actual Claude SDK call
-        self.execute_with_retry(|| async {
-            if prompt.is_empty() {
-                return Err(crate::error::AgentError::Claude(
-                    claude_sdk_rs::Error::ConfigError("Empty prompt".to_string()),
-                ));
-            }
-
-            // Use the full conversation including context
-            tracing::info!(
-                "Sending request to Claude SDK (prompt length: {} chars)",
-                full_conversation.len()
-            );
-            let response = self
-                .client
-                .send_full(&full_conversation)
-                .await
-                .map_err(|e| {
-                    tracing::error!("Claude SDK error: {:?}", e);
-                    crate::error::AgentError::Claude(e)
-                })?;
-            tracing::info!(
-                "Received response from Claude SDK (content length: {} chars)",
-                response.content.len()
-            );
-
-            Ok(response.content)
-        })
-        .await
-    }
-
-    /// Execute a streaming query with full session context
-    pub async fn query_stream_with_context(
-        &self,
-        prompt: &str,
-        context: &SessionContext,
-    ) -> Result<impl Stream<Item = MessageChunk>> {
         if prompt.is_empty() {
-            return Err(crate::error::AgentError::Claude(
-                claude_sdk_rs::Error::ConfigError("Empty prompt".to_string()),
+            return Err(crate::error::AgentError::Process(
+                "Empty prompt".to_string(),
             ));
         }
 
@@ -295,113 +286,52 @@ impl ClaudeClient {
         }
         full_conversation.push_str(&format!("User: {}", prompt));
 
-        // Use the full conversation including context for streaming
-        let message_stream = self
-            .client
-            .query(&full_conversation)
-            .stream()
-            .await
-            .map_err(crate::error::AgentError::Claude)?;
+        // Use the process manager for the query
+        tracing::info!(
+            "Sending request to Claude process (prompt length: {} chars)",
+            full_conversation.len()
+        );
+        
+        let response = self.query(&full_conversation, &context.session_id).await?;
+        
+        tracing::info!(
+            "Received response from Claude process (content length: {} chars)",
+            response.len()
+        );
 
-        // Convert the MessageStream to our MessageChunk stream
-        let chunk_stream = message_stream.map(|result| {
-            match result {
-                Ok(Message::Assistant { content, meta }) => MessageChunk {
-                    content,
-                    chunk_type: ChunkType::Text,
-                    tool_call: None,
-                    token_usage: None,
-                    meta: Some(meta),
-                },
-                Ok(Message::Tool {
-                    name,
-                    parameters,
-                    meta,
-                }) => MessageChunk {
-                    content: String::new(), // Tool calls don't have direct content
-                    chunk_type: ChunkType::ToolCall,
-                    tool_call: Some(ToolCallInfo { name, parameters }),
-                    token_usage: None,
-                    meta: Some(meta),
-                },
-                Ok(Message::ToolResult { meta, .. }) => MessageChunk {
-                    content: String::new(), // Tool results handled separately
-                    chunk_type: ChunkType::ToolResult,
-                    tool_call: None,
-                    token_usage: None,
-                    meta: Some(meta),
-                },
-                Ok(Message::Result { meta, .. }) => {
-                    // Extract token usage from metadata for backward compatibility
-                    let token_usage = meta.tokens_used.as_ref().map(|tokens| TokenUsageInfo {
-                        input_tokens: tokens.input,
-                        output_tokens: tokens.output,
-                    });
-                    MessageChunk {
-                        content: String::new(),
-                        chunk_type: ChunkType::Text,
-                        tool_call: None,
-                        token_usage,
-                        meta: Some(meta),
-                    }
-                }
-                Ok(msg) => {
-                    // Other message types (Init, User, System) - extract meta if available
-                    let meta = match msg {
-                        Message::Init { meta } => Some(meta),
-                        Message::User { meta, .. } => Some(meta),
-                        Message::System { meta, .. } => Some(meta),
-                        _ => None,
-                    };
-                    MessageChunk {
-                        content: String::new(),
-                        chunk_type: ChunkType::Text,
-                        tool_call: None,
-                        token_usage: None,
-                        meta,
-                    }
-                }
-                Err(_) => MessageChunk {
-                    content: String::new(), // Error handling - could be improved
-                    chunk_type: ChunkType::Text,
-                    tool_call: None,
-                    token_usage: None,
-                    meta: None,
-                },
-            }
-        });
-
-        Ok(chunk_stream)
+        Ok(response)
     }
 
-    /// Execute an operation with retry logic
-    async fn execute_with_retry<F, Fut, T>(&self, operation: F) -> Result<T>
-    where
-        F: Fn() -> Fut,
-        Fut: futures::Future<Output = Result<T>>,
-    {
-        let mut attempts = 0;
-        let max_attempts = 3;
-
-        loop {
-            attempts += 1;
-
-            match operation().await {
-                Ok(result) => return Ok(result),
-                Err(e) if attempts < max_attempts && is_retryable(&e) => {
-                    let delay = Duration::from_millis(100 * 2_u64.pow(attempts - 1));
-                    sleep(delay).await;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
+    /// Execute a streaming query with full session context
+    pub async fn query_stream_with_context(
+        &self,
+        prompt: &str,
+        context: &SessionContext,
+    ) -> Result<Pin<Box<dyn Stream<Item = MessageChunk> + Send>>> {
+        if prompt.is_empty() {
+            return Err(crate::error::AgentError::Process(
+                "Empty prompt".to_string(),
+            ));
         }
-    }
-}
 
-/// Determine if an error is worth retrying
-fn is_retryable(error: &crate::error::AgentError) -> bool {
-    matches!(error, crate::error::AgentError::Claude(_))
+        // Build conversation history from context
+        let mut full_conversation = String::new();
+
+        for message in &context.messages {
+            let role_str = match message.role {
+                MessageRole::User => "User",
+                MessageRole::Assistant => "Assistant",
+                MessageRole::System => "System",
+            };
+            full_conversation.push_str(&format!("{}: {}\n", role_str, message.content));
+        }
+        full_conversation.push_str(&format!("User: {}", prompt));
+
+        // Use the process manager for streaming
+        self.query_stream(&full_conversation, &context.session_id)
+            .await
+    }
+
 }
 
 impl SessionContext {
@@ -423,27 +353,6 @@ impl SessionContext {
             role,
             content,
             timestamp: SystemTime::now(),
-            meta: None,
-        };
-        self.messages.push(message);
-    }
-
-    /// Add a message to the session with metadata
-    pub fn add_message_with_meta(&mut self, role: MessageRole, content: String, meta: MessageMeta) {
-        // Aggregate cost and token usage from metadata
-        if let Some(cost) = meta.cost_usd {
-            self.total_cost_usd += cost;
-        }
-        if let Some(ref tokens) = meta.tokens_used {
-            self.total_input_tokens += tokens.input;
-            self.total_output_tokens += tokens.output;
-        }
-
-        let message = ClaudeMessage {
-            role,
-            content,
-            timestamp: SystemTime::now(),
-            meta: Some(meta),
         };
         self.messages.push(message);
     }
@@ -498,7 +407,6 @@ impl From<crate::session::Message> for ClaudeMessage {
             role: message.role,
             content: message.content,
             timestamp: message.timestamp,
-            meta: None, // Session messages don't have SDK metadata
         }
     }
 }
@@ -510,7 +418,6 @@ impl From<&crate::session::Message> for ClaudeMessage {
             role: message.role.clone(),
             content: message.content.clone(),
             timestamp: message.timestamp,
-            meta: None, // Session messages don't have SDK metadata
         }
     }
 }
@@ -581,21 +488,18 @@ mod tests {
             role: MessageRole::User,
             content: "User message".to_string(),
             timestamp: SystemTime::now(),
-            meta: None,
         };
 
         let assistant_msg = ClaudeMessage {
             role: MessageRole::Assistant,
             content: "Assistant message".to_string(),
             timestamp: SystemTime::now(),
-            meta: None,
         };
 
         let system_msg = ClaudeMessage {
             role: MessageRole::System,
             content: "System message".to_string(),
             timestamp: SystemTime::now(),
-            meta: None,
         };
 
         assert!(matches!(user_msg.role, MessageRole::User));
@@ -610,7 +514,6 @@ mod tests {
             chunk_type: ChunkType::Text,
             tool_call: None,
             token_usage: None,
-            meta: None,
         };
 
         let tool_call_chunk = MessageChunk {
@@ -621,7 +524,6 @@ mod tests {
                 parameters: serde_json::json!({"arg": "value"}),
             }),
             token_usage: None,
-            meta: None,
         };
 
         let tool_result_chunk = MessageChunk {
@@ -629,7 +531,6 @@ mod tests {
             chunk_type: ChunkType::ToolResult,
             tool_call: None,
             token_usage: None,
-            meta: None,
         };
 
         let result_chunk = MessageChunk {
@@ -640,7 +541,6 @@ mod tests {
                 input_tokens: 100,
                 output_tokens: 200,
             }),
-            meta: None,
         };
 
         assert!(matches!(text_chunk.chunk_type, ChunkType::Text));
@@ -663,9 +563,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_context_metadata_aggregation() {
-        use claude_sdk_rs::TokenUsage;
-
+    fn test_session_context_token_tracking() {
         let session_id = SessionId::new();
         let mut context = SessionContext::new(session_id);
 
@@ -676,54 +574,14 @@ mod tests {
         assert_eq!(context.total_tokens(), 0);
         assert_eq!(context.average_cost_per_message(), None);
 
-        // Add message with metadata
-        let meta1 = MessageMeta {
-            session_id: "test-session".to_string(),
-            timestamp: Some(SystemTime::now()),
-            cost_usd: Some(0.0015),
-            duration_ms: Some(1200),
-            tokens_used: Some(TokenUsage {
-                input: 50,
-                output: 100,
-                total: 150,
-            }),
-        };
-        context.add_message_with_meta(MessageRole::User, "Hello".to_string(), meta1);
+        // Add messages
+        context.add_message(MessageRole::User, "Hello".to_string());
+        assert_eq!(context.messages.len(), 1);
 
-        // Check aggregated values
-        assert_eq!(context.total_cost_usd, 0.0015);
-        assert_eq!(context.total_input_tokens, 50);
-        assert_eq!(context.total_output_tokens, 100);
-        assert_eq!(context.total_tokens(), 150);
-        assert_eq!(context.average_cost_per_message(), Some(0.0015));
+        context.add_message(MessageRole::Assistant, "Response".to_string());
+        assert_eq!(context.messages.len(), 2);
 
-        // Add another message with metadata
-        let meta2 = MessageMeta {
-            session_id: "test-session".to_string(),
-            timestamp: Some(SystemTime::now()),
-            cost_usd: Some(0.0025),
-            duration_ms: Some(800),
-            tokens_used: Some(TokenUsage {
-                input: 30,
-                output: 200,
-                total: 230,
-            }),
-        };
-        context.add_message_with_meta(MessageRole::Assistant, "Response".to_string(), meta2);
-
-        // Check cumulative values
-        assert_eq!(context.total_cost_usd, 0.0040);
-        assert_eq!(context.total_input_tokens, 80);
-        assert_eq!(context.total_output_tokens, 300);
-        assert_eq!(context.total_tokens(), 380);
-        assert_eq!(context.average_cost_per_message(), Some(0.0020));
-
-        // Add message without metadata - should not affect totals
-        context.add_message(MessageRole::User, "No metadata".to_string());
-
-        assert_eq!(context.total_cost_usd, 0.0040);
-        assert_eq!(context.total_input_tokens, 80);
-        assert_eq!(context.total_output_tokens, 300);
-        assert_eq!(context.messages.len(), 3);
+        // Note: Token tracking would need to be updated separately via the public fields
+        // This test now focuses on basic message addition functionality
     }
 }

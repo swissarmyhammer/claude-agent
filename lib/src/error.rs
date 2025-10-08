@@ -169,8 +169,8 @@ impl McpError {
 /// Main error type for the Claude Agent
 #[derive(Error, Debug)]
 pub enum AgentError {
-    #[error("Claude SDK error: {0}")]
-    Claude(#[from] claude_sdk_rs::Error),
+    #[error("Claude process error: {0}")]
+    Process(String),
 
     #[error("MCP error: {0}")]
     Mcp(#[from] McpError),
@@ -215,6 +215,7 @@ pub enum AgentError {
 impl ToJsonRpcError for AgentError {
     fn to_json_rpc_code(&self) -> i32 {
         match self {
+            AgentError::Process(_) => -32000,        // Server error
             AgentError::Mcp(mcp_error) => mcp_error.to_json_rpc_code(),
             AgentError::PathValidation(_) => -32602, // Invalid params
             AgentError::Protocol(_) => -32600,       // Invalid Request
@@ -292,6 +293,9 @@ mod tests {
 
     #[test]
     fn test_error_display() {
+        let err = AgentError::Process("process failed".to_string());
+        assert_eq!(err.to_string(), "Claude process error: process failed");
+
         let err = AgentError::Protocol("test protocol error".to_string());
         assert_eq!(err.to_string(), "Protocol error: test protocol error");
 
@@ -328,6 +332,9 @@ mod tests {
 
     #[test]
     fn test_json_rpc_error_codes() {
+        let err = AgentError::Process("test".to_string());
+        assert_eq!(err.to_json_rpc_code(), -32000);
+
         let err = AgentError::Protocol("test".to_string());
         assert_eq!(err.to_json_rpc_code(), -32600);
 

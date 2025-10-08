@@ -151,37 +151,50 @@ impl ClaudeProcessManager {
     /// - Failed to spawn claude binary
     /// - Process spawn fails
     pub async fn spawn_for_session(&self, session_id: SessionId) -> Result<()> {
-        // Check if session already exists
-        {
-            let processes = self.processes.read().map_err(|_| {
-                AgentError::Internal("Failed to acquire read lock on processes".to_string())
-            })?;
-            if processes.contains_key(&session_id) {
-                return Err(AgentError::Session(format!(
-                    "Session {} already has a claude process",
-                    session_id
-                )));
-            }
-        }
-
-        // Spawn new process
-        let process = ClaudeProcess::spawn(session_id)?;
-
-        // Insert into map
+        // Check if session already exists - use write lock to prevent race
         let mut processes = self.processes.write().map_err(|_| {
             AgentError::Internal("Failed to acquire write lock on processes".to_string())
         })?;
+        
+        if processes.contains_key(&session_id) {
+            // Process already exists, this is fine - just return success
+            tracing::debug!("Process already exists for session {}", session_id);
+            return Ok(());
+        }
+
+        // Spawn new process
+        let process = ClaudeProcess::spawn(session_id).map_err(|e| {
+            tracing::error!("Failed to spawn claude process for session {}: {}", session_id, e);
+            e
+        })?;
+
+        // Insert into map
         processes.insert(session_id, Arc::new(Mutex::new(process)));
 
         tracing::info!("Spawned claude process for session {}", session_id);
         Ok(())
     }
 
-    /// Get the process for a session
+    /// Get the process for a session, spawning one if it doesn't exist
     ///
     /// # Errors
-    /// Returns error if session does not exist
+    /// Returns error if spawning fails
     pub async fn get_process(&self, session_id: &SessionId) -> Result<Arc<Mutex<ClaudeProcess>>> {
+        // First try to get existing process
+        {
+            let processes = self.processes.read().map_err(|_| {
+                AgentError::Internal("Failed to acquire read lock on processes".to_string())
+            })?;
+            if let Some(process) = processes.get(session_id) {
+                return Ok(process.clone());
+            }
+        }
+
+        // Process doesn't exist, spawn one
+        tracing::info!("No process found for session {}, spawning new one", session_id);
+        self.spawn_for_session(*session_id).await?;
+
+        // Get the newly spawned process
         let processes = self.processes.read().map_err(|_| {
             AgentError::Internal("Failed to acquire read lock on processes".to_string())
         })?;
@@ -189,7 +202,7 @@ impl ClaudeProcessManager {
         processes
             .get(session_id)
             .cloned()
-            .ok_or_else(|| AgentError::Session(format!("No process for session {}", session_id)))
+            .ok_or_else(|| AgentError::Internal("Process spawn succeeded but not found in map".to_string()))
     }
 
     /// Terminate a session's process
@@ -539,14 +552,9 @@ mod tests {
             return;
         }
 
-        // Try to spawn duplicate
+        // Try to spawn duplicate - should be idempotent and return Ok
         let result = manager.spawn_for_session(session_id).await;
-        assert!(result.is_err());
-        if let Err(AgentError::Session(msg)) = result {
-            assert!(msg.contains("already has a claude process"));
-        } else {
-            panic!("Expected Session error");
-        }
+        assert!(result.is_ok(), "spawn_for_session should be idempotent");
 
         // Cleanup
         let _ = manager.terminate_session(&session_id).await;
@@ -557,13 +565,16 @@ mod tests {
         let manager = ClaudeProcessManager::new();
         let session_id = SessionId::new();
 
+        // get_process now auto-spawns processes if they don't exist
         let result = manager.get_process(&session_id).await;
-        assert!(result.is_err());
-        if let Err(AgentError::Session(msg)) = result {
-            assert!(msg.contains("No process for session"));
-        } else {
-            panic!("Expected Session error");
-        }
+        assert!(result.is_ok(), "get_process should auto-spawn if process doesn't exist");
+
+        // Verify the process was spawned by checking session_id matches
+        let process = result.unwrap();
+        assert_eq!(process.lock().unwrap().session_id(), session_id);
+
+        // Cleanup
+        let _ = manager.terminate_session(&session_id).await;
     }
 
     #[tokio::test]
