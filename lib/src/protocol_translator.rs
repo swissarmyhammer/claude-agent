@@ -24,6 +24,12 @@ use agent_client_protocol::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+/// Result information from stream-json result messages
+#[derive(Debug, Clone)]
+pub struct StreamResult {
+    pub stop_reason: Option<String>,
+}
+
 /// Protocol translator for converting between ACP and stream-json formats
 pub struct ProtocolTranslator;
 
@@ -186,6 +192,31 @@ impl ProtocolTranslator {
                 }))
             }
         }
+    }
+
+    /// Parse result message to extract stop_reason
+    ///
+    /// # Arguments
+    /// * `line` - A single line of JSON from claude stdout
+    ///
+    /// # Returns
+    /// * `Ok(Some(StreamResult))` - Successfully parsed result message
+    /// * `Ok(None)` - Not a result message or no stop_reason present
+    /// * `Err(...)` - Parse error
+    pub fn parse_result_message(line: &str) -> Result<Option<StreamResult>> {
+        let parsed: JsonValue = serde_json::from_str(line)
+            .map_err(|e| AgentError::Internal(format!("Failed to parse result message: {}", e)))?;
+
+        if parsed.get("type").and_then(|v| v.as_str()) == Some("result") {
+            let stop_reason = parsed
+                .get("stop_reason")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+
+            return Ok(Some(StreamResult { stop_reason }));
+        }
+
+        Ok(None)
     }
 
     /// Convert tool result to stream-json for claude stdin
@@ -421,6 +452,57 @@ mod tests {
         let session_id = SessionId("test_session".into());
 
         let result = ProtocolTranslator::stream_json_to_acp(line, &session_id);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_parse_result_message_with_max_tokens() {
+        // Test: Parse result message with max_tokens stop_reason
+        let line = r#"{"type":"result","subtype":"success","stop_reason":"max_tokens","usage":{}}"#;
+        let result = ProtocolTranslator::parse_result_message(line);
+        assert!(result.is_ok());
+
+        let stream_result = result.unwrap();
+        assert!(stream_result.is_some());
+
+        let stream_result = stream_result.unwrap();
+        assert_eq!(stream_result.stop_reason, Some("max_tokens".to_string()));
+    }
+
+    #[test]
+    fn test_parse_result_message_with_end_turn() {
+        // Test: Parse result message with end_turn stop_reason
+        let line = r#"{"type":"result","subtype":"success","stop_reason":"end_turn","usage":{}}"#;
+        let result = ProtocolTranslator::parse_result_message(line);
+        assert!(result.is_ok());
+
+        let stream_result = result.unwrap();
+        assert!(stream_result.is_some());
+
+        let stream_result = stream_result.unwrap();
+        assert_eq!(stream_result.stop_reason, Some("end_turn".to_string()));
+    }
+
+    #[test]
+    fn test_parse_result_message_without_stop_reason() {
+        // Test: Parse result message without stop_reason field
+        let line = r#"{"type":"result","subtype":"success","usage":{}}"#;
+        let result = ProtocolTranslator::parse_result_message(line);
+        assert!(result.is_ok());
+
+        let stream_result = result.unwrap();
+        assert!(stream_result.is_some());
+
+        let stream_result = stream_result.unwrap();
+        assert_eq!(stream_result.stop_reason, None);
+    }
+
+    #[test]
+    fn test_parse_result_message_not_result_type() {
+        // Test: Non-result message should return None
+        let line = r#"{"type":"assistant","message":{"content":[]}}"#;
+        let result = ProtocolTranslator::parse_result_message(line);
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }

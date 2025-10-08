@@ -50,6 +50,8 @@ pub struct MessageChunk {
     pub tool_call: Option<ToolCallInfo>,
     /// Token usage information (only present in Result messages)
     pub token_usage: Option<TokenUsageInfo>,
+    /// Stop reason from Claude (only present in final chunk from result message)
+    pub stop_reason: Option<String>,
 }
 
 /// Tool call information extracted from Message::Tool
@@ -113,6 +115,7 @@ impl ClaudeClient {
                 chunk_type: ChunkType::Text,
                 tool_call: None,
                 token_usage: None,
+                stop_reason: None,
             },
             // Handle other ContentBlock variants if they exist
             _ => MessageChunk {
@@ -120,6 +123,7 @@ impl ClaudeClient {
                 chunk_type: ChunkType::Text,
                 tool_call: None,
                 token_usage: None,
+                stop_reason: None,
             },
         }
     }
@@ -237,6 +241,18 @@ impl ClaudeClient {
 
                 // Check if this is a result message (indicates end)
                 if Self::is_end_of_stream(&line) {
+                    // Parse the result message to extract stop_reason
+                    if let Ok(Some(result)) = ProtocolTranslator::parse_result_message(&line) {
+                        // Send a final chunk with the stop_reason
+                        let final_chunk = MessageChunk {
+                            content: String::new(),
+                            chunk_type: ChunkType::Text,
+                            tool_call: None,
+                            token_usage: None,
+                            stop_reason: result.stop_reason,
+                        };
+                        let _ = tx.send(final_chunk);
+                    }
                     break;
                 }
 
@@ -511,6 +527,7 @@ mod tests {
             chunk_type: ChunkType::Text,
             tool_call: None,
             token_usage: None,
+            stop_reason: None,
         };
 
         let tool_call_chunk = MessageChunk {
@@ -521,6 +538,7 @@ mod tests {
                 parameters: serde_json::json!({"arg": "value"}),
             }),
             token_usage: None,
+            stop_reason: None,
         };
 
         let tool_result_chunk = MessageChunk {
@@ -528,6 +546,7 @@ mod tests {
             chunk_type: ChunkType::ToolResult,
             tool_call: None,
             token_usage: None,
+            stop_reason: None,
         };
 
         let result_chunk = MessageChunk {
@@ -538,6 +557,7 @@ mod tests {
                 input_tokens: 100,
                 output_tokens: 200,
             }),
+            stop_reason: None,
         };
 
         assert!(matches!(text_chunk.chunk_type, ChunkType::Text));

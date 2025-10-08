@@ -98,10 +98,10 @@ use crate::session::SessionId;
 use crate::{AgentError, Result};
 use std::collections::HashMap;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
 /// Claude CLI command-line arguments for stream-json communication
@@ -457,7 +457,7 @@ impl ClaudeProcess {
                             self.session_id
                         );
                         // Force kill the process
-                        if let Err(e) = self.child.kill() {
+                        if let Err(e) = self.child.kill().await {
                             tracing::error!(
                                 "Failed to force kill claude process for session {}: {}",
                                 self.session_id,
@@ -469,7 +469,7 @@ impl ClaudeProcess {
                             )));
                         }
                         // Wait for the killed process to clean up
-                        if let Err(e) = self.child.wait() {
+                        if let Err(e) = self.child.wait().await {
                             tracing::error!(
                                 "Failed to wait after killing claude process for session {}: {}",
                                 self.session_id,
@@ -753,7 +753,7 @@ mod tests {
 
         // Forcibly kill the process to simulate a crash
         let pid = process.child.id();
-        process.child.kill().expect("Failed to kill process");
+        process.child.kill().await.expect("Failed to kill process");
 
         // Wait for the kill to take effect
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -776,7 +776,7 @@ mod tests {
             }
         }
 
-        tracing::debug!("Successfully detected crashed process with PID {}", pid);
+        tracing::debug!("Successfully detected crashed process with PID {:?}", pid);
         // No need to call shutdown() as process is already dead
     }
 

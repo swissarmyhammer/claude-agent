@@ -412,11 +412,13 @@ impl ClaudeAgentServer {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let response_line = format!("{}\n", serde_json::to_string(&response)?);
+        tracing::info!("Sending JSON-RPC response: {} bytes", response_line.len());
 
         let mut writer_guard = writer.lock().await;
         writer_guard.write_all(response_line.as_bytes()).await?;
         writer_guard.flush().await?;
 
+        tracing::info!("JSON-RPC response sent successfully");
         Ok(())
     }
 

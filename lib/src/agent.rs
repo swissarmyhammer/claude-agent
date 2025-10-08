@@ -1305,6 +1305,7 @@ impl ClaudeAgent {
         let mut full_response = String::new();
         let mut chunk_count = 0;
         let session_id_str = session_id.to_string();
+        let mut claude_stop_reason: Option<String> = None;
 
         while let Some(chunk) = stream.next().await {
             // Check for cancellation before processing each chunk
@@ -1326,6 +1327,11 @@ impl ClaudeAgent {
                         "partial_response_length": full_response.len()
                     })),
                 });
+            }
+
+            // Capture stop_reason from chunk if present
+            if let Some(reason) = &chunk.stop_reason {
+                claude_stop_reason = Some(reason.clone());
             }
 
             chunk_count += 1;
@@ -1423,13 +1429,24 @@ impl ClaudeAgent {
             .send_agent_thought(&request.session_id, &result_thought)
             .await;
 
+        // Map Claude's stop_reason to ACP StopReason
+        let stop_reason = match claude_stop_reason.as_deref() {
+            Some("max_tokens") => StopReason::MaxTokens,
+            Some("end_turn") | None => StopReason::EndTurn,
+            Some(other) => {
+                tracing::debug!("Unknown stop_reason '{}', defaulting to EndTurn", other);
+                StopReason::EndTurn
+            }
+        };
+
         Ok(PromptResponse {
-            stop_reason: StopReason::EndTurn,
+            stop_reason,
             meta: Some(serde_json::json!({
                 "processed": true,
                 "streaming": true,
                 "chunks_sent": chunk_count,
-                "session_messages": session.context.len() + 1
+                "session_messages": session.context.len() + 1,
+                "claude_stop_reason": claude_stop_reason
             })),
         })
     }
