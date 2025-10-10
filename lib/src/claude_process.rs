@@ -195,6 +195,11 @@ impl ClaudeProcessManager {
                 AgentError::Internal("Failed to acquire read lock on processes".to_string())
             })?;
             if let Some(process) = processes.get(session_id) {
+                tracing::debug!(
+                    "Reusing existing Claude process for session {} (total active: {})",
+                    session_id,
+                    processes.len()
+                );
                 return Ok(process.clone());
             }
         }
@@ -210,6 +215,12 @@ impl ClaudeProcessManager {
         let processes = self.processes.read().map_err(|_| {
             AgentError::Internal("Failed to acquire read lock on processes".to_string())
         })?;
+
+        tracing::info!(
+            "Spawned new Claude process for session {} (total active: {})",
+            session_id,
+            processes.len()
+        );
 
         processes.get(session_id).cloned().ok_or_else(|| {
             AgentError::Internal("Process spawn succeeded but not found in map".to_string())
