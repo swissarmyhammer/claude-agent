@@ -112,7 +112,16 @@ impl ProtocolTranslator {
 
         match msg_type {
             "assistant" => {
-                // Parse assistant message
+                // When using --include-partial-messages, the claude CLI sends both:
+                // 1. stream_event messages with content_block_delta (real-time text chunks)
+                // 2. assistant messages with complete content (final aggregation for text)
+                //
+                // For TEXT content: ignore assistant messages since we already processed
+                // them via stream_event chunks. This avoids duplication.
+                //
+                // For TOOL_USE content: we MUST process assistant messages because
+                // tool_use content does NOT come through stream_events.
+                
                 let assistant_msg: StreamJsonAssistantMessage = serde_json::from_value(parsed)
                     .map_err(|e| {
                         AgentError::Internal(format!("Failed to parse assistant message: {}", e))
@@ -121,25 +130,27 @@ impl ProtocolTranslator {
                 // Validate message type
                 assistant_msg.validate()?;
 
-                // Convert first content item to ACP
+                // Check first content item to determine if this is tool use
                 if let Some(content_item) = assistant_msg.message.content.first() {
-                    // Log if there are additional content items that will be ignored
-                    if assistant_msg.message.content.len() > 1 {
-                        tracing::debug!(
-                            "Assistant message contains {} content items, only returning first",
-                            assistant_msg.message.content.len()
-                        );
+                    match content_item {
+                        ContentItem::Text { text, .. } => {
+                            // Ignore text content - already received via stream_events
+                            tracing::debug!("🚫 ASSISTANT text message IGNORED ({}chars): '{}'", text.len(), text.chars().take(50).collect::<String>());
+                            Ok(None)
+                        }
+                        ContentItem::ToolUse { id, name, .. } => {
+                            // Process tool use - doesn't come through stream_events
+                            tracing::debug!("🔧 ASSISTANT tool_use message: {} ({})", name, id);
+                            let content_block = Self::parse_content_item(content_item)?;
+                            Ok(Some(SessionNotification {
+                                session_id: session_id.clone(),
+                                update: SessionUpdate::AgentMessageChunk {
+                                    content: content_block,
+                                },
+                                meta: None,
+                            }))
+                        }
                     }
-
-                    let content_block = Self::parse_content_item(content_item)?;
-
-                    Ok(Some(SessionNotification {
-                        session_id: session_id.clone(),
-                        update: SessionUpdate::AgentMessageChunk {
-                            content: content_block,
-                        },
-                        meta: None,
-                    }))
                 } else {
                     Ok(None)
                 }
@@ -174,7 +185,7 @@ impl ProtocolTranslator {
                                 .and_then(|d| d.get("text"))
                                 .and_then(|t| t.as_str())
                             {
-                                tracing::debug!("Received content_block_delta with {} chars", text.len());
+                                tracing::debug!("📨 STREAM_EVENT chunk: {} chars: '{}'", text.len(), text.chars().take(50).collect::<String>());
                                 return Ok(Some(SessionNotification {
                                     session_id: session_id.clone(),
                                     update: SessionUpdate::AgentMessageChunk {
@@ -394,7 +405,10 @@ mod tests {
 
     #[test]
     fn test_stream_json_to_acp_assistant_text() {
-        // Test: Convert assistant text message from stream-json to ACP
+        // Test: Assistant text messages should be filtered out (duplicate prevention)
+        // With --include-partial-messages, we receive:
+        // 1. stream_event chunks with the text (processed)
+        // 2. assistant message with full text (filtered to avoid duplication)
         let line =
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello back!"}]}}"#;
         let session_id = SessionId("test_session".into());
@@ -403,21 +417,11 @@ mod tests {
         assert!(result.is_ok());
 
         let notification = result.unwrap();
-        assert!(notification.is_some());
-
-        let notification = notification.unwrap();
-        assert_eq!(notification.session_id, session_id);
-
-        match notification.update {
-            SessionUpdate::AgentMessageChunk { content } => {
-                if let ContentBlock::Text(text) = content {
-                    assert_eq!(text.text, "Hello back!");
-                } else {
-                    panic!("Expected text content block");
-                }
-            }
-            _ => panic!("Expected AgentMessageChunk"),
-        }
+        // Should return None because text content is filtered (duplicate prevention)
+        assert!(
+            notification.is_none(),
+            "Expected None for assistant text message (duplicate prevention)"
+        );
     }
 
     #[test]
@@ -584,5 +588,111 @@ mod tests {
             }
             _ => panic!("Expected AgentMessageChunk"),
         }
+    }
+
+    #[test]
+    fn test_duplicate_prevention_assistant_text_is_filtered() {
+        // Test: Assistant messages with TEXT content should return None (duplicate prevention)
+        // This test verifies that the full text message is filtered out to avoid duplication
+        // since we already received the text via stream_event chunks
+        let line =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello back!"}]}}"#;
+        let session_id = SessionId("test_session".into());
+
+        let result = ProtocolTranslator::stream_json_to_acp(line, &session_id);
+        assert!(result.is_ok());
+
+        let notification = result.unwrap();
+        assert!(
+            notification.is_none(),
+            "Expected None for assistant text message (duplicate prevention), but got Some"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_prevention_stream_events_are_processed() {
+        // Test: stream_event with content_block_delta SHOULD be processed (real-time chunks)
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"text":"Hello"}}}"#;
+        let session_id = SessionId("test_session".into());
+
+        let result = ProtocolTranslator::stream_json_to_acp(line, &session_id);
+        assert!(result.is_ok());
+
+        let notification = result.unwrap();
+        assert!(
+            notification.is_some(),
+            "Expected Some for stream_event chunk, but got None"
+        );
+
+        let notification = notification.unwrap();
+        match notification.update {
+            SessionUpdate::AgentMessageChunk { content } => {
+                if let ContentBlock::Text(text) = content {
+                    assert_eq!(text.text, "Hello");
+                } else {
+                    panic!("Expected text content block");
+                }
+            }
+            _ => panic!("Expected AgentMessageChunk"),
+        }
+    }
+
+    #[test]
+    fn test_duplicate_prevention_tool_use_is_not_filtered() {
+        // Test: Assistant messages with TOOL_USE content SHOULD be processed
+        // because tool_use does NOT come through stream_events
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_456","name":"bash","input":{"command":"ls"}}]}}"#;
+        let session_id = SessionId("test_session".into());
+
+        let result = ProtocolTranslator::stream_json_to_acp(line, &session_id);
+        assert!(result.is_ok());
+
+        let notification = result.unwrap();
+        assert!(
+            notification.is_some(),
+            "Expected Some for assistant tool_use message, but got None"
+        );
+
+        let notification = notification.unwrap();
+        match notification.update {
+            SessionUpdate::AgentMessageChunk { content } => {
+                if let ContentBlock::Text(text) = content {
+                    // Tool use is converted to JSON text
+                    assert!(text.text.contains("tool_use"));
+                    assert!(text.text.contains("toolu_456"));
+                    assert!(text.text.contains("bash"));
+                } else {
+                    panic!("Expected text content block");
+                }
+            }
+            _ => panic!("Expected AgentMessageChunk"),
+        }
+    }
+
+    #[test]
+    fn test_duplicate_prevention_full_scenario() {
+        // Test: Simulate the full scenario with chunks followed by full message
+        // This is what the claude CLI actually sends
+        let session_id = SessionId("test_session".into());
+
+        // Step 1: Receive stream_event chunks (these should be processed)
+        let chunk1 = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"text":"Hello"}}}"#;
+        let result1 = ProtocolTranslator::stream_json_to_acp(chunk1, &session_id);
+        assert!(result1.is_ok());
+        assert!(result1.unwrap().is_some(), "Expected chunk1 to be processed");
+
+        let chunk2 = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"text":" world"}}}"#;
+        let result2 = ProtocolTranslator::stream_json_to_acp(chunk2, &session_id);
+        assert!(result2.is_ok());
+        assert!(result2.unwrap().is_some(), "Expected chunk2 to be processed");
+
+        // Step 2: Receive assistant message with full text (this should be filtered)
+        let full_message = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello world"}]}}"#;
+        let result3 = ProtocolTranslator::stream_json_to_acp(full_message, &session_id);
+        assert!(result3.is_ok());
+        assert!(
+            result3.unwrap().is_none(),
+            "Expected full assistant text message to be filtered (duplicate prevention)"
+        );
     }
 }
