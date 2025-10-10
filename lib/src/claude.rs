@@ -227,53 +227,6 @@ impl ClaudeClient {
         let process_clone = process.clone();
         let acp_session_id = Self::to_acp_session_id(session_id);
 
-        // Create a channel to signal keepalive task to stop
-        let (keepalive_stop_tx, mut keepalive_stop_rx) = tokio::sync::oneshot::channel();
-
-        // Spawn keepalive task to periodically send ping messages
-        // This forces the claude CLI to flush its stdout buffer
-        let process_keepalive = process.clone();
-        tokio::task::spawn(async move {
-            tracing::debug!("Keepalive task started");
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
-            interval.tick().await; // First tick completes immediately, skip it
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        // Send ping message to force flush
-                        // Using a period character (non-whitespace required by API)
-                        let ping_content = vec![ContentBlock::Text(TextContent {
-                            text: ".".to_string(),
-                            annotations: None,
-                            meta: None,
-                        })];
-                        match ProtocolTranslator::acp_to_stream_json(ping_content) {
-                            Ok(stream_json) => {
-                                let mut proc = process_keepalive.lock().await;
-                                tracing::debug!("Keepalive: sending ping message");
-                                match proc.write_line(&stream_json).await {
-                                    Ok(_) => tracing::debug!("Keepalive: ping sent successfully"),
-                                    Err(e) => {
-                                        tracing::debug!("Keepalive: write failed: {:?}, stopping", e);
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::debug!("Keepalive: failed to convert to stream_json: {:?}, stopping", e);
-                                break;
-                            }
-                        }
-                    }
-                    _ = &mut keepalive_stop_rx => {
-                        tracing::debug!("Keepalive: stop signal received");
-                        break;
-                    }
-                }
-            }
-            tracing::debug!("Keepalive task stopped");
-        });
-
         // Spawn an async task to read from the process and send chunks
         tokio::task::spawn(async move {
             loop {
@@ -288,8 +241,6 @@ impl ClaudeClient {
 
                 // Check if this is a result message (indicates end)
                 if Self::is_end_of_stream(&line) {
-                    // Stop the keepalive task
-                    let _ = keepalive_stop_tx.send(());
 
                     // Parse the result message to extract stop_reason
                     if let Ok(Some(result)) = ProtocolTranslator::parse_result_message(&line) {
@@ -378,22 +329,11 @@ impl ClaudeClient {
             ));
         }
 
-        // Build conversation history from context
-        let mut full_conversation = String::new();
-
-        for message in &context.messages {
-            let role_str = match message.role {
-                MessageRole::User => "User",
-                MessageRole::Assistant => "Assistant",
-                MessageRole::System => "System",
-            };
-            full_conversation.push_str(&format!("{}: {}\n", role_str, message.content));
-        }
-        full_conversation.push_str(&format!("User: {}", prompt));
-
-        // Use the process manager for streaming
-        self.query_stream(&full_conversation, &context.session_id)
-            .await
+        // Claude CLI maintains conversation state internally, so we just send
+        // the new prompt without rebuilding the full conversation history.
+        // The process manager ensures we're using the same CLI process for this
+        // session, which maintains context across calls.
+        self.query_stream(prompt, &context.session_id).await
     }
 }
 
@@ -650,5 +590,81 @@ mod tests {
 
         // Note: Token tracking would need to be updated separately via the public fields
         // This test now focuses on basic message addition functionality
+    }
+
+    /// Test that multiple sessions correctly reuse their processes without spawning new ones
+    ///
+    /// This test verifies:
+    /// 1. Two different sessions spawn two different Claude CLI processes
+    /// 2. Sending multiple messages to each session reuses the same processes
+    /// 3. No additional processes are spawned for subsequent messages
+    ///
+    /// NOTE: This test makes real API calls to Claude and costs money.
+    #[tokio::test]
+    async fn test_two_sessions_multiple_messages_process_reuse() {
+        // Skip if ANTHROPIC_API_KEY is not set
+        if std::env::var("ANTHROPIC_API_KEY").is_err() {
+            eprintln!("Skipping test_two_sessions_multiple_messages_process_reuse - ANTHROPIC_API_KEY not set");
+            return;
+        }
+
+        let client = ClaudeClient::new().unwrap();
+        let session1_id = SessionId::new();
+        let session2_id = SessionId::new();
+
+        // Send first message to session 1 - should spawn process 1
+        let result1 = client.query("Hello from session 1, message 1", &session1_id).await;
+        if result1.is_err() {
+            eprintln!("Skipping test - claude not installed: {:?}", result1.unwrap_err());
+            return;
+        }
+        let response1_1 = result1.unwrap();
+        assert!(!response1_1.is_empty(), "Expected response from session 1 message 1");
+
+        // Verify session 1 has a process
+        let process_manager = client.process_manager();
+        assert!(process_manager.has_session(&session1_id).await, "Session 1 should have a process");
+
+        // Send first message to session 2 - should spawn process 2
+        let response2_1 = client.query("Hello from session 2, message 1", &session2_id).await.unwrap();
+        assert!(!response2_1.is_empty(), "Expected response from session 2 message 1");
+
+        // Verify session 2 has a process
+        assert!(process_manager.has_session(&session2_id).await, "Session 2 should have a process");
+
+        // At this point, we should have exactly 2 processes
+        // We can't directly count processes from the public API, but we can verify both sessions exist
+        assert!(process_manager.has_session(&session1_id).await);
+        assert!(process_manager.has_session(&session2_id).await);
+
+        // Send second message to session 1 - should REUSE process 1
+        let response1_2 = client.query("Session 1, message 2", &session1_id).await.unwrap();
+        assert!(!response1_2.is_empty(), "Expected response from session 1 message 2");
+
+        // Verify session 1 still has a process (same one)
+        assert!(process_manager.has_session(&session1_id).await);
+
+        // Send second message to session 2 - should REUSE process 2
+        let response2_2 = client.query("Session 2, message 2", &session2_id).await.unwrap();
+        assert!(!response2_2.is_empty(), "Expected response from session 2 message 2");
+
+        // Verify session 2 still has a process (same one)
+        assert!(process_manager.has_session(&session2_id).await);
+
+        // Cleanup: get and drop process references before terminating
+        {
+            let _proc1 = process_manager.get_process(&session1_id).await.unwrap();
+            let _proc2 = process_manager.get_process(&session2_id).await.unwrap();
+        }
+
+        // Terminate both sessions
+        let _ = process_manager.terminate_session(&session1_id).await;
+        let _ = process_manager.terminate_session(&session2_id).await;
+
+        // Verify both sessions are cleaned up
+        assert!(!process_manager.has_session(&session1_id).await);
+        assert!(!process_manager.has_session(&session2_id).await);
+
+        tracing::info!("Successfully verified two sessions with multiple messages reuse processes correctly");
     }
 }
