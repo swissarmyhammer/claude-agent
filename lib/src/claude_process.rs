@@ -23,7 +23,8 @@
 //!   --input-format stream-json \
 //!   --output-format stream-json \
 //!   --verbose \
-//!   --dangerously-skip-permissions
+//!   --dangerously-skip-permissions \
+//!   --replay-user-messages
 //! ```
 //!
 //! - `-p`: Print mode (non-interactive)
@@ -31,6 +32,7 @@
 //! - `--output-format stream-json`: Emit newline-delimited JSON on stdout
 //! - `--verbose`: Required for stream-json output format
 //! - `--dangerously-skip-permissions`: ACP server handles permission checks
+//! - `--replay-user-messages`: Re-emit user messages for immediate acknowledgment
 //!
 //! Messages are exchanged as newline-delimited JSON objects conforming to the
 //! JSON-RPC 2.0 specification for Agent Communication Protocol (ACP).
@@ -113,6 +115,7 @@ const CLAUDE_CLI_ARGS: &[&str] = &[
     "stream-json",                    // emit newline-delimited JSON on stdout
     "--verbose",                      // REQUIRED for stream-json output format
     "--dangerously-skip-permissions", // ACP server handles permission checks
+    "--include-partial-messages",     // Emit partial messages for immediate streaming
 ];
 
 /// Manages multiple persistent claude CLI processes, one per session

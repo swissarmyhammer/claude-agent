@@ -227,6 +227,53 @@ impl ClaudeClient {
         let process_clone = process.clone();
         let acp_session_id = Self::to_acp_session_id(session_id);
 
+        // Create a channel to signal keepalive task to stop
+        let (keepalive_stop_tx, mut keepalive_stop_rx) = tokio::sync::oneshot::channel();
+
+        // Spawn keepalive task to periodically send ping messages
+        // This forces the claude CLI to flush its stdout buffer
+        let process_keepalive = process.clone();
+        tokio::task::spawn(async move {
+            tracing::debug!("Keepalive task started");
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            interval.tick().await; // First tick completes immediately, skip it
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        // Send ping message to force flush
+                        // Using a period character (non-whitespace required by API)
+                        let ping_content = vec![ContentBlock::Text(TextContent {
+                            text: ".".to_string(),
+                            annotations: None,
+                            meta: None,
+                        })];
+                        match ProtocolTranslator::acp_to_stream_json(ping_content) {
+                            Ok(stream_json) => {
+                                let mut proc = process_keepalive.lock().await;
+                                tracing::debug!("Keepalive: sending ping message");
+                                match proc.write_line(&stream_json).await {
+                                    Ok(_) => tracing::debug!("Keepalive: ping sent successfully"),
+                                    Err(e) => {
+                                        tracing::debug!("Keepalive: write failed: {:?}, stopping", e);
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!("Keepalive: failed to convert to stream_json: {:?}, stopping", e);
+                                break;
+                            }
+                        }
+                    }
+                    _ = &mut keepalive_stop_rx => {
+                        tracing::debug!("Keepalive: stop signal received");
+                        break;
+                    }
+                }
+            }
+            tracing::debug!("Keepalive task stopped");
+        });
+
         // Spawn an async task to read from the process and send chunks
         tokio::task::spawn(async move {
             loop {
@@ -241,6 +288,9 @@ impl ClaudeClient {
 
                 // Check if this is a result message (indicates end)
                 if Self::is_end_of_stream(&line) {
+                    // Stop the keepalive task
+                    let _ = keepalive_stop_tx.send(());
+
                     // Parse the result message to extract stop_reason
                     if let Ok(Some(result)) = ProtocolTranslator::parse_result_message(&line) {
                         // Send a final chunk with the stop_reason

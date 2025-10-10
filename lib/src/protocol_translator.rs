@@ -144,6 +144,14 @@ impl ProtocolTranslator {
                     Ok(None)
                 }
             }
+            "user" => {
+                // User messages from keepalive pings should be filtered.
+                // We send empty user messages periodically to force the claude CLI to flush
+                // its stdout buffer (solving a buffering bug), but these should not be
+                // forwarded to clients.
+                tracing::debug!("Received user message (keepalive ping, filtered)");
+                Ok(None)
+            }
             "system" => {
                 // System messages are metadata only, don't notify
                 tracing::debug!("Received system message (metadata only)");
@@ -152,6 +160,38 @@ impl ProtocolTranslator {
             "result" => {
                 // Result messages are metadata only, don't notify
                 tracing::debug!("Received result message (metadata only)");
+                Ok(None)
+            }
+            "stream_event" => {
+                // Stream events contain partial message chunks (when --include-partial-messages is used)
+                // Extract the event type and handle content_block_delta events
+                if let Some(event) = parsed.get("event") {
+                    if let Some(event_type) = event.get("type").and_then(|v| v.as_str()) {
+                        if event_type == "content_block_delta" {
+                            // Extract the text from delta.text
+                            if let Some(text) = event
+                                .get("delta")
+                                .and_then(|d| d.get("text"))
+                                .and_then(|t| t.as_str())
+                            {
+                                tracing::debug!("Received content_block_delta with {} chars", text.len());
+                                return Ok(Some(SessionNotification {
+                                    session_id: session_id.clone(),
+                                    update: SessionUpdate::AgentMessageChunk {
+                                        content: ContentBlock::Text(TextContent {
+                                            text: text.to_string(),
+                                            annotations: None,
+                                            meta: None,
+                                        }),
+                                    },
+                                    meta: None,
+                                }));
+                            }
+                        }
+                    }
+                }
+                // Ignore other stream_event types (message_start, content_block_start, etc.)
+                tracing::debug!("Received stream_event (non-delta, ignored)");
                 Ok(None)
             }
             _ => {
@@ -400,6 +440,17 @@ mod tests {
         let result = ProtocolTranslator::stream_json_to_acp(line, &session_id);
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_stream_json_to_acp_user_message_filtered() {
+        // Test: User messages (from keepalive pings) should be filtered
+        let line = r#"{"type":"user","message":{"role":"user","content":""}}"#;
+        let session_id = SessionId("test_session".into());
+
+        let result = ProtocolTranslator::stream_json_to_acp(line, &session_id);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "Keepalive ping messages should be filtered");
     }
 
     #[test]

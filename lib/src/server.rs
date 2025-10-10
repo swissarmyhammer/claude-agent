@@ -1,15 +1,13 @@
 //! ACP Server Infrastructure
 //!
 //! This module provides the ACP (Agent Client Protocol) server implementation
-//! that wraps the ClaudeAgent to provide JSON-RPC communication over stdio
-//! and custom streams.
+//! that wraps the ClaudeAgent to provide JSON-RPC communication over custom streams.
 
 use crate::{agent::ClaudeAgent, config::AgentConfig, error::AgentError};
 use agent_client_protocol::Agent;
 use serde::Serialize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::signal;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
@@ -39,7 +37,8 @@ struct JsonRpcNotification {
 /// The main ACP server that handles JSON-RPC communication
 pub struct ClaudeAgentServer {
     agent: Arc<ClaudeAgent>,
-    notification_receiver: broadcast::Receiver<agent_client_protocol::SessionNotification>,
+    notification_receiver:
+        Mutex<Option<broadcast::Receiver<agent_client_protocol::SessionNotification>>>,
 }
 
 impl ClaudeAgentServer {
@@ -49,95 +48,11 @@ impl ClaudeAgentServer {
 
         Ok(Self {
             agent: Arc::new(agent),
-            notification_receiver,
+            notification_receiver: Mutex::new(Some(notification_receiver)),
         })
     }
 
-    /// Start the server using stdio (standard ACP pattern)
-    pub async fn start_stdio(&self) -> crate::Result<()> {
-        info!("Starting ACP server on stdio");
-
-        let stdin = tokio::io::stdin();
-        let stdout = tokio::io::stdout();
-
-        self.start_with_streams(stdin, stdout).await
-    }
-
-    /// Start the server with graceful shutdown handling
-    pub async fn start_with_shutdown(&self) -> crate::Result<()> {
-        info!("Starting ACP server with shutdown handling");
-
-        let shutdown_signal = self.setup_shutdown_handler();
-        let server_task = self.start_stdio();
-
-        tokio::select! {
-            result = server_task => {
-                info!("Server task completed: {:?}", result);
-                result
-            }
-            _ = shutdown_signal => {
-                info!("Received shutdown signal, stopping server");
-                self.shutdown().await?;
-                Ok(())
-            }
-        }
-    }
-
-    /// Setup shutdown signal handler
-    async fn setup_shutdown_handler(&self) -> crate::Result<()> {
-        #[cfg(unix)]
-        {
-            let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
-                .map_err(AgentError::Io)?;
-            let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
-                .map_err(AgentError::Io)?;
-
-            tokio::select! {
-                _ = sigterm.recv() => {
-                    info!("Received SIGTERM");
-                }
-                _ = sigint.recv() => {
-                    info!("Received SIGINT");
-                }
-            }
-        }
-
-        #[cfg(not(unix))]
-        {
-            signal::ctrl_c().await.map_err(|e| AgentError::Io(e))?;
-            info!("Received Ctrl+C");
-        }
-
-        Ok(())
-    }
-
-    /// Perform graceful shutdown
-    async fn shutdown(&self) -> crate::Result<()> {
-        info!("Shutting down server");
-
-        // Clean up active sessions by shutting down the session manager
-        if let Err(e) = self.agent.shutdown_sessions().await {
-            warn!("Error shutting down sessions: {}", e);
-        }
-
-        // Close MCP server connections if any exist
-        if let Err(e) = self.agent.shutdown_mcp_connections().await {
-            warn!("Error shutting down MCP connections: {}", e);
-        }
-
-        // Stop any background tool processes
-        if let Err(e) = self.agent.shutdown_tool_handler().await {
-            warn!("Error shutting down tool handler: {}", e);
-        }
-
-        // The notification channel will be dropped when the server is dropped,
-        // which will automatically close all receivers
-
-        info!("Server shutdown complete");
-        Ok(())
-    }
-
-    /// Start the server with custom streams for testing
+    /// Start the server with custom streams
     ///
     /// # Concurrency Model
     /// This method handles requests and notifications concurrently using `tokio::join!`.
@@ -172,7 +87,22 @@ impl ClaudeAgentServer {
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
 
         // Handle requests directly without spawning (avoids Send issues)
-        let mut notification_receiver = self.notification_receiver.resubscribe();
+        // IMPORTANT: Use the original notification_receiver, NOT resubscribe()!
+        // resubscribe() creates a NEW receiver that only gets messages sent AFTER this point,
+        // causing us to miss all the streaming chunks sent during prompt processing.
+        //
+        // We use Mutex for interior mutability since start_with_streams takes &self,
+        // but we need to move the receiver into the notification handler.
+        let mut notification_receiver = self
+            .notification_receiver
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| {
+                AgentError::Protocol(
+                    "Notification receiver already taken (server started twice?)".to_string(),
+                )
+            })?;
 
         // Handle requests and signal shutdown when done
         let request_handler = async {
@@ -185,18 +115,21 @@ impl ClaudeAgentServer {
 
         // Handle notifications until shutdown signal
         let notification_handler = async {
+            info!("Notification handler started, waiting for notifications");
             loop {
                 tokio::select! {
                     notification_result = notification_receiver.recv() => {
                         match notification_result {
                             Ok(notification) => {
+                                info!("Notification handler received notification, sending to client");
                                 if let Err(e) = Self::send_notification(Arc::clone(&writer), notification).await {
                                     error!("Failed to send notification: {} - shutting down notification handler", e);
                                     break;
                                 }
+                                info!("Notification sent successfully");
                             }
-                            Err(_) => {
-                                warn!("Notification channel closed");
+                            Err(e) => {
+                                warn!("Notification channel error: {:?}", e);
                                 break;
                             }
                         }
@@ -207,6 +140,7 @@ impl ClaudeAgentServer {
                     }
                 }
             }
+            info!("Notification handler stopped");
         };
 
         // Run both handlers concurrently

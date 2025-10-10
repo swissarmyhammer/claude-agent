@@ -6,7 +6,6 @@
 mod common;
 
 use claude_agent_lib::{config::AgentConfig, server::ClaudeAgentServer};
-use tokio::time::{timeout, Duration};
 
 #[tokio::test]
 async fn test_server_creation() {
@@ -23,26 +22,6 @@ async fn test_config_creation() {
     // Basic test to ensure config can be created
     // Config exists and can be used to create servers
     let _server = ClaudeAgentServer::new(config).await;
-}
-
-#[tokio::test]
-async fn test_server_startup_timeout() {
-    let config = AgentConfig::default();
-    let server = ClaudeAgentServer::new(config)
-        .await
-        .expect("Failed to create server");
-
-    // Test that server startup doesn't hang indefinitely
-    // We use a very short timeout just to verify the method exists and can be called
-    let result = timeout(Duration::from_millis(10), async {
-        // This will likely timeout, which is expected
-        server.start_stdio().await
-    })
-    .await;
-
-    // We expect either a timeout (Ok(Err)) or timeout error (Err)
-    // Both indicate the method exists and is callable
-    assert!(result.is_err() || result.is_ok());
 }
 
 #[tokio::test]
