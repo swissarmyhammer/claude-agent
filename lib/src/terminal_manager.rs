@@ -972,7 +972,10 @@ mod tests {
         manager: &TerminalManager,
         session_manager: &crate::session::SessionManager,
     ) -> crate::Result<(String, String)> {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let cwd = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
         let session_id = session_manager.create_session(cwd, None)?;
         let session_id_str = session_id.to_string();
 
@@ -1045,7 +1048,10 @@ mod tests {
         let manager = TerminalManager::new();
         let session_manager = create_test_session_manager().await;
 
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let cwd = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
         let session_id = session_manager.create_session(cwd, None).unwrap();
 
         let params = TerminalReleaseParams {
@@ -1199,7 +1205,10 @@ mod tests {
         let manager = TerminalManager::new();
         let session_manager = create_test_session_manager().await;
 
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let cwd = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
         let session_id = session_manager.create_session(cwd, None).unwrap();
 
         let params = TerminalCreateParams {
@@ -1331,7 +1340,10 @@ mod tests {
         let manager = TerminalManager::new();
         let session_manager = create_test_session_manager().await;
 
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let cwd = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
         let session_id = session_manager.create_session(cwd, None).unwrap();
 
         let params = TerminalCreateParams {
@@ -1389,7 +1401,10 @@ mod tests {
         let manager = Arc::new(TerminalManager::new());
         let session_manager = Arc::new(create_test_session_manager().await);
 
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let cwd = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
         let session_id = session_manager.create_session(cwd, None).unwrap();
 
         let params = TerminalCreateParams {
@@ -1500,7 +1515,10 @@ mod tests {
         let manager = TerminalManager::new();
         let session_manager = create_test_session_manager().await;
 
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let cwd = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
         let session_id = session_manager.create_session(cwd, None).unwrap();
 
         let params = TerminalCreateParams {
